@@ -1,2 +1,64 @@
+# OS-specific
 .DS_Store
+Thumbs.db
+
+# IDE/Editor
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Environments
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# Spellbook runtime artifacts (large files)
+spellbook/eval/
+spellbook/tmp/
+
+# Common ML/Model files
+*.pth
+*.pt
+*.onnx
+*.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.ckpt
+*.safetensors
+
+# Data directories
+/data/
+
+# Archives
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# Build artifacts
+build/
+dist/
+*.egg
+*.so
+*.o
+*.a
+
+# Logs
+*.log
+logs/

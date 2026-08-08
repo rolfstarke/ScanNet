@@ -1,0 +1,26 @@
+name: 3disspellbook
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - plyfile
+  - imageio
+  - pillow
+  - scipy
+  - cython
+  - pyyaml
+  - opencv
+  - matplotlib
+  - omegaconf
+  - tqdm
+  - openpyxl
+  - xdotool
+  - pip
+  - pip:
+      - open3d
+      - imgui
+      - PyOpenGL
+      - glfw
+      - /home/rolf/opt/zed-sdk/pyzed-5.4-cp310-cp310-linux_x86_64.whl
