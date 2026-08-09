@@ -61,3 +61,7 @@ dist/
 # Logs
 *.log
 logs/
+
+# Session exports
+session-ses_*.json
+session-ses_*.md
