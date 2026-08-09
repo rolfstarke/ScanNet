@@ -28,7 +28,6 @@ env/
 
 # Spellbook runtime artifacts (large files)
 spellbook/eval/
-spellbook/tmp/
 
 # Common ML/Model files
 *.pth
