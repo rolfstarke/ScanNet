@@ -32,10 +32,11 @@ import yaml
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import decimate, scene_id_from_pointcloud, write_scannet_predictions  # noqa: E402
+from common import _benchmark_spec, scene_id_from_pointcloud, write_scannet_submission  # noqa: E402
 
 OPEN3DIS_REPO = "/home/rolf/GIT/Open3DIS"
 OPEN3DIS_PY = "/data/open3dis/conda/envs/open3dis/bin/python"
+SCRATCH_ROOT = "/data/open3dis/scratch"  # transient split/config files -- kept off the submission root
 
 MIN_MASK_POINTS = 20
 DECIMATE_LIMIT = 700_000
@@ -155,9 +156,10 @@ def main():
     ap.add_argument("--classes", nargs="+", required=True)
     ap.add_argument("--out", required=True, help="predictions output dir")
     ap.add_argument("--gpu", type=int, default=None)
-    ap.add_argument("--label_set", default="scannet18",
-                    choices=["scannet18", "scannet200"])
+    ap.add_argument("--benchmark", default="ScanNet20",
+                    choices=["ScanNet20", "ScanNet200"])
     args = ap.parse_args()
+    spec = _benchmark_spec(args.benchmark)
 
     os.makedirs(args.out, exist_ok=True)
     scene_id = scene_id_from_pointcloud(args.pointcloud)
@@ -167,7 +169,7 @@ def main():
     _link_frames(args.frames, scene_2d_dir)
     decimated = _ensure_working_ply(args.pointcloud, working_ply, DECIMATE_LIMIT)
 
-    split_path = os.path.join(args.out, "open3dis_split.txt")
+    split_path = os.path.join(SCRATCH_ROOT, scene_id, "open3dis_split.txt")
     with open(split_path, "w") as f:
         f.write(scene_id + "\n")
 
@@ -176,7 +178,7 @@ def main():
     run_config = _make_run_config(
         GENERIC_TEMPLATE_CONFIG,
         dict(split_path=split_path, img_dim=img_dim, rgb_img_dim=rgb_img_dim),
-        exp_name, args.classes, args.out,
+        exp_name, args.classes, os.path.join(SCRATCH_ROOT, scene_id),
     )
     exp_dir = os.path.join(OPEN3DIS_REPO, "exp", exp_name)
 
@@ -218,8 +220,8 @@ def main():
             yield sel, args.classes[best_idx[i]], confidence[i]
 
     candidates = sorted(_instances(), key=lambda t: -t[2])[:FINAL_INSTANCE_TOP_K]
-    n_written = write_scannet_predictions(args.out, args.classes, candidates, MIN_MASK_POINTS,
-                          args.label_set)
+    n_written = write_scannet_submission(args.out, scene_id, args.classes, candidates,
+                                         MIN_MASK_POINTS, spec)
     print(f"[INFO] Wrote {n_written} instances to {args.out}")
 
 

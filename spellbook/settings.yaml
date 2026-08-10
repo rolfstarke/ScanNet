@@ -1,0 +1,2 @@
+default: ScanNet20
+scannet_root: /data/scannet

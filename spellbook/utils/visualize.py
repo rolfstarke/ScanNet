@@ -13,11 +13,11 @@ _BENCHMARKSCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..
 sys.path.insert(0, _BENCHMARKSCRIPTS)
 import util  # noqa: E402
 import util_3d  # noqa: E402
+from ..benchmark import artifact_paths, resolve_benchmark  # noqa: E402
 from . import hud
 
 DEFAULT_SCANNET_DIR = "/data/scannet/scans"
 LABEL_MAP_FILE = "/data/scannet/v2/scannetv2-labels.combined.tsv"
-PREDICTIONS_ROOT = "predictions"
 
 _PALETTE = colormaps["tab20"].colors
 TARGET_LABEL_PX = 14.0
@@ -99,34 +99,35 @@ def load_gt_instances(scene_dir):
     return {"objects": objects, "scene_points": points, "scene_colors": colors}
 
 
-def load_predictions(pred_dir, points, colors):
-    labels = {}
-    with open(os.path.join(pred_dir, "labels.txt")) as f:
-        for line in f:
-            lid, name = line.strip().split(" ", 1)
-            labels[int(lid)] = name
+def load_predictions(submission_root, scene_id, points, colors, spec):
+    """Predictions in official ScanNet submission layout: <scene_id>.txt one line per instance
+    "predicted_masks/<scene_id>_NNN.txt <label_id> <confidence>", masks under predicted_masks/.
+    Returns None if the scene has no prediction file in this submission root."""
+    scene_file = os.path.join(submission_root, f"{scene_id}.txt")
+    if not os.path.isfile(scene_file):
+        return None
 
     objects = []
-    predictions_file = os.path.join(pred_dir, "predictions.txt")
     for mask_file, prediction in util_3d.read_instance_prediction_file(
-            predictions_file, pred_dir).items():
-        mask = util_3d.load_ids(mask_file) > 0
+            scene_file, submission_root).items():
         label_id = prediction["label_id"]
+        if label_id not in spec.id_to_label:
+            continue
+        mask = util_3d.load_ids(mask_file) > 0
         objects.append({
             "points": points[mask],
             "colors": colors[mask],
-            "class_name": labels[label_id],
+            "class_name": spec.id_to_label[label_id],
             "score": prediction["conf"],
             "sel": mask,
         })
     return {"objects": objects, "scene_points": points, "scene_colors": colors}
 
 
-def available_models(scene_dir):
-    pred_root = os.path.join(scene_dir, PREDICTIONS_ROOT)
-    if not os.path.isdir(pred_root):
+def available_models(run_root):
+    if not os.path.isdir(run_root):
         return []
-    return sorted(d for d in os.listdir(pred_root) if os.path.isdir(os.path.join(pred_root, d)))
+    return sorted(d for d in os.listdir(run_root) if os.path.isdir(os.path.join(run_root, d)))
 
 
 def _display_size():

@@ -21,7 +21,7 @@ import torch
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import decimate, scene_id_from_pointcloud, write_scannet_predictions  # noqa: E402
+from common import _benchmark_spec, decimate, scene_id_from_pointcloud, write_scannet_submission  # noqa: E402
 
 OPENINS3D_REPO = "/home/rolf/GIT/OpenIns3D"
 SCRATCH_ROOT = "/data/openins3d/scratch"  # bulky, transient synthetic renders -- kept off /home
@@ -57,14 +57,15 @@ def main():
     ap.add_argument("--pointcloud", required=True, help="scene pointcloud (.ply, xyz+rgb)")
     ap.add_argument("--classes", nargs="+", required=True)
     ap.add_argument("--out", required=True, help="predictions output dir")
-    ap.add_argument("--label_set", default="scannet18",
-                    choices=["scannet18", "scannet200"],
-                    help="label vocabulary: scannet18 (NYU40, default) or scannet200 (raw id-column ids)")
+    ap.add_argument("--benchmark", default="ScanNet20",
+                    choices=["ScanNet20", "ScanNet200"],
+                    help="benchmark backend (default ScanNet20)")
     ap.add_argument("--detector", default="odise", choices=["odise", "yoloworld"],
                     help="2D open-vocab detector for the Lookup stage (default odise -- the "
                          "detector OpenIns3D's paper numbers use; yoloworld is the repo demo default)")
     ap.add_argument("--gpu", type=int, default=None)
     args = ap.parse_args()
+    spec = _benchmark_spec(args.benchmark)
 
     os.makedirs(args.out, exist_ok=True)
     scene_id = scene_id_from_pointcloud(args.pointcloud)
@@ -113,8 +114,8 @@ def main():
                 continue
             yield masks_np[:, i][nn_idx], args.classes[cls], float(score[i])
 
-    n_written = write_scannet_predictions(args.out, args.classes, _instances(), MIN_MASK_POINTS,
-                                          label_set=args.label_set)
+    n_written = write_scannet_submission(args.out, scene_id, args.classes, _instances(),
+                                         MIN_MASK_POINTS, spec)
     print(f"[INFO] Wrote {n_written} instances to {args.out} "
           f"({mask_list.shape[1]} raw masks, {len(working_pts)}/{len(full_pts)} points used)")
 

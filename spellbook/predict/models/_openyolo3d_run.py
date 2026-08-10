@@ -20,7 +20,7 @@ if "--gpu" in sys.argv:
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import write_scannet_predictions  # noqa: E402
+from common import _benchmark_spec, write_scannet_submission  # noqa: E402
 
 OPENYOLO3D_REPO = "/home/rolf/GIT/OpenYOLO3D"
 SCRATCH_ROOT = "/data/openyolo3D/scratch"
@@ -56,11 +56,12 @@ def main():
     ap.add_argument("--frames", required=True, help="extracted frames dir (frames.py)")
     ap.add_argument("--classes", nargs="+", required=True)
     ap.add_argument("--out", required=True, help="predictions output dir")
-    ap.add_argument("--label_set", default="scannet18",
-                    choices=["scannet18", "scannet200"],
-                    help="label vocabulary: scannet18 (NYU40, default) or scannet200 (raw id-column ids)")
+    ap.add_argument("--benchmark", default="ScanNet20",
+                    choices=["ScanNet20", "ScanNet200"],
+                    help="benchmark backend (default ScanNet20)")
     ap.add_argument("--gpu", type=int, default=None)
     args = ap.parse_args()
+    spec = _benchmark_spec(args.benchmark)
 
     os.makedirs(args.out, exist_ok=True)
     scene_id = os.path.basename(os.path.dirname(args.pointcloud))
@@ -74,7 +75,7 @@ def main():
         cfg = yaml.safe_load(f)
     cfg["network2d"]["text_prompts"] = list(args.classes)
     cfg["network3d"]["is_gt"] = False
-    cfg_path = os.path.join(args.out, "openyolo3d_config.yaml")
+    cfg_path = os.path.join(SCRATCH_ROOT, scene_id, "openyolo3d_config.yaml")
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
 
@@ -99,8 +100,8 @@ def main():
                 continue
             yield masks_np[:, i], args.classes[classes_np[i]], float(scores_np[i])
 
-    n_written = write_scannet_predictions(args.out, args.classes, _instances(), MIN_MASK_POINTS,
-                                          label_set=args.label_set)
+    n_written = write_scannet_submission(args.out, scene_id, args.classes, _instances(),
+                                         MIN_MASK_POINTS, spec)
     print(f"[INFO] Wrote {n_written} instances to {args.out} "
           f"({masks_np.shape[1]} raw masks, {masks_np.shape[0]} points)")
 

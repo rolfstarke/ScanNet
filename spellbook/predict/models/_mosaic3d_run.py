@@ -19,7 +19,7 @@ import torch
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import decimate, write_scannet_predictions  # noqa: E402
+from common import _benchmark_spec, decimate, scene_id_from_pointcloud, write_scannet_submission  # noqa: E402
 
 MOSAIC3D_REPO = "/home/rolf/GIT/Mosaic3D"
 CHECKPOINT = "/data/mosaic3d/ckpts/spunet34c.ckpt"
@@ -28,6 +28,7 @@ GRID_SIZE = 0.02
 
 POINT_LIMIT = 1_500_000  # SpUNet's per-point feature gather OOMs on a 16GB card above ~2M points
 MIN_MASK_POINTS = 20
+SCRATCH_ROOT = "/data/mosaic3d/scratch"  # transient decimated meshes -- kept off the submission root
 
 STRUCTURAL_CLASS_PROFILES = {
     "wall": dict(eps=0.40, min_points=100, max_extent=8.0),
@@ -51,9 +52,11 @@ def main():
     ap.add_argument("--classes", nargs="+", required=True)
     ap.add_argument("--out", required=True, help="predictions output dir")
     ap.add_argument("--gpu", type=int, default=None)
-    ap.add_argument("--label_set", default="scannet18",
-                    choices=["scannet18", "scannet200"])
+    ap.add_argument("--benchmark", default="ScanNet20",
+                    choices=["ScanNet20", "ScanNet200"])
     args = ap.parse_args()
+    spec = _benchmark_spec(args.benchmark)
+    scene_id = scene_id_from_pointcloud(args.pointcloud)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.gpu is not None and torch.cuda.is_available():
@@ -69,7 +72,8 @@ def main():
     working_pts, nn_idx = decimate(full_pts, POINT_LIMIT)
     if len(working_pts) < len(full_pts):
         working_cols = full_cols[cKDTree(full_pts).query(working_pts, k=1, workers=-1)[1]]
-        working_ply = os.path.join(args.out, "working_scene.ply")
+        working_ply = os.path.join(SCRATCH_ROOT, scene_id, "working_scene.ply")
+        os.makedirs(os.path.dirname(working_ply), exist_ok=True)
         working_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(working_pts))
         working_pcd.colors = o3d.utility.Vector3dVector(working_cols)
         o3d.io.write_point_cloud(working_ply, working_pcd)
@@ -92,8 +96,8 @@ def main():
             sel_working[obj["point_indices"]] = True
             yield sel_working[nn_idx], obj["class_name"], obj["score"]
 
-    n_written = write_scannet_predictions(args.out, args.classes, _instances(), MIN_MASK_POINTS,
-                          args.label_set)
+    n_written = write_scannet_submission(args.out, scene_id, args.classes, _instances(),
+                                         MIN_MASK_POINTS, spec)
     print(f"[INFO] Wrote {n_written} instances to {args.out} ({len(working_pts)}/{len(full_pts)} points used)")
 
 

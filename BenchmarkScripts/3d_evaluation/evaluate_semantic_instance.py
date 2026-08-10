@@ -25,6 +25,9 @@
 #
 # example usage: evaluate_semantic_instance.py --scan_path [path to scan data] --output_file [output file]
 
+# Python 3 port of the official ScanNet semantic-instance evaluator.
+# Upstream: ScanNet/ScanNet (commit 520d564) -- changes: py2->py3 syntax,
+# np.float->float / np.bool->np.bool_ (numpy>=1.24), empty-match guard (issue #8).
 # python imports
 import math
 import os, sys, argparse
@@ -33,8 +36,8 @@ from copy import deepcopy
 
 try:
     import numpy as np
-except:
-    print "Failed to import numpy package."
+except Exception:
+    print("Failed to import numpy package.")
     sys.exit(-1)
 
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
@@ -79,7 +82,7 @@ def evaluate_matches(matches):
     dist_confs = [ opt.distance_confs[0] ]
     
     # results: class x overlap
-    ap = np.zeros( (len(dist_threshes) , len(CLASS_LABELS) , len(overlaps)) , np.float )
+    ap = np.zeros( (len(dist_threshes) , len(CLASS_LABELS) , len(overlaps)) , float )
     for di, (min_region_size, distance_thresh, distance_conf) in enumerate(zip(min_region_sizes, dist_threshes, dist_confs)):
         for oi, overlap_th in enumerate(overlaps):
             pred_visited = {}
@@ -107,7 +110,7 @@ def evaluate_matches(matches):
 
                     cur_true  = np.ones ( len(gt_instances) )
                     cur_score = np.ones ( len(gt_instances) ) * (-float("inf"))
-                    cur_match = np.zeros( len(gt_instances) , dtype=np.bool )
+                    cur_match = np.zeros( len(gt_instances) , dtype=np.bool_)
                     # collect matches
                     for (gti,gt) in enumerate(gt_instances):
                         found_match = False
@@ -170,7 +173,7 @@ def evaluate_matches(matches):
                     y_score = np.append(y_score,cur_score)
 
                 # compute average precision
-                if has_gt and has_pred:
+                if has_gt and has_pred and len(y_score) > 0:
                     # compute precision recall curve first
 
                     # sorting and cumsum
@@ -245,11 +248,11 @@ def compute_averages(aps):
 def assign_instances_for_scan(pred_file, gt_file, pred_path):
     try:
         pred_info = util_3d.read_instance_prediction_file(pred_file, pred_path)
-    except Exception, e:
+    except Exception as e:
         util.print_error('unable to load ' + pred_file + ': ' + str(e))
     try:
         gt_ids = util_3d.load_ids(gt_file)
-    except Exception, e:
+    except Exception as e:
         util.print_error('unable to load ' + gt_file + ': ' + str(e))
 
     # get gt instances
@@ -314,15 +317,15 @@ def print_results(avgs):
     col1    = ":"
     lineLen = 64
 
-    print ""
-    print "#"*lineLen
+    print("")
+    print("#"*lineLen)
     line  = ""
     line += "{:<15}".format("what"      ) + sep + col1
     line += "{:>15}".format("AP"        ) + sep
     line += "{:>15}".format("AP_50%"    ) + sep
     line += "{:>15}".format("AP_25%"    ) + sep
-    print line
-    print "#"*lineLen
+    print(line)
+    print("#"*lineLen)
 
     for (li,label_name) in enumerate(CLASS_LABELS):
         ap_avg  = avgs["classes"][label_name]["ap"]
@@ -332,19 +335,19 @@ def print_results(avgs):
         line += sep + "{:>15.3f}".format(ap_avg ) + sep
         line += sep + "{:>15.3f}".format(ap_50o ) + sep
         line += sep + "{:>15.3f}".format(ap_25o ) + sep
-        print line
+        print(line)
 
     all_ap_avg  = avgs["all_ap"]
     all_ap_50o  = avgs["all_ap_50%"]
     all_ap_25o  = avgs["all_ap_25%"]
 
-    print "-"*lineLen
+    print("-"*lineLen)
     line  = "{:<15}".format("average") + sep + col1 
     line += "{:>15.3f}".format(all_ap_avg)  + sep 
     line += "{:>15.3f}".format(all_ap_50o)  + sep
     line += "{:>15.3f}".format(all_ap_25o)  + sep
-    print line
-    print ""
+    print(line)
+    print("")
 
 
 def write_result_file(avgs, filename):
@@ -361,7 +364,7 @@ def write_result_file(avgs, filename):
 
 
 def evaluate(pred_files, gt_files, pred_path, output_file):
-    print 'evaluating', len(pred_files), 'scans...'
+    print('evaluating', len(pred_files), 'scans...')
     matches = {}
     for i in range(len(pred_files)):
         matches_key = os.path.abspath(gt_files[i])
@@ -372,7 +375,7 @@ def evaluate(pred_files, gt_files, pred_path, output_file):
         matches[matches_key]['pred'] = pred2gt
         sys.stdout.write("\rscans processed: {}".format(i+1))
         sys.stdout.flush()
-    print ''
+    print('')
     ap_scores = evaluate_matches(matches)
     avgs = compute_averages(ap_scores)
 
