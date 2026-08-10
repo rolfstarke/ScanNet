@@ -18,39 +18,48 @@ Bugs, problems, and their attempted fixes live in GitHub Issues (`rolfstarke/Sca
 ### spellbook/ (all project code lives here)
 ```
 spellbook/
-├── main.py                      # CLI: --visualize, --predict (multi-scene, --gpu, --classes, --label_set)
+├── main.py                      # CLI: --visualize, --predict (--benchmark, --run-id, multi-scene, --gpu)
+├── settings.yaml                # default benchmark + scannet_root
+├── benchmark.py                 # BenchmarkSpec (ScanNet20: 18 classes / ScanNet200: 198 = 200 - wall/floor), paths
+├── evaluate.py                  # GT export + evaluation dispatch (official / scannet200 evaluator)
+├── scannet200_evaluator.py      # Python-3 port of Rozenberszki's ScanNet200 evaluator (198-class)
 ├── environment.yaml             # 3disspellbook conda env
 ├── PROJECT_STATUS.md            # this file
 ├── utils/
-│   ├── visualize.py             # Open3D viewer + ImGui legend (GT + predictions)
+│   ├── visualize.py             # Open3D viewer + ImGui legend (GT + official submission predictions)
 │   └── hud.py
-├── predict/
-│   ├── runner.py                # model→env dispatch, free-GPU queue, sequential up-front frame extraction
-│   ├── frames.py                # .sens extraction via ScanNet's SensorData exporters (0..N-1), idempotent
-│   └── models/
-│       ├── common.py            # decimate(), write_scannet_predictions (label_set: scannet18 | scannet200)
-│       ├── _mosaic3d_run.py     # point-cloud only
-│       ├── _openins3d_run.py    # point-cloud only; --detector {odise,yoloworld}
-│       ├── _openyolo3d_run.py   # needs frames
-│       └── _open3dis_run.py     # needs frames
-└── eval/
-    ├── export_gt.py             # flat per-vertex label*1000+instance GT (18 + 200 label sets)
-    ├── evaluate_semantic_instance.py  # official evaluator, Python-3 ported, --label_set
-    ├── run_eval.py              # collects per-scene preds + runs evaluator per model
-    ├── gt/, gt200/              # generated GT files
-    └── results_*.txt            # per-model result CSVs (+ results_prefix/ = pre-fix reference)
+└── predict/
+    ├── runner.py                # model→env dispatch, free-GPU queue, sequential up-front frame extraction
+    ├── frames.py                # .sens extraction via ScanNet's SensorData exporters (0..N-1), idempotent
+    └── models/
+        ├── common.py            # decimate(), write_scannet_submission (official submission layout)
+        ├── _mosaic3d_run.py     # point-cloud only
+        ├── _openins3d_run.py    # point-cloud only; --detector {odise,yoloworld}
+        ├── _openyolo3d_run.py   # needs frames
+        └── _open3dis_run.py     # needs frames
 ```
 
-### Data Layout (`/data/scannet/scans/<scene_id>/` — ScanNet native structure)
+### Data Layout (`/data/scannet/` — scans/ stays official, artifacts outside)
 ```
-scene0568_00/
-├── scene0568_00_vh_clean_2.ply          # mesh used as model input + GT vertex basis
-├── scene0568_00.aggregation.json        # GT instance annotations
-├── scene0568_00_vh_clean_2.0.010000.segs.json
-├── scene0568_00.sens                    # RGB-D sensor data
+/data/scannet/
+├── scans/<scene_id>/            # official ScanNet data, unchanged
+│   ├── sceneXXXX_YY_vh_clean_2.ply          # mesh used as model input + GT vertex basis
+│   ├── sceneXXXX_YY.aggregation.json        # GT instance annotations
+│   ├── sceneXXXX_YY_vh_clean_2.0.010000.segs.json
+│   ├── sceneXXXX_YY.sens                    # RGB-D sensor data
+│   ├── frames/{color,depth,pose}/{0..N-1}.{jpg,png,txt}
+│   └── frames/intrinsic_{color,depth}.txt + extrinsic_{color,depth}.txt
+├── predictions/<Benchmark>/<run-id>/<model>/   # official submission root (zippable as-is)
+│   ├── sceneXXXX_YY.txt                       # "predicted_masks/<scene>_NNN.txt <label> <conf>"
+│   └── predicted_masks/<scene>_NNN.txt
+├── derived/
+│   ├── ground_truth/<Benchmark>/<scene>.txt   # flat per-vertex label*1000+instance
+│   ├── evaluations/<Benchmark>/<run-id>/      # result CSVs + <model>.tasks completion markers
+│   └── legacy/                                # pre-migration results (18-class valid, 189-class invalid per #12)
+└── v2/scannetv2-labels.combined.tsv           # label map (raw_category -> nyu40id | id)
+```
 ├── frames/{color,depth,pose}/{0..N-1}.{jpg,png,txt}
-├── frames/intrinsic_{color,depth}.txt + extrinsic_{color,depth}.txt
-└── predictions/<model>/{labels.txt, predictions.txt, predicted_masks/NNN.txt}
+└── frames/intrinsic_{color,depth}.txt + extrinsic_{color,depth}.txt
 ```
 
 ### Scenes (20 official val scenes, ~2.5GB each)
@@ -76,33 +85,33 @@ Per-model integration issues: #2 (openyolo3d intrinsics), #3 (open3dis rescale),
 
 1. **Native model pipelines**: call each model's own ScanNet-capable API, not ov3dis-comparison wrappers.
 2. **Canonical frame pool**: full-density extraction to `frames/` (sequential 0..N-1 names, 4 native intrinsic files); models subsample via their own configs. ScanNet's SensReader `export_*` would keep gapped indices — rejected (#5).
-3. **Prediction output**: `/data/scannet/scans/<scene_id>/predictions/<model>/` in ScanNet benchmark format (`labels.txt`, `predictions.txt`, `predicted_masks/NNN.txt`, one mask line per mesh vertex).
-4. **Label ids**: real NYU40 ids (18-class) resp. raw `id`-column ids (ScanNet200) from ScanNet's own constants; unknown class names raise (see #1).
-5. **Benchmark protocol**: official ScanNet18 (18 classes) and ScanNet200 instance (198 classes = 200 − wall/floor; 187 effective on val) — see #12.
+3. **Prediction output**: official ScanNet submission layout, one directory per (benchmark, run, model): `/data/scannet/predictions/<Benchmark>/<run-id>/<model>/` with `<scene>.txt` + `predicted_masks/<scene>_NNN.txt`. Directly zippable as a benchmark submission; runs never overwrite each other (#16).
+4. **Label ids**: real NYU40 ids (ScanNet20) resp. raw `id`-column ids (ScanNet200, 198 classes = 200 minus wall/floor) from ScanNet's own constants, derived in `benchmark.py` as the single source of truth; unknown class names raise (see #1, #12).
+5. **Benchmark protocol**: `settings.yaml` selects the default backend (ScanNet20 = official evaluator ported in place to Python 3; ScanNet200 = port of the benchmark author's evaluator, since ScanNet/ScanNet publishes no ScanNet200 instance evaluator). `--benchmark` overrides; `--classes` is for custom (non-benchmark) prediction only.
 6. **GPU dispatch**: free-GPU queue over `--gpu` list (default all GPUs); frames extracted sequentially up front (see #9).
-7. **Evaluation**: flat per-vertex GT encoding via `export_gt.py` (ScanNet's own export tool is inconsistent with its evaluator, see #8); evaluator ported to Python 3 with edge-case fix (#8).
+7. **Evaluation**: flat per-vertex GT encoding via `evaluate.py export-gt` (ScanNet's own export tool is inconsistent with its evaluator, see #8); evaluators ported to Python 3 with edge-case fix (#8); `evaluate.py evaluate` dispatches per benchmark with pre-flight validation (#11).
 
 ---
 
 ## Commands
 
 ```bash
-# Prediction (multi-scene, multi-GPU; label_set: scannet18 | scannet200)
+# Prediction (default benchmark from settings.yaml; --benchmark overrides)
 python spellbook/main.py --predict --scene 0568_00 0304_00 --models mosaic3d,openins3d,openyolo3d,open3dis \
-    --classes cabinet,bed,chair,... --label_set scannet18
+    --benchmark ScanNet20 --run-id myrun        # classes default to the benchmark's official list
 
-# Ground truth export
-python spellbook/eval/export_gt.py --scan_path /data/scannet/scans/<scene> --output_file <out>.txt \
-    --label_map_file /data/scannet/v2/scannetv2-labels.combined.tsv --label_set scannet18|scannet200
+# Ground truth export (all 20 scenes done; re-run after adding scenes)
+python spellbook/evaluate.py export-gt --scene 0568_00 --benchmark ScanNet20|ScanNet200
 
-# Evaluation
-python spellbook/eval/run_eval.py --models m1,m2 --scenes scene0568_00,... --label_set scannet18|scannet200
+# Evaluation (predictions must exist under predictions/<Benchmark>/<run-id>/<model>/)
+python spellbook/evaluate.py evaluate --run-id myrun --models mosaic3d,open3dis \
+    --scenes 0568_00,0304_00,... --benchmark ScanNet20|ScanNet200
 
-# Visualization
-python spellbook/main.py --visualize --scene 0568_00
+# Visualization (predictions need --run-id; without it: GT only)
+python spellbook/main.py --visualize --scene 0568_00 --benchmark ScanNet20 --run-id myrun
 ```
 
-Class lists: 18-class names in `common.py` (`BENCHMARK_CLASS_LABELS`); ScanNet200 198-instance list from `BenchmarkScripts/ScanNet200/scannet200_constants.py` (200) minus ids {1,3}.
+Class lists: derived in `spellbook/benchmark.py` from `BenchmarkScripts/ScanNet200/scannet200_constants.py` — ScanNet20: 20 minus wall/floor = 18 NYU40 ids; ScanNet200: 200 minus ids {1,3} = 198 raw ids.
 
 ---
 

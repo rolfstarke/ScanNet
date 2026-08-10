@@ -88,10 +88,10 @@ def export_gt(scan_path, output_file, spec, scannet_root=None):
     label_ids = np.zeros(num_verts, dtype=np.uint32)
     for label, segs in label_to_segs.items():
         label_id = label_map[label]
-        if label_id not in valid_ids:
-            continue
         for seg in segs:
             label_ids[seg_to_verts[seg]] = label_id
+    if spec.gt_column == "id":  # ScanNet200: zero non-198 classes (old 189-set kept wall/floor)
+        label_ids[~np.isin(label_ids, list(valid_ids))] = 0
 
     instance_ids = np.zeros(num_verts, dtype=np.uint32)
     for object_id, segs in object_id_to_segs.items():

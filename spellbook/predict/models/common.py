@@ -19,12 +19,16 @@ from scipy.spatial import cKDTree
 
 def _benchmark_spec(benchmark_name):
     """Resolve a benchmark name to its BenchmarkSpec (spellbook/benchmark.py). The wrappers run
-    as subprocesses in OTHER conda envs with no spellbook path set, so insert the spellbook dir
-    (three levels above this file) lazily and import on demand."""
+    as subprocesses in OTHER conda envs with no spellbook path set, and MUST NOT get spellbook
+    dir on sys.path (it shadows e.g. OpenIns3D's `from utils import ...` absolute imports), so
+    load benchmark.py via importlib from its absolute path instead."""
+    import importlib.util
     spellbook_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    sys.path.insert(0, spellbook_dir)
-    from benchmark import resolve_benchmark
-    return resolve_benchmark(benchmark_name)
+    spec_path = os.path.join(spellbook_dir, "benchmark.py")
+    _spec = importlib.util.spec_from_file_location("spellbook_benchmark", spec_path)
+    module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(module)
+    return module.resolve_benchmark(benchmark_name)
 
 
 def scene_id_from_pointcloud(pointcloud_path):

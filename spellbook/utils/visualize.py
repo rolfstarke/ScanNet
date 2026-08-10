@@ -11,10 +11,12 @@ from matplotlib import colormaps
 
 _BENCHMARKSCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "BenchmarkScripts")
 sys.path.insert(0, _BENCHMARKSCRIPTS)
+_SPELLBOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+sys.path.insert(0, _SPELLBOOK)
 import util  # noqa: E402
 import util_3d  # noqa: E402
-from ..benchmark import artifact_paths, resolve_benchmark  # noqa: E402
-from . import hud
+from benchmark import artifact_paths, resolve_benchmark  # noqa: E402
+from utils import hud  # noqa: E402
 
 DEFAULT_SCANNET_DIR = "/data/scannet/scans"
 LABEL_MAP_FILE = "/data/scannet/v2/scannetv2-labels.combined.tsv"
@@ -159,7 +161,8 @@ def _hud_payload(scene_id, state, objects, gt_counts, nyu40map, palette):
     }
 
 
-def visualize(scene_id, scannet_dir=DEFAULT_SCANNET_DIR, ceiling_height=2.0):
+def visualize(scene_id, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet20", run_id=None,
+              ceiling_height=2.0):
     if not os.environ.get("DISPLAY"):
         raise RuntimeError(
             "No DISPLAY set -- Open3D needs a real or virtual X display to open a window.")
@@ -192,7 +195,11 @@ def visualize(scene_id, scannet_dir=DEFAULT_SCANNET_DIR, ceiling_height=2.0):
 
     gt = load_gt_instances(scene_dir)
     gt_counts = _instance_counts(gt["objects"]) if gt else Counter()
-    pred_models = available_models(scene_dir)
+    spec = resolve_benchmark(benchmark)
+    run_root = os.path.join(artifact_paths(spec)["predictions"], run_id) if run_id else None
+    pred_models = available_models(run_root) if run_root else []
+    if run_root and not pred_models:
+        print(f"[WARN] no predictions found under {run_root} -- GT only")
     model_options = [None, "ground_truth"] + pred_models
     model = "ground_truth"
 
@@ -204,8 +211,8 @@ def visualize(scene_id, scannet_dir=DEFAULT_SCANNET_DIR, ceiling_height=2.0):
                 return objects, boxes, labels
             data = gt
         elif name is not None:
-            data = load_predictions(os.path.join(scene_dir, PREDICTIONS_ROOT, name),
-                                    scene_pts, scene_colors)
+            data = load_predictions(os.path.join(run_root, name),
+                                    scene_pts, scene_colors, spec)
         else:
             return objects, boxes, labels
         for o in data["objects"]:

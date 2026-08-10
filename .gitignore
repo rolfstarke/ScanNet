@@ -27,7 +27,6 @@ venv/
 env/
 
 # Spellbook runtime artifacts (large files)
-spellbook/eval/
 
 # Common ML/Model files
 *.pth
