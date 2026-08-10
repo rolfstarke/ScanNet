@@ -170,6 +170,7 @@ def main():
     decimated = _ensure_working_ply(args.pointcloud, working_ply, DECIMATE_LIMIT)
 
     split_path = os.path.join(SCRATCH_ROOT, scene_id, "open3dis_split.txt")
+    os.makedirs(os.path.dirname(split_path), exist_ok=True)
     with open(split_path, "w") as f:
         f.write(scene_id + "\n")
 
