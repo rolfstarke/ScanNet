@@ -24,8 +24,15 @@ def main():
                         help="benchmark backend (default: spellbook/settings.yaml)")
     parser.add_argument("--run-id", type=str, default=None,
                         help="run id for output isolation (default: auto-generated)")
+    parser.add_argument("--engine", nargs="+", default=None,
+                        choices=["zed", "metashape", "rtabmap", "isaac", "open3d",
+                                 "bundlefusion"],
+                        help="reconstruct mode: SVO2 -> ScanNet-native scan per "
+                             "(scene, engine); frames extracted once, tasks parallel over --gpu")
+    parser.add_argument("--replace", action="store_true",
+                        help="re-extract frames even if a complete set exists")
     parser.add_argument("--scene", nargs="+", required=True,
-                        help="scene numbers (e.g., 0568_00 0304_00)")
+                        help="scene numbers (e.g., 0568_00 0304_00 or 9004 9009)")
     args = parser.parse_args()
 
     from benchmark import load_settings, resolve_benchmark
@@ -47,6 +54,11 @@ def main():
         from predict.runner import predict
         predict([f"scene{s}" for s in args.scene], args.models.split(","),
                 classes, args.gpu, benchmark, run_id)
+    elif args.engine:
+        from reconstruct.batch import run_batch
+        ok, failed = run_batch([int(s) for s in args.scene], args.engine,
+                               args.gpu, args.replace)
+        sys.exit(1 if failed else 0)
     else:
         parser.print_help()
 

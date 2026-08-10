@@ -90,7 +90,7 @@ def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, task
         return model, scene_id, None, time.time() - start, False
 
 
-def predict(scene_ids, models, classes, gpus=None, benchmark="ScanNet20", run_id=None):
+def predict(scene_ids, models, classes, gpus=None, benchmark="ScanNet20", run_id=None, replace=False):
     """Run predictions for `models` on all `scene_ids`, in parallel over a free-GPU pool.
 
     Each (benchmark, run, model) writes an official ScanNet submission directly to
@@ -127,7 +127,7 @@ def predict(scene_ids, models, classes, gpus=None, benchmark="ScanNet20", run_id
     if need_frames:
         from predict.frames import extract_frames
         for scene_id in scene_ids:
-            frames_dir_by_scene[scene_id] = extract_frames(scene_id)
+            frames_dir_by_scene[scene_id] = extract_frames(scene_id, replace)
 
     tasks = [(m, s) for m in models for s in scene_ids]
     gpus = list(gpus) if gpus else list(range(gpu_count()))
