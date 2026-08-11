@@ -13,7 +13,7 @@ Bugs, problems, and their attempted fixes live in GitHub Issues (`rolfstarke/Sca
 ## Repository Structure
 
 ### ScanNet (upstream, first priority)
-- `BenchmarkScripts/` — official evaluators, ScanNet200 constants/splits. Only minimal Python-3 patches applied (see #5); logic untouched.
+- `BenchmarkScripts/` — official evaluators, ScanNet200 constants/splits. Python-3 compatibility patches plus the empty-match edge-case fix from #8; metric logic otherwise unchanged.
 - `SensReader/python/SensorData.py` — Python-3 ported (.sens reader); logic untouched (see #5).
 - `Tasks/Benchmark/scannetv2_val.txt` — official val split list.
 
@@ -27,6 +27,8 @@ spellbook/
 ├── scannet200_evaluator.py      # Python-3 port of Rozenberszki's ScanNet200 evaluator (198-class)
 ├── environment.yaml             # 3disspellbook conda env
 ├── PROJECT_STATUS.md            # this file
+├── archive/                      # completed action plans, research reports, and retained evidence
+├── tmp/                          # active plans/research and transient logs
 ├── utils/
 │   ├── visualize.py             # Open3D viewer + ImGui legend (GT + official submission predictions)
 │   └── hud.py
@@ -144,6 +146,7 @@ Known pose-source limitation (measured, #18/#19 context): ZED SDK 5.4 tracking d
 11. **axisAlignment**: computed (pure z-rotation + translation, det == 1) and written to `<id>.txt`, NEVER applied — released ScanNet meshes and `.sens` poses share the raw frame (consumers apply it).
 12. **Depth/pose conventions**: ZED X native resolution (1920x1080 / 1920x1200 per recording); depth 0.1-6.0 m, invalid = 0, trailing SVO frame dropped; camera-to-world poses conjugated `diag(1,-1,-1,1)` from ZED's z-backward basis; gravity z-up alignment per `alignment.h`; the batch extracts each SVO once (shared frames, `--replace` to regenerate) and runs engine tasks in parallel subprocesses.
 13. **QC**: 13 metrics vs bars measured from real ScanNet scenes (`scannet_reference.yaml`); PASS/FAIL written to `recon/qc.yaml`, FAIL reported, never aborts.
+14. **Foreign-environment imports**: model subprocesses load `spellbook/benchmark.py` by absolute `importlib` spec. Adding `spellbook/` to `sys.path` shadows model repositories' top-level packages such as OpenIns3D's `utils`.
 
 ---
 
@@ -191,14 +194,10 @@ Class lists: derived in `spellbook/benchmark.py` from `BenchmarkScripts/ScanNet2
 
 ## Current Plan / Next Steps
 
-1. Fix ScanNet200 protocol to the official 198-class instance set (prompts, GT, evaluator) and re-run — #12.
-2. Investigate OpenIns3D's 189-class collapse / anomaly scenes — #13.
-3. Hardening: eval CLI validation #11, atomic/isolated prediction outputs #16, batch supervision #17, Open3DIS tracker race #15, env reproducibility #14.
-4. Optional: extend from 20 to the full 312-scene val split once hardening is in place.
-5. Optional: re-evaluate after protocol fix to obtain the defensible ScanNet200 numbers.
-6. Run the full reconstruction batch: `main.py --scene 9004 9009 --engine metashape isaac bundlefusion open3d zed rtabmap --gpu 1 2 3 4`; per-scan QC gates rank the engines.
-7. Isaac: build `zed-isaac-nvblox:spellbook` (NGC pull + zed layer) and verify the cuVSLAM pose + save_ply mesh path — #22.
-8. Verify the remaining engine adapters end-to-end (bundlefusion, metashape, rtabmap have never run).
-9. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS).
-
-Status of prior benchmark results is recorded in the issues (#1–#4, #12) and in `spellbook/eval/results_*.txt`; this file deliberately keeps no result chronology.
+1. Investigate OpenIns3D's ScanNet200 collapse / anomaly scenes — #13.
+2. Hardening: atomic/resumable prediction outputs #16, batch supervision #17, Open3DIS tracker race #15, env reproducibility #14.
+3. Optional: extend from 20 to the full 312-scene val split once hardening is in place.
+4. Run the full reconstruction batch: `main.py --scene 9004 9009 --engine metashape isaac bundlefusion open3d zed rtabmap --gpu 1 2 3 4`; per-scan QC gates rank the engines.
+5. Isaac: build `zed-isaac-nvblox:spellbook` (NGC pull + zed layer) and verify the cuVSLAM pose + save_ply mesh path — #22.
+6. Verify the remaining engine adapters end-to-end (bundlefusion, metashape, rtabmap have never run).
+7. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS).

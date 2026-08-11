@@ -26,7 +26,8 @@ __pycache__/
 venv/
 env/
 
-# Spellbook runtime artifacts (large files)
+# Spellbook runtime artifacts
+spellbook/archive
 
 # Common ML/Model files
 *.pth
