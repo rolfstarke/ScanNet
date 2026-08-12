@@ -127,7 +127,7 @@ Per-model integration issues: #2 (openyolo3d intrinsics), #3 (open3dis rescale),
 | rtabmap | RTAB-Map graph-optimized | RTAB-Map textured mesh | podman `localhost/zed-rtabmap:jazzy` |
 | isaac | cuVSLAM | Nvblox 4 mm TSDF | podman `zed-isaac-nvblox:spellbook` (see #22) |
 
-Known pose-source limitation (measured, #18/#19 context): ZED SDK 5.4 tracking drifts ~1 m over the 9009 walk, so zed/open3d scans fail the surface/floor-density QC gates; bundlefusion/metashape/rtabmap (global optimization) are the intended fix. QC numbers per scan live in `recon/qc.yaml`, never in this file.
+Zed/open3d are local-pose baselines; multiroom drift and density remain tracked in #25. BundleFusion, Metashape, RTAB-Map, and Isaac provide the global-optimization comparisons; per-scan measurements live only in `recon/qc.yaml` and issues.
 
 ---
 
@@ -164,8 +164,8 @@ python spellbook/evaluate.py export-gt --scene 0568_00 --benchmark ScanNet20|Sca
 python spellbook/evaluate.py evaluate --run-id myrun --models mosaic3d,open3dis \
     --scenes 0568_00,0304_00,... --benchmark ScanNet20|ScanNet200
 
-# Visualization (predictions need --run-id; without it: GT only)
-python spellbook/main.py --visualize --scene 0568_00 --benchmark ScanNet20 --run-id myrun
+# Visualization (opens GT; arrow keys select benchmark, compatible run/model, and mode)
+python spellbook/main.py --visualize --scene 0568_00
 
 # Reconstruction batch (frames extracted once per scene, then tasks in parallel over --gpu;
 # terminal shows only tqdm GPU bars; logs under spellbook/tmp/logs/reconstruct-<run-id>/)
@@ -199,5 +199,5 @@ Class lists: derived in `spellbook/benchmark.py` from `BenchmarkScripts/ScanNet2
 3. Optional: extend from 20 to the full 312-scene val split once hardening is in place.
 4. Run the full reconstruction batch: `main.py --scene 9004 9009 --engine metashape isaac bundlefusion open3d zed rtabmap --gpu 1 2 3 4`; per-scan QC gates rank the engines.
 5. Isaac: build `zed-isaac-nvblox:spellbook` (NGC pull + zed layer) and verify the cuVSLAM pose + save_ply mesh path — #22.
-6. Verify the remaining engine adapters end-to-end (bundlefusion, metashape, rtabmap have never run).
+6. Verify the remaining engine adapters end-to-end (bundlefusion, metashape, rtabmap have never run); compare global methods against the local-pose baseline — #25.
 7. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS).

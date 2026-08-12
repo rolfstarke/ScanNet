@@ -7,7 +7,7 @@
 - always make sure to keep ScanNet fully intact and operable with all additions
 
 ### task workflow
-- For every non-trivial task, delegate independent research to multiple research subagents; save each report to spellbook/tmp.
+- For every non-trivial task, delegate independent research to multiple research subagents using @scout and @explore; save each report to spellbook/tmp.
 - do research in large parallel batches if non-overlapping tasks allow for it
 - write detailed action plans for @build agents directly to separate .md files in spellbook/tmp. summarize in chat.
 - action plan should be self-contained, concise, file-specific, and include constraints, commands, acceptance tests, and cleanup steps
