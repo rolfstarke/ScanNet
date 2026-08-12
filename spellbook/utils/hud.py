@@ -26,29 +26,26 @@ def _window_geometry(parent_pid, scene_id):
     return values["X"], values["Y"], values["WIDTH"], values["HEIGHT"]
 
 
-def _draw_class_row(imgui, name, current, ground_truth, color, prediction_mode):
+def _draw_class_row(imgui, name, color):
     draw = imgui.get_window_draw_list()
     x, y = imgui.get_cursor_screen_pos()
     text = imgui.get_color_u32_rgba(0.08, 0.08, 0.08, 1.0)
-    track = imgui.get_color_u32_rgba(0.74, 0.74, 0.74, 1.0)
-    fill = imgui.get_color_u32_rgba(0.25, 0.25, 0.25, 1.0)
-    marker = imgui.get_color_u32_rgba(0.04, 0.04, 0.04, 1.0)
     swatch = imgui.get_color_u32_rgba(*color, 1.0)
 
     draw.add_rect_filled(x, y + 2, x + 11, y + 13, swatch, 2)
     draw.add_text(x + 17, y, text, name)
-    if prediction_mode:
-        draw.add_text(x + 175, y, text, f"{current}/{ground_truth}")
-        bar_x, bar_y, bar_w, bar_h = x + 215, y + 4, 90, 7
-        draw.add_rect_filled(bar_x, bar_y, bar_x + bar_w, bar_y + bar_h, track, 1)
-        ratio = current / ground_truth if ground_truth else (2.0 if current else 0.0)
-        draw.add_rect_filled(bar_x, bar_y, bar_x + bar_w * min(ratio / 2.0, 1.0),
-                             bar_y + bar_h, fill, 1)
-        target_x = bar_x + bar_w / 2
-        draw.add_line(target_x, bar_y - 2, target_x, bar_y + bar_h + 2, marker, 1.5)
-    else:
-        draw.add_text(x + 175, y, text, str(ground_truth))
     imgui.dummy(315, 17)
+
+
+def _draw_setting_row(imgui, row):
+    draw = imgui.get_window_draw_list()
+    x, y = imgui.get_cursor_screen_pos()
+    if row["selected"]:
+        draw.add_rect_filled(x - 6, y - 3, x + WIDTH - 6, y + 17,
+                             imgui.get_color_u32_rgba(0.82, 0.88, 1.0, 1.0))
+    marker = "> " if row["selected"] else "  "
+    imgui.text(f"{marker}{row['name']}: {row['value']}")
+    imgui.dummy(0, 4)
 
 
 def _draw(imgui, payload, height):
@@ -58,20 +55,31 @@ def _draw(imgui, payload, height):
              imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE |
              imgui.WINDOW_NO_SAVED_SETTINGS | imgui.WINDOW_NO_INPUTS)
     imgui.begin("##scannet_hud", flags=flags)
+
+    # Block 1: Information
     imgui.text("ScanNet")
     imgui.separator()
     imgui.text(f"Scene: {payload['scene']}")
-    imgui.text(f"Model: {payload['model']}")
-    imgui.text(f"View: {payload['geometry']}    Colors: {payload['color_mode']}")
-    imgui.text("M mesh/points   B boxes   H height   C classes   I instances   N next")
+    imgui.text(f"Source: {payload['source']}")
+    imgui.text(f"Instances: {payload['visible_count']}")
+    if payload["tp"] is not None:
+        imgui.text(f"TP: {payload['tp']}   FP: {payload['fp']}")
+    if payload["status"]:
+        imgui.text(payload["status"])
+    imgui.text(payload["help"])
     imgui.separator()
-    heading = "Classes   prediction / ground truth" if payload["prediction_mode"] else "Classes   instances"
-    imgui.text(heading)
+
+    # Block 2: Settings
+    imgui.text("Settings")
+    for row in payload["settings"]:
+        _draw_setting_row(imgui, row)
+    imgui.separator()
+
+    # Block 3: Classes
+    imgui.text("Classes")
     imgui.columns(2, "class_columns", border=False)
     for name in payload["classes"]:
-        _draw_class_row(imgui, name, payload["counts"].get(name, 0),
-                        payload["ground_truth"].get(name, 0), payload["colors"][name],
-                        payload["prediction_mode"])
+        _draw_class_row(imgui, name, payload["colors"][name])
         imgui.next_column()
     imgui.columns(1)
     imgui.end()
