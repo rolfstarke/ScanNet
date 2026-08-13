@@ -53,7 +53,7 @@ def _depth_bytes(depth_u16):
     return zlib.compress(depth_u16.astype("<u2").tobytes(), level=6)
 
 
-def read_gravity(svo, gpu=None):
+def read_gravity(svo):
     """Quick SVO open to read the IMU gravity vector (no frame grab, no depth compute)."""
     import pyzed.sl as sl
     init = sl.InitParameters()
@@ -83,7 +83,7 @@ def frames_complete(frames_dir):
             and os.path.isfile(os.path.join(frames_dir, "intrinsic_depth.txt")))
 
 
-def ensure_frames(svo, work_dir, gpu=None, replace=False):
+def ensure_frames(svo, work_dir, replace=False):
     """Extract SVO frames once and reuse complete sets; `replace=True` re-extracts.
     Returns the same info dict as extract()."""
     frames = os.path.join(work_dir, "frames")
@@ -99,15 +99,15 @@ def ensure_frames(svo, work_dir, gpu=None, replace=False):
             "poses": np.load(os.path.join(frames, "camera_to_world.npy")),
             "states": open(os.path.join(frames, "pose_state.txt")).read().split(),
             "svo_frames": len(open(os.path.join(frames, "pose_state.txt")).read().split()),
-            "gravity": np.load(grav_path) if os.path.exists(grav_path) else read_gravity(svo, gpu=gpu),
+            "gravity": np.load(grav_path) if os.path.exists(grav_path) else read_gravity(svo),
         }
-    info = extract(svo, work_dir, gpu=gpu)
+    info = extract(svo, work_dir)
     print(f"[extract] {info['svo_frames']} svo frames, {len(info['poses'])} exported, "
           f"K={info['K'][0, 0]:.2f} f / {info['K'][0, 2]:.1f},{info['K'][1, 2]:.1f} c")
     return info
 
 
-def extract(svo, work_dir, gpu=None):
+def extract(svo, work_dir):
     """Play the SVO once, write work_dir/frames/{color,depth,pose} + pose_state.txt +
     intrinsic files. Returns dict(poses=(N,4,4), states, K=(3,3), gravity, svo_frames=N).
     Poses are ZED RIGHT_HANDED_Y_UP, camera OpenCV (x right, y down, z fwd)."""

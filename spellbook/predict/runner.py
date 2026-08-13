@@ -3,20 +3,25 @@ writing ScanNet official benchmark submissions to
 /data/scannet/predictions/<Benchmark>/<run-id>/<model>/ (flat <scene>.txt files +
 predicted_masks/, directly zippable for scan-net.org).
 
-Tasks are the (model x scene) cross-product, dispatched in parallel over a free-GPU pool:
-each worker claims the next free GPU from a queue, runs one task, then releases it
-(minimal adaptation of the ov3dis-comparison `predict_parallel` pattern). Without an
-explicit GPU list, every GPU reported by nvidia-smi is used. Completed (scene) tasks are
-appended to a per-run marker file under derived/evaluations/<Benchmark>/<run-id>/<model>.tasks
-as the resume state.
+Tasks are the (model x scene) cross-product, dispatched in parallel over the shared
+automatic GPU pool from spellbook/settings.yaml (gpu_pool): each worker blocks on a
+cross-process flock lease for one of GPUs 1-4, runs one task, then releases it. Physical
+GPU 0 is never allocated (reserved for the ZED SDK, issue #18). The lease descriptor is
+forwarded to the model child with pass_fds so the GPU job survives the runner; children
+see a single visible GPU via CUDA_VISIBLE_DEVICES=<physical index>. Completed (scene)
+tasks are appended to a per-run marker file under
+derived/evaluations/<Benchmark>/<run-id>/<model>.tasks as the resume state.
 """
 import os
-import queue
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from benchmark import load_settings
+
 SCANS_DIR = "/data/scannet/scans"
+
+LEASE_FD_ENV = "SPELLBOOK_GPU_LEASE_FD"
 
 MODEL_PYTHON = {
     "mosaic3d": "/data/mosaic3d/conda/envs/mosaic3d/bin/python",
@@ -45,20 +50,11 @@ MODEL_NEEDS_FRAMES = {
 OPENYOLO3D_CUDA_HOME = "/data/openyolo3D/cuda-11.3"
 
 
-def gpu_count():
-    """Number of GPUs as reported by nvidia-smi (0 if unavailable)."""
-    try:
-        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
-        return len([l for l in out.stdout.splitlines() if l.strip()])
-    except OSError:
-        return 0
-
-
 def _pointcloud_path(scene_id):
     return os.path.join(SCANS_DIR, scene_id, f"{scene_id}_vh_clean_2.ply")
 
 
-def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, tasks_log):
+def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, tasks_log, lease):
     """Run one (model, scene) task in a subprocess; appends scene_id to the task marker file
     on success. Returns (model, scene_id, out_dir, elapsed, ok)."""
     os.makedirs(out_dir, exist_ok=True)
@@ -70,16 +66,20 @@ def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, task
         if frames_dir is None:
             raise RuntimeError(f"{model} needs frames but extraction produced none for {scene_id}")
         args += ["--frames", frames_dir]
-    args += ["--gpu", str(gpu)]
 
     env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    if lease is not None:
+        env[LEASE_FD_ENV] = str(lease.fileno())
     if model == "openyolo3d":
         env["LD_LIBRARY_PATH"] = os.path.join(OPENYOLO3D_CUDA_HOME, "lib64") + ":" + env.get("LD_LIBRARY_PATH", "")
 
-    print(f"[INFO] running {model} on {scene_id} (gpu {gpu}) ...")
+    pass_fds = () if lease is None else (lease.fileno(),)
+
+    print(f"[INFO] running {model} on {scene_id} (auto GPU {gpu}) ...")
     start = time.time()
     try:
-        subprocess.run(args, env=env, check=True)
+        subprocess.run(args, env=env, check=True, pass_fds=pass_fds)
         elapsed = time.time() - start
         print(f"[INFO] {model} on {scene_id} done in {elapsed:.1f}s -> {out_dir}")
         with open(tasks_log, "a") as f:
@@ -90,16 +90,21 @@ def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, task
         return model, scene_id, None, time.time() - start, False
 
 
-def predict(scene_ids, models, classes, gpus=None, benchmark="ScanNet20", run_id=None, replace=False):
-    """Run predictions for `models` on all `scene_ids`, in parallel over a free-GPU pool.
+def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, replace=False):
+    """Run predictions for `models` on all `scene_ids`, in parallel over the automatic
+    settings GPU pool.
 
     Each (benchmark, run, model) writes an official ScanNet submission directly to
     /data/scannet/predictions/<Benchmark>/<run-id>/<model>/. `classes` is the prompt class
-    list; None -> the benchmark's official protocol classes. `gpus` is a list of physical GPU
-    indices to use; None -> all GPUs from nvidia-smi. `run_id` isolates outputs; None -> one
-    auto-generated run-YYYYMMDD-HHMMSS id for the whole call.
+    list; None -> the benchmark's official protocol classes. `run_id` isolates outputs;
+    None -> one auto-generated run-YYYYMMDD-HHMMSS id for the whole call.
     Returns a list of (model, scene_id, out_dir, elapsed, ok) per task."""
     from benchmark import artifact_paths, resolve_benchmark, submission_dir
+    from utils.gpu import gpu_lease
+
+    settings = load_settings()
+    gpu_pool = settings["gpu_pool"]
+    scannet_root = settings["scannet_root"]
 
     spec = resolve_benchmark(benchmark)
     if classes is None:
@@ -130,10 +135,7 @@ def predict(scene_ids, models, classes, gpus=None, benchmark="ScanNet20", run_id
             frames_dir_by_scene[scene_id] = extract_frames(scene_id, replace)
 
     tasks = [(m, s) for m in models for s in scene_ids]
-    gpus = list(gpus) if gpus else list(range(gpu_count()))
-    if not gpus:
-        gpus = [0]
-    print(f"[INFO] {len(tasks)} tasks, {len(gpus)} GPUs ({gpus})")
+    print(f"[INFO] {len(tasks)} tasks, automatic GPU pool {gpu_pool}")
 
     def _task_args(model):
         tasks_log = os.path.join(eval_root, run_id, f"{model}.tasks")
@@ -141,28 +143,16 @@ def predict(scene_ids, models, classes, gpus=None, benchmark="ScanNet20", run_id
         return submission_dir(spec, run_id, model), tasks_log
 
     results = []
-    if len(gpus) == 1:
-        for model, scene_id in tasks:
-            out_dir, tasks_log = _task_args(model)
-            results.append(_run_one(model, scene_id, frames_dir_by_scene.get(scene_id), classes,
-                                    gpus[0], out_dir, benchmark, tasks_log))
-        return results
-
-    free_gpus = queue.Queue()
-    for g in gpus:
-        free_gpus.put(g)
 
     def work(task):
         model, scene_id = task
         out_dir, tasks_log = _task_args(model)
-        gpu = free_gpus.get()
-        try:
+        with gpu_lease(gpu_pool, scannet_root) as lease:
             return _run_one(model, scene_id, frames_dir_by_scene.get(scene_id), classes,
-                            gpu, out_dir, benchmark, tasks_log)
-        finally:
-            free_gpus.put(gpu)
+                            lease.index, out_dir, benchmark, tasks_log, lease)
 
-    with ThreadPoolExecutor(max_workers=min(len(gpus), len(tasks))) as pool:
+    max_workers = max(1, min(len(gpu_pool), len(tasks)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(work, t) for t in tasks]
         for fut in futures:
             results.append(fut.result())

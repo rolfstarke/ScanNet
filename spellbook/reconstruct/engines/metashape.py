@@ -8,7 +8,11 @@ The Metashape script is generated here and executed headless by
 /data/zed-metashape/conda/env/bin/python (licensed Pro Python API, exactly the old repo's
 invocation pattern: the env's python runs the pipeline code; no metashape.sh, no ZED SDK
 involved, so no LD_PRELOAD redirect needed). Contract:
-reconstruct(work, root, gpu=None) -> (engine_native.ply, poses (M,4,4), keep, "y_up").
+reconstruct(work, root, gpu=None, lease_fd=None) -> (engine_native.ply, poses (M,4,4), keep, "y_up").
+GPU_POLICY "managed": run.py leases a settings-pool GPU (never 0) and passes the physical
+index + lease fd, which is forwarded to the Metashape python child with pass_fds.
+CUDA_VISIBLE_DEVICES is cleared from the child env so enumGPUDevices sees all physical
+GPUs and the physical-index gpu_mask stays correct.
 
 Poses = chunk.transform.matrix @ camera.transform, rotation columns orthonormalized (SVD);
 the chunk similarity scale s is a global property of the mesh, so vertices and pose
@@ -29,6 +33,15 @@ MIN_ROTATION_DEG = 8.0
 MAX_GAP_FRAMES = 45
 MAX_KEYFRAMES = 400
 TIMEOUT_S = 5400
+
+GPU_POLICY = "managed"
+SERIAL = True
+
+
+def preflight():
+    if not os.path.exists(METASHAPE_PY):
+        return f"Metashape env python missing: {METASHAPE_PY}"
+    return None
 
 _SCRIPT = '''\
 import glob
@@ -189,7 +202,7 @@ def _select_keyframes(pose_dir):
     return selected
 
 
-def reconstruct(work, root, gpu=None):
+def reconstruct(work, root, gpu=None, lease_fd=None):
     work = os.path.abspath(work)
     frames = os.path.join(work, "frames")
     keyframes = os.path.join(work, "keyframes")
@@ -217,11 +230,14 @@ def reconstruct(work, root, gpu=None):
         f.write(script)
 
     log_path = os.path.join(logs, "metashape.log")
+    env = os.environ.copy()
+    env.pop("CUDA_VISIBLE_DEVICES", None)  # Metashape must enumerate all physical GPUs
+    pass_fds = () if lease_fd is None else (lease_fd,)
     with open(log_path, "wb") as logf:
         try:
             subprocess.run([METASHAPE_PY, script_path], check=True, timeout=TIMEOUT_S,
-                           stdout=logf, stderr=subprocess.STDOUT, env=os.environ.copy(),
-                           cwd=work)
+                           stdout=logf, stderr=subprocess.STDOUT, env=env,
+                           cwd=work, pass_fds=pass_fds)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"metashape run timed out after {TIMEOUT_S}s, see {log_path}")
         except subprocess.CalledProcessError as e:

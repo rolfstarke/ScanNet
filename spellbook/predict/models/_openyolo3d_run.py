@@ -14,9 +14,6 @@ import os
 import shutil
 import sys
 
-if "--gpu" in sys.argv:
-    os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[sys.argv.index("--gpu") + 1]
-
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -59,7 +56,6 @@ def main():
     ap.add_argument("--benchmark", default="ScanNet20",
                     choices=["ScanNet20", "ScanNet200"],
                     help="benchmark backend (default ScanNet20)")
-    ap.add_argument("--gpu", type=int, default=None)
     args = ap.parse_args()
     spec = _benchmark_spec(args.benchmark)
 

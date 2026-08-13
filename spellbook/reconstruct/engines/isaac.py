@@ -23,6 +23,16 @@ NGC_IMAGE = f"nvcr.io/nvidia/isaac/ros:{NGC_TAG}"
 LOCAL_IMAGE = "zed-isaac-nvblox:spellbook"
 TIMEOUT = 7200
 
+GPU_POLICY = "managed"
+SERIAL = True
+
+
+def preflight():
+    if _podman(["image", "exists", LOCAL_IMAGE]).returncode != 0:
+        return (f"podman image {LOCAL_IMAGE} missing "
+                "(NGC pull + zed layer build required)")
+    return None
+
 # Runs inside the container via `python3 -c`; fails loudly if rosbags is missing.
 _POSE_EXTRACT = """import pathlib
 import sys
@@ -121,7 +131,7 @@ RUN apt-get install -y --no-install-recommends \
             raise RuntimeError(f"[isaac] zed layer build failed: {r.stderr[-800:]}")
 
 
-def reconstruct(work, root, gpu=None):
+def reconstruct(work, root, gpu=None, lease_fd=None):
     marker = os.path.join(work, "svo_path.txt")
     svo = open(marker).read().strip() if os.path.exists(marker) else None
     if svo is None:
@@ -211,9 +221,11 @@ python3 -c '{_POSE_EXTRACT}'
            f"-v{log_dir}:/logs:ro", f"-v{os.path.dirname(svo)}:/svo:ro",
            LOCAL_IMAGE, "/bin/bash", "/inside.sh"]
     log_path = os.path.join(log_dir, "isaac.log")
+    pass_fds = () if lease_fd is None else (lease_fd,)
     with open(log_path, "wb") as logf:
         try:
-            subprocess.run(cmd, timeout=TIMEOUT, stdout=logf, stderr=subprocess.STDOUT)
+            subprocess.run(cmd, timeout=TIMEOUT, stdout=logf, stderr=subprocess.STDOUT,
+                           pass_fds=pass_fds)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"[isaac] container timed out after {TIMEOUT}s, see {log_path}")
     print(f"[isaac] container run finished; outputs in {export_dir}")

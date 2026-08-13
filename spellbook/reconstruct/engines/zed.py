@@ -17,7 +17,18 @@ import os
 
 import numpy as np
 
-from . import open3d as open3d_engine
+from ..tsdf import integrate_tsdf
+
+GPU_POLICY = "zed-default"
+SERIAL = True
+
+
+def preflight():
+    try:
+        import pyzed.sl  # noqa: F401
+    except Exception as ex:
+        return f"pyzed not importable: {ex}"
+    return None
 
 
 def _init(svo, gpu):
@@ -50,7 +61,7 @@ def _grab_all(zed):
     return i
 
 
-def reconstruct(work, root, gpu=None):
+def reconstruct(work, root, gpu=None, lease_fd=None):
     import pyzed.sl as sl
 
     marker = os.path.join(work, "svo_path.txt")
@@ -102,7 +113,7 @@ def reconstruct(work, root, gpu=None):
     if len(keep) < 100:
         raise RuntimeError(f"only {len(keep)} valid poses")
 
-    # ---- shared 4 mm TSDF re-integration (same code path as the open3d engine) ----
+    # ---- shared TSDF re-integration (same code path as the open3d engine) ----
     poses = np.stack(poses)
-    native, poses = open3d_engine._integrate(work, keep, gpu, poses)
+    native, poses = integrate_tsdf(work, keep, poses)
     return native, poses, keep, "zed_opencv"

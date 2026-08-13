@@ -55,6 +55,16 @@ GPU_SCRIPT = "/home/rolf/GIT/zed-rtabmap/scripts/podman_gpu.sh"
 TIMEOUT = 7200
 CONTAINER_NAME = f"spellbook-rtabmap-{os.getpid()}"  # unique per process: parallel tasks
 
+GPU_POLICY = "managed"
+SERIAL = False
+
+
+def preflight():
+    if subprocess.run(["podman", "image", "exists", PODMAN_IMAGE],
+                      capture_output=True).returncode != 0:
+        return f"podman image {PODMAN_IMAGE} missing"
+    return None
+
 _INSIDE_SH = r"""#!/usr/bin/env bash
 # SVO2 -> rtabmap.db -> refined.db -> export, one container run.
 set -eo pipefail
@@ -402,7 +412,7 @@ def _to_native_ply(export_dir, out_path):
     return out_path
 
 
-def reconstruct(work, root, gpu=None):
+def reconstruct(work, root, gpu=None, lease_fd=None):
     marker = os.path.join(work, "svo_path.txt")
     if not os.path.exists(marker):
         raise RuntimeError("run.py must write recon/svo_path.txt before engines run")
@@ -452,10 +462,12 @@ def reconstruct(work, root, gpu=None):
     ]
 
     log_path = os.path.join(log_dir, "rtabmap.log")
+    pass_fds = () if lease_fd is None else (lease_fd,)
     with open(log_path, "w") as lf:
         lf.write("cmd: " + " ".join(cmd) + "\n")
         lf.flush()
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                pass_fds=pass_fds)
         try:
             proc.wait(timeout=TIMEOUT)
         except subprocess.TimeoutExpired:

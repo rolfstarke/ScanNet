@@ -167,13 +167,14 @@ python spellbook/evaluate.py evaluate --run-id myrun --models mosaic3d,open3dis 
 # Visualization (opens GT; arrow keys select benchmark, compatible run/model, and mode)
 python spellbook/main.py --visualize --scene 0568_00
 
-# Reconstruction batch (frames extracted once per scene, then tasks in parallel over --gpu;
-# terminal shows only tqdm GPU bars; logs under spellbook/tmp/logs/reconstruct-<run-id>/)
+# Reconstruction batch (frames extracted once per scene, then tasks automatically share
+# the settings gpu_pool GPUs 1-4 via cross-process leases; GPU 0 stays unmanaged for ZED
+# SDK extraction/tracking. Terminal shows only tqdm bars; logs under spellbook/tmp/logs/reconstruct-<run-id>/)
 python spellbook/main.py --scene 9004 9009 --engine metashape isaac bundlefusion open3d zed rtabmap \
-    --gpu 1 2 3 4                       # add --replace to re-extract frames
+                                        # add --replace to re-extract frames
 
-# Single (scene, engine)
-python -m spellbook.reconstruct.run --scene 9009 --engine bundlefusion --gpu 1
+# Single (scene, engine); GPU is leased automatically for managed engines
+python -m spellbook.reconstruct.run --scene 9009 --engine bundlefusion
 
 # QC re-run for one scan
 python -m spellbook.reconstruct.qc scene9009_04
@@ -197,7 +198,7 @@ Class lists: derived in `spellbook/benchmark.py` from `BenchmarkScripts/ScanNet2
 1. Investigate OpenIns3D's ScanNet200 collapse / anomaly scenes — #13.
 2. Hardening: atomic/resumable prediction outputs #16, batch supervision #17, Open3DIS tracker race #15, env reproducibility #14.
 3. Optional: extend from 20 to the full 312-scene val split once hardening is in place.
-4. Run the full reconstruction batch: `main.py --scene 9004 9009 --engine metashape isaac bundlefusion open3d zed rtabmap --gpu 1 2 3 4`; per-scan QC gates rank the engines.
+4. Run the full reconstruction batch: `main.py --scene 9004 9009 --engine metashape isaac bundlefusion open3d zed rtabmap`; per-scan QC gates rank the engines. GPU allocation is automatic (settings `gpu_pool: [1, 2, 3, 4]`; GPU 0 unmanaged and reserved for the ZED SDK).
 5. Isaac: build `zed-isaac-nvblox:spellbook` (NGC pull + zed layer) and verify the cuVSLAM pose + save_ply mesh path — #22.
 6. Verify the remaining engine adapters end-to-end (bundlefusion, metashape, rtabmap have never run); compare global methods against the local-pose baseline — #25.
 7. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS).

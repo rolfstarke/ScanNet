@@ -16,9 +16,6 @@ instances() gated behind `if False`, tracker_*.txt skip-lists present).
 import os
 import sys
 
-if "--gpu" in sys.argv:
-    os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[sys.argv.index("--gpu") + 1]
-
 import argparse
 import pathlib
 import subprocess
@@ -133,7 +130,10 @@ def _make_run_config(base_config, data_overrides, exp_name, classes, out_dir):
 
 
 def _run_stage(script, config, env):
-    subprocess.run([OPEN3DIS_PY, script, "--config", config], cwd=OPEN3DIS_REPO, env=env, check=True)
+    fd = os.environ.get("SPELLBOOK_GPU_LEASE_FD")
+    pass_fds = (int(fd),) if fd else ()
+    subprocess.run([OPEN3DIS_PY, script, "--config", config], cwd=OPEN3DIS_REPO,
+                   env=env, check=True, pass_fds=pass_fds)
 
 
 def _classify(inst_feat, classes, device):
@@ -155,7 +155,6 @@ def main():
     ap.add_argument("--frames", required=True, help="extracted frames dir (frames.py)")
     ap.add_argument("--classes", nargs="+", required=True)
     ap.add_argument("--out", required=True, help="predictions output dir")
-    ap.add_argument("--gpu", type=int, default=None)
     ap.add_argument("--benchmark", default="ScanNet20",
                     choices=["ScanNet20", "ScanNet200"])
     args = ap.parse_args()

@@ -10,9 +10,6 @@ zero_shot_multi_vocs.py demo does, and reformats the output.
 import os
 import sys
 
-if "--gpu" in sys.argv:
-    os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[sys.argv.index("--gpu") + 1]
-
 import argparse
 
 import numpy as np
@@ -63,7 +60,6 @@ def main():
     ap.add_argument("--detector", default="odise", choices=["odise", "yoloworld"],
                     help="2D open-vocab detector for the Lookup stage (default odise -- the "
                          "detector OpenIns3D's paper numbers use; yoloworld is the repo demo default)")
-    ap.add_argument("--gpu", type=int, default=None)
     args = ap.parse_args()
     spec = _benchmark_spec(args.benchmark)
 

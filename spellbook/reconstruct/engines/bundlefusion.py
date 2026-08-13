@@ -50,6 +50,16 @@ _TIMEOUT = 5400
 _HOME_TMP = os.path.join(os.path.expanduser("~"), ".bf_tmp")
 _BF_WIDTH, _BF_HEIGHT = 640, 480
 
+GPU_POLICY = "managed"
+SERIAL = False
+
+
+def preflight():
+    if subprocess.run(["docker", "image", "inspect", _IMAGE],
+                      capture_output=True).returncode != 0:
+        return f"docker image {_IMAGE} missing"
+    return None
+
 
 def _png_size(path):
     """Return (width, height) of a PNG by parsing the IHDR chunk (no deps)."""
@@ -110,7 +120,7 @@ def _stage_input(bf_in, frames):
     return names
 
 
-def _run_docker(bf_in, bf_out, gpu):
+def _run_docker(bf_in, bf_out, gpu, lease_fd=None):
     container = f"bundlefusion_{os.getpid()}"
     cmd = [
         "docker", "run", "--rm", "--name", container, "--privileged",
@@ -124,8 +134,10 @@ def _run_docker(bf_in, bf_out, gpu):
         "/input", "/output",
         str(_OPT_ROUNDS),
     ]
+    pass_fds = () if lease_fd is None else (lease_fd,)
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT,
+                              pass_fds=pass_fds)
     except subprocess.TimeoutExpired:
         subprocess.run(["docker", "kill", container], capture_output=True)
         raise RuntimeError(
@@ -153,7 +165,7 @@ def _parse_poses(pose_dir, n_frames, log):
     return poses, keep
 
 
-def reconstruct(work, root, gpu=None):
+def reconstruct(work, root, gpu=None, lease_fd=None):
     frames = os.path.join(work, "frames")
     K = np.loadtxt(os.path.join(frames, "intrinsic_depth.txt"))
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
@@ -175,7 +187,7 @@ def reconstruct(work, root, gpu=None):
 
         print(f"[bundlefusion] {len(names)} frames, K@640x480 = "
               f"{fx * sx:.3f}/{fy * sy:.3f} f, {cx * sx:.1f}/{cy * sy:.1f} c, gpu={gpu or 0}")
-        res = _run_docker(bf_in, bf_out, gpu)
+        res = _run_docker(bf_in, bf_out, gpu, lease_fd)
         log_dir = os.path.join(work, "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "bundlefusion.log")

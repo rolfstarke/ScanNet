@@ -82,8 +82,28 @@ def _validate():
 _validate()
 
 
+def validate_gpu_pool(pool):
+    """Validate the managed GPU pool from settings.yaml.
+
+    Physical GPU 0 is never managed: it is reserved for ZED SDK extraction/tracking
+    (SDK 5.4 bug #18 forces the default device). The pool must therefore be a
+    non-empty list of unique positive integer indices.
+    """
+    if not isinstance(pool, list) or not pool:
+        raise ValueError("settings.yaml: gpu_pool must be a non-empty list")
+    for g in pool:
+        if not isinstance(g, int) or isinstance(g, bool):
+            raise ValueError(f"settings.yaml: gpu_pool member {g!r} is not an integer")
+        if g <= 0:
+            raise ValueError("settings.yaml: gpu_pool must only contain indices > 0 "
+                             "(GPU 0 is reserved for the ZED SDK)")
+    if len(set(pool)) != len(pool):
+        raise ValueError(f"settings.yaml: gpu_pool has duplicates: {pool}")
+    return list(pool)
+
+
 def load_settings():
-    """Returns {default, scannet_root} from spellbook/settings.yaml."""
+    """Returns {default, scannet_root, gpu_pool} from spellbook/settings.yaml."""
     import yaml
     with open(_SETTINGS_FILE) as f:
         cfg = yaml.safe_load(f) or {}
@@ -94,7 +114,8 @@ def load_settings():
                          f"(expected one of {list(BENCHMARKS)})")
     if not os.path.isdir(root):
         raise ValueError(f"settings.yaml: scannet_root {root!r} is not a directory")
-    return {"default": default, "scannet_root": root}
+    pool = validate_gpu_pool(cfg.get("gpu_pool", [1, 2, 3, 4]))
+    return {"default": default, "scannet_root": root, "gpu_pool": pool}
 
 
 def resolve_benchmark(name=None):

@@ -306,9 +306,8 @@ def reference(scan_dir_root: str, out_path: str):
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "qc"
     if mode == "--reference":
-        reference("/data/scannet/scans", "/home/rolf/.local/share/opencode/worktree/"
-                  "af8d5a7a5325e9bc2684882359e0eea504f05d5d/feature/reconstruction/"
-                  "spellbook/reconstruct/scannet_reference.yaml")
+        reference("/data/scannet/scans", os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "scannet_reference.yaml"))
     else:
         for sid in sys.argv[1:]:
             run_qc(sid, os.path.join("/data/scannet/scans", sid))

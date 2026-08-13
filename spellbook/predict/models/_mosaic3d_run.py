@@ -51,7 +51,6 @@ def main():
     ap.add_argument("--pointcloud", required=True, help="ScanNet scene pointcloud (.ply)")
     ap.add_argument("--classes", nargs="+", required=True)
     ap.add_argument("--out", required=True, help="predictions output dir")
-    ap.add_argument("--gpu", type=int, default=None)
     ap.add_argument("--benchmark", default="ScanNet20",
                     choices=["ScanNet20", "ScanNet200"])
     args = ap.parse_args()
@@ -59,8 +58,6 @@ def main():
     scene_id = scene_id_from_pointcloud(args.pointcloud)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.gpu is not None and torch.cuda.is_available():
-        device = torch.device(f"cuda:{args.gpu}")
 
     os.makedirs(args.out, exist_ok=True)
 
