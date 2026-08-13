@@ -20,49 +20,53 @@ Bugs, problems, and their attempted fixes live in GitHub Issues (`rolfstarke/Sca
 ### spellbook/ (all project code lives here)
 ```
 spellbook/
-├── main.py                      # CLI: --visualize, --predict (--benchmark, --run-id, multi-scene, --gpu)
-├── settings.yaml                # default benchmark + scannet_root
-├── benchmark.py                 # BenchmarkSpec (ScanNet20: 18 classes / ScanNet200: 198 = 200 - wall/floor), paths
+├── main.py                      # CLI: --visualize, --predict (--benchmark, --run-id, multi-scene), --engine
+├── settings.yaml                # default benchmark + scannet_root + gpu_pool ([1,2,3,4]; 0 = ZED, never managed)
+├── benchmark.py                 # BenchmarkSpec (ScanNet20: 18 classes / ScanNet200: 198 = 200 - wall/floor), paths, gpu_pool validation
 ├── evaluate.py                  # GT export + evaluation dispatch (official / scannet200 evaluator)
 ├── scannet200_evaluator.py      # Python-3 port of Rozenberszki's ScanNet200 evaluator (198-class)
-├── environment.yaml             # 3disspellbook conda env
+├── environment.yaml             # 3disspellbook conda env (ZED SDK activation sets ZED_DIR/LD_LIBRARY_PATH)
 ├── PROJECT_STATUS.md            # this file
 ├── archive/                      # completed action plans, research reports, and retained evidence
 ├── tmp/                          # active plans/research and transient logs
 ├── utils/
+│   ├── gpu.py                   # cross-process GPU leases (flock per pool index, pass_fds forwarding)
 │   ├── visualize.py             # Open3D viewer + ImGui legend (GT + official submission predictions)
 │   └── hud.py
 └── predict/
-    ├── runner.py                # model→env dispatch, free-GPU queue, sequential up-front frame extraction
+    ├── runner.py                # model→env dispatch over automatic gpu_pool leases; sequential up-front frame extraction
     ├── frames.py                # .sens extraction via ScanNet's SensorData exporters (0..N-1), idempotent
     └── models/
         ├── common.py            # decimate(), write_scannet_submission (official submission layout)
         ├── _mosaic3d_run.py     # point-cloud only
         ├── _openins3d_run.py    # point-cloud only; --detector {odise,yoloworld}
         ├── _openyolo3d_run.py   # needs frames
-        └── _open3dis_run.py     # needs frames
+        └── _open3dis_run.py     # needs frames; forwards the lease fd to its nested subprocess
 ```
 
 ### spellbook/reconstruct/ (SVO2 -> ScanNet-native scans; invoked via `main.py --engine`)
 ```
 spellbook/reconstruct/
-├── batch.py                  # multi-scene x multi-engine GPU-pool runner: sequential shared frame
-│                             #   extraction, then parallel per-task subprocesses, tqdm GPU bars only
+├── batch.py                  # multi-scene x multi-engine runner: sequential shared frame extraction, then
+│                             #   parallel per-task subprocesses (each run.py child leases its own GPU), tqdm bars
 ├── run.py                    # single (scene, engine) pipeline: frames -> engine -> align -> meshes
-│                             #   -> sens/txt -> segmentator -> qc (--frames, --replace, --gpu)
+│                             #   -> sens/txt -> segmentator -> qc; acquires the GPU lease per GPU_POLICY
 ├── extract.py                # SVO2 -> frames/ (uint16 mm depth, pose_state.txt, gravity, intrinsics);
 │                             #   ensure_frames(): reuse complete sets, --replace re-extracts
+├── tsdf.py                   # shared Open3D TSDF integration (integrate_tsdf), ZED-basis conjugation
 ├── scannet.py                # gravity z-up align (alignment.h), pymeshlab clean chain + decimation,
 │                             #   float32 binary PLY writer, axisAlignment, Segmentator wrapper
 ├── finalize.py               # .sens v4 + <id>.txt writers
 ├── qc.py                     # 13 metrics vs measured ScanNet bars -> recon/qc.yaml
 ├── scannet_reference.yaml    # QC bars measured from real ScanNet scenes
 └── engines/
-    ├── zed.py  open3d.py     # ZED tracking (+.area) / Stage-A poses + shared Open3D TSDF integration
-    ├── metashape.py          # Metashape Pro (keyframe priors, f+b1 calibration)
-    ├── rtabmap.py            # RTAB-Map in podman (reprocess + loop closures, textured mesh)
-    ├── isaac.py              # cuVSLAM + Nvblox in podman (NGC image, save_ply service) — see #22
-    └── bundlefusion.py       # ScanNet's reference engine in docker (zParametersScanNet, 4 mm)
+    ├── __init__.py           # adapter contract: GPU_POLICY, SERIAL, preflight(), reconstruct(work, root, gpu, lease_fd)
+    ├── zed.py                # ZED .area two-pass tracking (GPU_POLICY zed-default, GPU 0, serial)
+    ├── open3d.py             # Stage-A poses + shared TSDF (GPU_POLICY cpu)
+    ├── metashape.py          # Metashape Pro (managed GPU, serial, license)
+    ├── rtabmap.py            # RTAB-Map in podman (managed GPU, reprocess + loop closures)
+    ├── isaac.py              # cuVSLAM + Nvblox in podman (managed GPU, serial) — see #22
+    └── bundlefusion.py       # ScanNet's reference engine in docker (managed GPU, 4 mm)
 ```
 
 ### Data Layout (`/data/scannet/` — scans/ stays official, artifacts outside)
@@ -138,15 +142,17 @@ Zed/open3d are local-pose baselines; multiroom drift and density remain tracked 
 3. **Prediction output**: official ScanNet submission layout, one directory per (benchmark, run, model): `/data/scannet/predictions/<Benchmark>/<run-id>/<model>/` with `<scene>.txt` + `predicted_masks/<scene>_NNN.txt`. Directly zippable as a benchmark submission; runs never overwrite each other (#16).
 4. **Label ids**: real NYU40 ids (ScanNet20) resp. raw `id`-column ids (ScanNet200, 198 classes = 200 minus wall/floor) from ScanNet's own constants, derived in `benchmark.py` as the single source of truth; unknown class names raise (see #1, #12).
 5. **Benchmark protocol**: `settings.yaml` selects the default backend (ScanNet20 = official evaluator ported in place to Python 3; ScanNet200 = port of the benchmark author's evaluator, since ScanNet/ScanNet publishes no ScanNet200 instance evaluator). `--benchmark` overrides; `--classes` is for custom (non-benchmark) prediction only.
-6. **GPU dispatch**: free-GPU queue over `--gpu` list (default all GPUs); frames extracted sequentially up front (see #9).
-7. **Evaluation**: flat per-vertex GT encoding via `evaluate.py export-gt` (ScanNet's own export tool is inconsistent with its evaluator, see #8); evaluators ported to Python 3 with edge-case fix (#8); `evaluate.py evaluate` dispatches per benchmark with pre-flight validation (#11).
-8. **Custom scan ids**: `scene90NN_MM` (9000-range unused by ScanNet v2); engine index per the table above; SVO discovery by filename convention (`custom/raw/scene<NNNN>.svo2`), `--svo` override.
-9. **Byte fidelity**: `.sens` v4 per `SensReader/c++/src/sensorData.h` (jpeg + zlib_ushort, depth_shift 1000); `<id>.txt` with the ScanNet 17 keys; `.segs.json` from ScanNet's own built Segmentator (defaults kThresh 0.01, segMinVerts 20).
-10. **Meshes**: ScanNet's `clean.mlx` filter chain via pymeshlab (equivalent calls — this pymeshlab cannot load `.mlx`), decimation `targetfacenum=300000` (absolute, not ScanNet's relative 20% — deviation); PLY written float32 binary (Segmentator's tinyply rejects double).
-11. **axisAlignment**: computed (pure z-rotation + translation, det == 1) and written to `<id>.txt`, NEVER applied — released ScanNet meshes and `.sens` poses share the raw frame (consumers apply it).
-12. **Depth/pose conventions**: ZED X native resolution (1920x1080 / 1920x1200 per recording); depth 0.1-6.0 m, invalid = 0, trailing SVO frame dropped; camera-to-world poses conjugated `diag(1,-1,-1,1)` from ZED's z-backward basis; gravity z-up alignment per `alignment.h`; the batch extracts each SVO once (shared frames, `--replace` to regenerate) and runs engine tasks in parallel subprocesses.
-13. **QC**: 13 metrics vs bars measured from real ScanNet scenes (`scannet_reference.yaml`); PASS/FAIL written to `recon/qc.yaml`, FAIL reported, never aborts.
-14. **Foreign-environment imports**: model subprocesses load `spellbook/benchmark.py` by absolute `importlib` spec. Adding `spellbook/` to `sys.path` shadows model repositories' top-level packages such as OpenIns3D's `utils`.
+6. **GPU scheduling (automatic)**: `settings.yaml gpu_pool` (`[1,2,3,4]`) is the only managed GPU list; `utils/gpu.py` leases a pool GPU via persistent `flock` lock files under `<scannet_root>/derived/locks/gpus/`, held for the whole task (descriptor forwarded to GPU children with `pass_fds`, kernel-released on crash). GPU 0 is never managed and reserved for ZED SDK extraction/tracking (SDK 5.4 bug #18: `sdk_gpu_id != 0` -> constant poses). No manual `--gpu` exists anywhere; Open3D's legacy TSDF is CPU-only and takes no lease.
+7. **Adapter metadata**: each engine adapter declares `GPU_POLICY` (zed-default/cpu/managed), `SERIAL` (metashape/isaac/zed run one at a time) and `preflight()` (runtime presence check); `batch.py` consumes these instead of duplicated constants.
+8. **Evaluation**: flat per-vertex GT encoding via `evaluate.py export-gt` (ScanNet's own export tool is inconsistent with its evaluator, see #8); evaluators ported to Python 3 with edge-case fix (#8); `evaluate.py evaluate` dispatches per benchmark with pre-flight validation (#11).
+9. **Custom scan ids**: `scene90NN_MM` (9000-range unused by ScanNet v2); engine index per the table above; SVO discovery by filename convention (`custom/raw/scene<NNNN>.svo2`), `--svo` override.
+10. **Byte fidelity**: `.sens` v4 per `SensReader/c++/src/sensorData.h` (jpeg + zlib_ushort, depth_shift 1000); `<id>.txt` with the ScanNet 17 keys; `.segs.json` from ScanNet's own built Segmentator (defaults kThresh 0.01, segMinVerts 20).
+11. **Meshes**: ScanNet's `clean.mlx` filter chain via pymeshlab (equivalent calls — this pymeshlab cannot load `.mlx`), decimation `targetfacenum=300000` (absolute, not ScanNet's relative 20% — deviation); PLY written float32 binary (Segmentator's tinyply rejects double).
+12. **axisAlignment**: computed (pure z-rotation + translation, det == 1) and written to `<id>.txt`, NEVER applied — released ScanNet meshes and `.sens` poses share the raw frame (consumers apply it).
+13. **Depth/pose conventions**: ZED X native resolution (1920x1080 / 1920x1200 per recording); depth 0.1-6.0 m, invalid = 0, trailing SVO frame dropped; camera-to-world poses conjugated `diag(1,-1,-1,1)` from ZED's z-backward basis; gravity z-up alignment per `alignment.h`; the batch extracts each SVO once (shared frames, `--replace` to regenerate) and runs engine tasks in parallel subprocesses.
+14. **QC**: 13 metrics vs bars measured from real ScanNet scenes (`scannet_reference.yaml`); PASS/FAIL written to `recon/qc.yaml`, FAIL reported, never aborts.
+15. **Foreign-environment imports**: model subprocesses load `spellbook/benchmark.py` by absolute `importlib` spec. Adding `spellbook/` to `sys.path` shadows model repositories' top-level packages such as OpenIns3D's `utils`.
+16. **Engine worktrees**: reconstruction engine development happens one branch per engine (`debug/reconstruction-<engine>`, CORE_SHA `ed5f532`), each branch may touch only its adapter (+ own test file); shared core files are frozen. Trees close one at a time (plugin `worktree_delete`), then merge `--no-ff` into `master`.
 
 ---
 
@@ -186,7 +192,7 @@ Class lists: derived in `spellbook/benchmark.py` from `BenchmarkScripts/ScanNet2
 
 ## Dependencies
 
-- `3disspellbook` conda env (visualization, orchestration, eval) — `spellbook/environment.yaml` + pypng
+- `3disspellbook` conda env (visualization, orchestration, eval) — `spellbook/environment.yaml` + pypng; **activate it before any ZED SDK work** (its `activate.d/zed_sdk_env.sh` sets `ZED_DIR` and `LD_LIBRARY_PATH`; calling the env's python directly makes `zed.open` fail with CALIBRATION FILE NOT AVAILABLE)
 - Per-model conda envs (see table); OpenIns3D env additionally has detectron2 0.6 + ODISE (see #14)
 - Label mapping: `/data/scannet/v2/scannetv2-labels.combined.tsv`
 - GitHub CLI `gh` (issue workflow), `~/.local/bin/gh`
@@ -198,7 +204,8 @@ Class lists: derived in `spellbook/benchmark.py` from `BenchmarkScripts/ScanNet2
 1. Investigate OpenIns3D's ScanNet200 collapse / anomaly scenes — #13.
 2. Hardening: atomic/resumable prediction outputs #16, batch supervision #17, Open3DIS tracker race #15, env reproducibility #14.
 3. Optional: extend from 20 to the full 312-scene val split once hardening is in place.
-4. Run the full reconstruction batch: `main.py --scene 9004 9009 --engine metashape isaac bundlefusion open3d zed rtabmap`; per-scan QC gates rank the engines. GPU allocation is automatic (settings `gpu_pool: [1, 2, 3, 4]`; GPU 0 unmanaged and reserved for the ZED SDK).
+4. Engine debugging in six worktrees (`debug/reconstruction-<engine>` @ CORE_SHA `ed5f532`, one session per tree): each branch may edit only `spellbook/reconstruct/engines/<engine>.py` (+ `spellbook/tests/test_reconstruct_<engine>.py`); shared core files are frozen. Frames for 9004/9009 are complete and read-only (never `--replace`).
 5. Isaac: build `zed-isaac-nvblox:spellbook` (NGC pull + zed layer) and verify the cuVSLAM pose + save_ply mesh path — #22.
-6. Verify the remaining engine adapters end-to-end (bundlefusion, metashape, rtabmap have never run); compare global methods against the local-pose baseline — #25.
-7. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS).
+6. Verify the remaining engine adapters end-to-end (bundlefusion, metashape, rtabmap have never run); compare global methods against the local-pose baseline — #25. Per-engine QC results stay in `recon/qc.yaml` + issues.
+7. Integration: close each worktree via plugin `worktree_delete` (one at a time), then `git merge --no-ff debug/reconstruction-<engine>` into master, run the full batch without GPU arguments.
+8. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS).
