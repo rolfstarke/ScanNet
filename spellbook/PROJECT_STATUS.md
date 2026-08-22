@@ -61,8 +61,8 @@ spellbook/reconstruct/
 ├── qc.py                     # 13 metrics vs measured ScanNet bars -> recon/qc.yaml
 ├── scannet_reference.yaml    # QC bars measured from real ScanNet scenes
 └── engines/
-    ├── __init__.py           # adapter contract: GPU_POLICY, SERIAL, preflight(), reconstruct(work, root, gpu, lease_fd)
-    ├── zed.py                # ZED .area two-pass tracking (GPU_POLICY zed-default, GPU 0, serial)
+    ├── __init__.py           # adapter contract: GPU_POLICY (managed/cpu/blocked), SERIAL, preflight(), gpu_check(), reconstruct(work, root, gpu, lease_fd)
+    ├── zed.py                # BLOCKED (#29): SDK default-device path would use user-reserved GPU 0
     ├── open3d.py             # Stage-A poses + shared TSDF (GPU_POLICY cpu)
     ├── metashape.py          # Metashape Pro (managed GPU, serial, license)
     ├── rtabmap.py            # RTAB-Map in podman (managed GPU, reprocess + loop closures)
@@ -115,9 +115,9 @@ spellbook/reconstruct/
 | OpenIns3D | point cloud | `/home/rolf/GIT/OpenIns3D` | `/data/openins3d/conda/envs/openins3d` | ODISE detector (paper's), see #4 |
 | OpenYOLO3D | frames | `/home/rolf/GIT/OpenYOLO3D` | `/data/openyolo3D/conda/envs/openyolo3d` | needs LD_LIBRARY_PATH hook (runner.py) |
 | Open3DIS | frames | `/home/rolf/GIT/Open3DIS` (patched checkout) | `/data/open3dis/conda/envs/open3dis` | img_dim=depth res, rgb_img_dim=color res |
-| OpenMask3D | frames | excluded per user decision | — | — |
+| OpenMask3D | frames | `/home/rolf/GIT/openmask3d` | `/home/rolf/anaconda3/envs/openmask3d` | scannet200_model.ckpt; OPENMASK3D_FORCE_GPU=0 pins the repo's get_free_gpu to the visible device |
 
-Per-model integration issues: #2 (openyolo3d intrinsics), #3 (open3dis rescale), #4 (openins3d demo path), #10 (mosaic3d), #13 (openins3d recall).
+Per-model integration issues: #2 (openyolo3d intrinsics), #3 (open3dis rescale), #4 (openins3d demo path), #10 (mosaic3d), #13 (openins3d recall); all five models pass `--gpu-check` distribution probes.
 
 ---
 
@@ -125,7 +125,7 @@ Per-model integration issues: #2 (openyolo3d intrinsics), #3 (open3dis rescale),
 
 | Engine | Pose source | Mesh | Runtime |
 |---|---|---|---|
-| zed | ZED SDK `.area` two-pass tracking | shared Open3D TSDF, 2 cm voxel (deviation) | pyzed 5.4 |
+| zed | ZED SDK `.area` two-pass tracking | shared Open3D TSDF, 2 cm voxel (deviation) | **blocked** — SDK default-device path would use user-reserved GPU 0 (#29) |
 | open3d | Stage A ZED tracking poses | shared Open3D TSDF, 2 cm voxel (deviation) | pyzed 5.4 |
 | bundlefusion | BundleFusion global BA (docker) | BundleFusion 4 mm TSDF | docker `bundlefusion:latest` |
 | metashape | Metashape SfM + BA (keyframe priors) | Metashape depth maps | `/data/zed-metashape` (node-locked, serialized) |
@@ -143,8 +143,8 @@ Zed/open3d are local-pose baselines; multiroom drift and density remain tracked 
 3. **Prediction output**: official ScanNet submission layout, one directory per (benchmark, run, model): `/data/scannet/predictions/<Benchmark>/<run-id>/<model>/` with `<scene>.txt` + `predicted_masks/<scene>_NNN.txt`. Directly zippable as a benchmark submission; runs never overwrite each other (#16).
 4. **Label ids**: real NYU40 ids (ScanNet20) resp. raw `id`-column ids (ScanNet200, 198 classes = 200 minus wall/floor) from ScanNet's own constants, derived in `benchmark.py` as the single source of truth; unknown class names raise (see #1, #12).
 5. **Benchmark protocol**: `settings.yaml` selects the default backend (ScanNet20 = official evaluator ported in place to Python 3; ScanNet200 = port of the benchmark author's evaluator, since ScanNet/ScanNet publishes no ScanNet200 instance evaluator). `--benchmark` overrides; `--classes` is for custom (non-benchmark) prediction only.
-6. **GPU scheduling (automatic)**: `settings.yaml gpu_pool` (`[1,2,3,4]`) is the only managed GPU list; `utils/gpu.py` leases a pool GPU via persistent `flock` lock files under `<scannet_root>/derived/locks/gpus/`, held for the whole task (descriptor forwarded to GPU children with `pass_fds`, kernel-released on crash). GPU 0 is never managed and reserved for ZED SDK extraction/tracking (SDK 5.4 bug #18: `sdk_gpu_id != 0` -> constant poses). No manual `--gpu` exists anywhere; Open3D's legacy TSDF is CPU-only and takes no lease.
-7. **Adapter metadata**: each engine adapter declares `GPU_POLICY` (zed-default/cpu/managed), `SERIAL` (metashape/isaac/zed run one at a time) and `preflight()` (runtime presence check); `batch.py` consumes these instead of duplicated constants.
+6. **GPU scheduling (automatic)**: `settings.yaml gpu_pool` (`[1,2,3,4]`) is the only managed GPU list; `utils/gpu.py` leases a pool GPU via persistent `flock` lock files under `<scannet_root>/derived/locks/gpus/`, held for the whole task (descriptor forwarded to GPU children with `pass_fds`, kernel-released on crash). **Physical GPU 0 is user-reserved — Spellbook never locks, selects, or initializes it.** No manual `--gpu` exists anywhere; Open3D's legacy TSDF is CPU-only and takes no lease. ZED is disabled because its SDK default-device path would use GPU 0 (#18, #29).
+7. **Adapter metadata**: each engine adapter declares `GPU_POLICY` (`managed`/`cpu`/`blocked`), `SERIAL`, `preflight()` (runtime presence check) and `gpu_check()` (native distribution probe); `batch.py` and `--gpu-check` consume these instead of duplicated constants.
 8. **Evaluation**: flat per-vertex GT encoding via `evaluate.py export-gt` (ScanNet's own export tool is inconsistent with its evaluator, see #8); evaluators ported to Python 3 with edge-case fix (#8); `evaluate.py evaluate` dispatches per benchmark with pre-flight validation (#11).
 9. **Custom scan ids**: `scene90NN_MM` (9000-range unused by ScanNet v2); engine index per the table above; SVO discovery by filename convention (`custom/raw/scene<NNNN>.svo2`), `--svo` override.
 10. **Byte fidelity**: `.sens` v4 per `SensReader/c++/src/sensorData.h` (jpeg + zlib_ushort, depth_shift 1000); `<id>.txt` with the ScanNet 17 keys; `.segs.json` from ScanNet's own built Segmentator (defaults kThresh 0.01, segMinVerts 20).
@@ -185,6 +185,12 @@ python -m spellbook.reconstruct.run --scene 9009 --engine bundlefusion
 
 # QC re-run for one scan
 python -m spellbook.reconstruct.qc scene9009_04
+
+# GPU distribution smoke (no results): launches every prediction method + reconstruction
+# engine under the real pool (1-4; GPU 0 user-reserved), proves assignment, holds briefly.
+# Expected on this host: 9 PASS (mosaic3d, openins3d, openyolo3d, open3dis, openmask3d,
+# open3d, metashape, rtabmap, bundlefusion), 2 BLOCKED (zed #29, isaac #22), 0 FAIL.
+python spellbook/main.py --gpu-check          # --models mosaic3d,... / --engine ... to filter
 ```
 
 Class lists: derived in `spellbook/benchmark.py` from `BenchmarkScripts/ScanNet200/scannet200_constants.py` — ScanNet20: 20 minus wall/floor = 18 NYU40 ids; ScanNet200: 200 minus ids {1,3} = 198 raw ids.
@@ -205,7 +211,8 @@ Class lists: derived in `spellbook/benchmark.py` from `BenchmarkScripts/ScanNet2
 1. Investigate OpenIns3D's ScanNet200 collapse / anomaly scenes — #13.
 2. Hardening: atomic/resumable prediction outputs #16, batch supervision #17, Open3DIS tracker race #15, env reproducibility #14.
 3. Optional: extend from 20 to the full 312-scene val split once hardening is in place.
-4. Engine debugging (manual, per engine): create `debug/reconstruction-<engine>` worktrees from current master per decision 16; verify the never-run engines (bundlefusion, metashape, rtabmap, isaac #22) end-to-end and compare global methods against the local-pose baseline (#25). Per-engine QC results stay in `recon/qc.yaml` + issues. Frames for 9004/9009 are complete and read-only (never `--replace`).
-5. Isaac: build `zed-isaac-nvblox:spellbook` (NGC pull + zed layer) and verify the cuVSLAM pose + save_ply mesh path — #22.
-6. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS).
-7. Integration: after each engine tree is closed (plugin `worktree_delete`, one at a time), merge `--no-ff debug/reconstruction-<engine>` into master and run the full batch without GPU arguments.
+4. Engine debugging (manual, per engine): create `debug/reconstruction-<engine>` worktrees from current master per decision 16; verify the never-run engines (bundlefusion, metashape, rtabmap, isaac #22) end-to-end and compare global methods against the local-pose baseline (#25). Per-engine QC results stay in `recon/qc.yaml` + issues. Frames for 9009 are complete and reusable; new extraction is blocked (ZED disabled, #29) — 9004 and any new SVO need the remapped-ZED work of #29 first.
+5. ZED: validate managed remapping (pool lease + CUDA_VISIBLE_DEVICES before pyzed import, sdk_gpu_id unset, 60-frame nonconstant-pose gate, full trajectory regression) to re-enable extraction and the zed engine — #29.
+6. Isaac: build `zed-isaac-nvblox:spellbook` from public Isaac debs (no NGC credentials) and switch off the broken CDI flag — #22.
+7. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS).
+8. Integration: after each engine tree is closed (plugin `worktree_delete`, one at a time), merge `--no-ff debug/reconstruction-<engine>` into master and run the full batch without GPU arguments.
