@@ -4,9 +4,13 @@ finalize time (after the engine has produced its optimized poses), see finalize.
 Format mirrors SensReader/c++/src/sensorData.h:1057-1109 (version 4, jpeg + zlib_ushort,
 depth_shift 1000.0), verified against SensReader/python/SensorData.py:52-74 and 6 release
 .sens files.
+
+ZED extraction is currently BLOCKED: every ZED SDK open lands on physical GPU 0
+(user-reserved, #18; managed remapping not validated). Complete frame sets remain
+reusable; no new extraction or --replace is possible until a validated remapped path
+exists.
 """
 import os
-import shutil
 import struct
 import zlib
 
@@ -17,6 +21,14 @@ _DEPTH_ZLIB = 1
 _DEPTH_SHIFT = 1000.0
 _WIDTH, _HEIGHT = 1920, 1200  # ZED X native
 _DEPTH_MIN, _DEPTH_MAX = 0.1, 6.0  # ScanNet zParametersScanNet.txt s_sensorDepthMin/Max
+
+ZED_BLOCK_REASON = ("ZED frame extraction disabled: the SDK's default-device path would "
+                    "use user-reserved physical GPU 0 (#18); managed remapping not "
+                    "validated. Reuse complete frame sets only.")
+
+
+def _zed_blocked():
+    raise RuntimeError(ZED_BLOCK_REASON)
 
 
 def write_sens(path, camera_to_world, color_bytes, depth_bytes, color_ts, depth_ts, K,
@@ -54,25 +66,10 @@ def _depth_bytes(depth_u16):
 
 
 def read_gravity(svo):
-    """Quick SVO open to read the IMU gravity vector (no frame grab, no depth compute)."""
-    import pyzed.sl as sl
-    init = sl.InitParameters()
-    init.set_from_svo_file(svo)
-    init.svo_real_time_mode = False
-    init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
-    init.depth_mode = sl.DEPTH_MODE.PERFORMANCE  # avoid the NEURAL pre-warm
-    # SDK 5.4 bug (measured): sdk_gpu_id != 0 makes positional tracking return constant
-    # poses (camera never moves, state OK). Tracking/extraction must stay on the default GPU.
-    zed = sl.Camera()
-    if zed.open(init) != sl.ERROR_CODE.SUCCESS:
-        return np.zeros(3)
-    try:
-        sd = sl.SensorsData()
-        if zed.get_sensors_data(sd) == sl.ERROR_CODE.SUCCESS:
-            return np.array(sd.get_gravity_vector()).astype(float)
-        return np.zeros(3)
-    finally:
-        zed.close()
+    """Quick SVO open to read the IMU gravity vector (no frame grab, no depth compute).
+
+    Blocked: any ZED SDK open lands on user-reserved physical GPU 0."""
+    _zed_blocked()
 
 
 def frames_complete(frames_dir):
@@ -85,108 +82,28 @@ def frames_complete(frames_dir):
 
 def ensure_frames(svo, work_dir, replace=False):
     """Extract SVO frames once and reuse complete sets; `replace=True` re-extracts.
-    Returns the same info dict as extract()."""
+    Returns the same info dict as extract().
+
+    Extraction requires the ZED SDK, which is blocked (user-reserved GPU 0); only
+    complete existing sets can be reused, and `--replace` always fails."""
     frames = os.path.join(work_dir, "frames")
-    if replace and os.path.islink(frames):
-        os.remove(frames)
-    elif replace and os.path.isdir(frames):
-        shutil.rmtree(frames)
+    if replace:
+        _zed_blocked()
     if frames_complete(frames):
         print(f"[extract] reusing existing frames (complete)")
         grav_path = os.path.join(frames, "gravity.npy")
+        if not os.path.exists(grav_path):
+            _zed_blocked()  # would need a ZED SVO open to read gravity
         return {
             "K": np.loadtxt(os.path.join(frames, "intrinsic_depth.txt"))[:3, :3],
             "poses": np.load(os.path.join(frames, "camera_to_world.npy")),
             "states": open(os.path.join(frames, "pose_state.txt")).read().split(),
             "svo_frames": len(open(os.path.join(frames, "pose_state.txt")).read().split()),
-            "gravity": np.load(grav_path) if os.path.exists(grav_path) else read_gravity(svo),
+            "gravity": np.load(grav_path),
         }
-    info = extract(svo, work_dir)
-    print(f"[extract] {info['svo_frames']} svo frames, {len(info['poses'])} exported, "
-          f"K={info['K'][0, 0]:.2f} f / {info['K'][0, 2]:.1f},{info['K'][1, 2]:.1f} c")
-    return info
+    _zed_blocked()
 
 
 def extract(svo, work_dir):
-    """Play the SVO once, write work_dir/frames/{color,depth,pose} + pose_state.txt +
-    intrinsic files. Returns dict(poses=(N,4,4), states, K=(3,3), gravity, svo_frames=N).
-    Poses are ZED RIGHT_HANDED_Y_UP, camera OpenCV (x right, y down, z fwd)."""
-    import cv2
-    import pyzed.sl as sl
-
-    frames = os.path.join(work_dir, "frames")
-    for d in ("color", "depth", "pose"):
-        os.makedirs(os.path.join(frames, d), exist_ok=True)
-
-    init = sl.InitParameters()
-    init.set_from_svo_file(svo)
-    init.svo_real_time_mode = False
-    init.coordinate_units = sl.UNIT.METER
-    init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
-    init.depth_mode = sl.DEPTH_MODE.NEURAL_PLUS
-    init.depth_minimum_distance = _DEPTH_MIN
-    init.depth_maximum_distance = _DEPTH_MAX
-    # SDK 5.4 bug (measured): sdk_gpu_id != 0 makes positional tracking return constant
-    # poses (camera never moves, state OK). Tracking/extraction must stay on the default GPU.
-
-    zed = sl.Camera()
-    if zed.open(init) != sl.ERROR_CODE.SUCCESS:
-        raise RuntimeError(f"failed to open {svo}")
-    zed.enable_positional_tracking(sl.PositionalTrackingParameters())  # defaults: area memory on
-
-    calib = zed.get_camera_information().camera_configuration.calibration_parameters.left_cam
-    K = np.array([[calib.fx, 0, calib.cx], [0, calib.fy, calib.cy], [0, 0, 1.0]])
-    K4 = np.eye(4)
-    K4[:3, :3] = K
-    for key in ("intrinsic_color", "intrinsic_depth"):
-        np.savetxt(os.path.join(frames, f"{key}.txt"), K4, fmt="%.6f")
-    for key in ("extrinsic_color", "extrinsic_depth"):
-        np.savetxt(os.path.join(frames, f"{key}.txt"), np.eye(4), fmt="%.6f")
-
-    runtime = sl.RuntimeParameters()
-    runtime.enable_depth = True
-    image, depth, pose = sl.Mat(), sl.Mat(), sl.Pose()
-    total = zed.get_svo_number_of_frames()
-    ctw, states, c_ts, d_ts = [], [], [], []
-    gravity = None
-    i = 0
-    while True:
-        err = zed.grab(runtime)
-        if err == sl.ERROR_CODE.END_OF_SVOFILE_REACHED:
-            break
-        if err != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"grab failed at frame {i}: {err}")
-        if i == total - 1:
-            break  # trailing frame is always invalid (verified on 6 release .sens)
-        zed.retrieve_image(image, sl.VIEW.LEFT)
-        zed.retrieve_measure(depth, sl.MEASURE.DEPTH)
-        state = zed.get_position(pose, sl.REFERENCE_FRAME.WORLD)
-        bgr = cv2.cvtColor(image.get_data(), cv2.COLOR_BGRA2BGR)
-        d = depth.get_data()
-        dmm = np.where(np.isfinite(d) & (d > 0), np.clip(d * 1000.0, 0, 65535), 0).astype(np.uint16)
-        cv2.imwrite(os.path.join(frames, "color", f"{i}.jpg"), bgr)
-        cv2.imwrite(os.path.join(frames, "depth", f"{i}.png"), dmm)
-        np.savetxt(os.path.join(frames, "pose", f"{i}.txt"), pose.pose_data(sl.Transform()).m, fmt="%.6f")
-        ctw.append(pose.pose_data(sl.Transform()).m)
-        states.append(state.name if isinstance(state, sl.POSITIONAL_TRACKING_STATE) else str(state))
-        c_ts.append(zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_microseconds())
-        d_ts.append(c_ts[-1])
-        if gravity is None:
-            try:
-                sd = sl.SensorsData()
-                if zed.get_sensors_data(sd) == sl.ERROR_CODE.SUCCESS:
-                    gravity = np.array(sd.get_gravity_vector()).astype(float)
-            except Exception:
-                gravity = np.zeros(3)
-        i += 1
-
-    zed.disable_positional_tracking()
-    zed.close()
-
-    with open(os.path.join(frames, "pose_state.txt"), "w") as f:
-        f.write("\n".join(states))
-
-    np.save(os.path.join(frames, "camera_to_world.npy"), np.stack(ctw))
-    np.save(os.path.join(frames, "gravity.npy"), gravity)
-    return dict(poses=np.stack(ctw), states=states, K=K, gravity=gravity,
-                svo_frames=total)
+    """Play the SVO once and write frames/. Unreachable while ZED is blocked."""
+    _zed_blocked()

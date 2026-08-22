@@ -43,6 +43,54 @@ def preflight():
         return f"Metashape env python missing: {METASHAPE_PY}"
     return None
 
+
+def gpu_check(gpu=None, lease_fd=None, hold_seconds=5):
+    """Native Metashape distribution check under the lease: license validity, physical
+    GPU enumeration, and the exact gpu_mask math the pipeline uses. No project work."""
+    if gpu is None or lease_fd is None:
+        return dict(status="fail", reason="managed check requires gpu + lease_fd")
+    script = (
+        "import json, sys, time\n"
+        "import Metashape\n"
+        "devices = Metashape.app.enumGPUDevices()\n"
+        "mask = (1 << %d) if 0 <= %d < len(devices) else None\n"
+        "json.dump(dict(license=Metashape.License().valid, n_devices=len(devices),\n"
+        "               gpu=%d, mask=mask), sys.stdout)\n"
+        "sys.stdout.write('\\n'); sys.stdout.flush()\n"
+        "time.sleep(%d)\n"
+    ) % (gpu, gpu, gpu, hold_seconds)
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tf:
+        tf.write(script)
+        script_path = tf.name
+    env = os.environ.copy()
+    env.pop("CUDA_VISIBLE_DEVICES", None)  # Metashape enumerates all physical GPUs
+    start = time.time()
+    try:
+        r = subprocess.run([METASHAPE_PY, script_path], capture_output=True, text=True,
+                           timeout=hold_seconds + 120, env=env,
+                           pass_fds=(lease_fd,))
+    except subprocess.TimeoutExpired:
+        return dict(status="fail", reason="metashape gpu_check timed out")
+    finally:
+        os.unlink(script_path)
+    if r.returncode != 0:
+        return dict(status="fail", reason=f"metashape gpu_check rc={r.returncode}: "
+                                          f"{r.stderr.strip()[-400:]}")
+    import json as _json
+    try:
+        info = _json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        return dict(status="fail", reason=f"unparseable metashape output: {r.stdout[-400:]}")
+    if not info.get("license"):
+        return dict(status="fail", reason="Metashape license invalid")
+    if info.get("mask") != (1 << gpu):
+        return dict(status="fail", reason=f"gpu_mask mismatch: {info}")
+    return dict(status="pass", policy="managed", physical_gpu=gpu,
+                visible_gpu=f"mask-1<<{gpu}", lease_fd=lease_fd,
+                runtime=f"Metashape ({info['n_devices']} devices)",
+                seconds=round(time.time() - start, 1), reason=None)
+
 _SCRIPT = '''\
 import glob
 import os
@@ -203,6 +251,9 @@ def _select_keyframes(pose_dir):
 
 
 def reconstruct(work, root, gpu=None, lease_fd=None):
+    if gpu is None or lease_fd is None:
+        raise RuntimeError("metashape is GPU_POLICY managed: gpu + lease_fd required "
+                           "(run.py acquires the settings-pool lease)")
     work = os.path.abspath(work)
     frames = os.path.join(work, "frames")
     keyframes = os.path.join(work, "keyframes")
@@ -223,7 +274,7 @@ def reconstruct(work, root, gpu=None, lease_fd=None):
 
     script = (_SCRIPT
               .replace("@WORK@", work)
-              .replace("@GPU@", str(gpu) if gpu is not None else "-1")
+              .replace("@GPU@", str(gpu))
               .replace("@LOC@", "(0.15, 0.15, 0.15)"))
     script_path = os.path.join(work, "metashape_run.py")
     with open(script_path, "w") as f:
@@ -232,7 +283,7 @@ def reconstruct(work, root, gpu=None, lease_fd=None):
     log_path = os.path.join(logs, "metashape.log")
     env = os.environ.copy()
     env.pop("CUDA_VISIBLE_DEVICES", None)  # Metashape must enumerate all physical GPUs
-    pass_fds = () if lease_fd is None else (lease_fd,)
+    pass_fds = (lease_fd,)
     with open(log_path, "wb") as logf:
         try:
             subprocess.run([METASHAPE_PY, script_path], check=True, timeout=TIMEOUT_S,

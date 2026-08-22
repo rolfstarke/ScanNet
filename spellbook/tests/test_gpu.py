@@ -99,6 +99,21 @@ class LeaseTests(unittest.TestCase):
         out, _ = waiter.communicate(timeout=15)
         self.assertEqual(self._last_line(out), "1")
 
+    def test_five_holders_cover_pool_and_fifth_waits(self):
+        """4 concurrent holders must take distinct GPUs 1-4; the 5th must wait and
+        reuse one after a holder exits (pool [1,2,3,4], never GPU 0)."""
+        pool = [1, 2, 3, 4]
+        children = [self._spawn(pool, 3) for _ in range(4)]
+        time.sleep(1.5)
+        waiter = self._spawn(pool, 1)
+        time.sleep(1.5)
+        self.assertIsNone(waiter.poll(), "5th holder must wait while the pool is full")
+        outs = [c.communicate(timeout=20)[0] for c in children]
+        assigned = {self._last_line(o) for o in outs}
+        self.assertEqual(assigned, {str(g) for g in pool})
+        out, _ = waiter.communicate(timeout=20)
+        self.assertIn(self._last_line(out), {str(g) for g in pool})
+
 
 if __name__ == "__main__":
     unittest.main()

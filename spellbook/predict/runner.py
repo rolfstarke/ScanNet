@@ -23,6 +23,8 @@ SCANS_DIR = "/data/scannet/scans"
 
 LEASE_FD_ENV = "SPELLBOOK_GPU_LEASE_FD"
 
+SUPPORTED_MODELS = ["mosaic3d", "openins3d", "openyolo3d", "open3dis", "openmask3d"]
+
 MODEL_PYTHON = {
     "mosaic3d": "/data/mosaic3d/conda/envs/mosaic3d/bin/python",
     "openins3d": "/data/openins3d/conda/envs/openins3d/bin/python",
@@ -47,7 +49,42 @@ MODEL_NEEDS_FRAMES = {
     "open3dis": True,
 }
 
+OPENMASK3D_RESOURCES = (
+    "/home/rolf/GIT/openmask3d",
+    "/data/openmask3d/resources/scannet200_model.ckpt",
+    "/data/openmask3d/resources/sam_vit_h_4b8939.pth",
+)
+
 OPENYOLO3D_CUDA_HOME = "/data/openyolo3D/cuda-11.3"
+
+
+def preflight_model(model):
+    """Return a reason string when `model` cannot run, else None. No CUDA context is
+    ever initialized here."""
+    if model not in SUPPORTED_MODELS:
+        return f"unknown model {model!r} (expected one of {SUPPORTED_MODELS})"
+    py = MODEL_PYTHON[model]
+    if not os.path.isfile(py) or not os.access(py, os.X_OK):
+        return f"{model}: python not found: {py}"
+    script = os.path.join(os.path.dirname(__file__), MODEL_RUN_SCRIPT[model])
+    if not os.path.isfile(script):
+        return f"{model}: wrapper missing: {script}"
+    if model == "openmask3d":
+        for p in OPENMASK3D_RESOURCES:
+            if not os.path.exists(p):
+                return f"openmask3d: required resource missing: {p}"
+    return None
+
+
+def child_env(lease, model):
+    """Shared child environment: one visible physical GPU + lease fd (pass_fds must
+    mirror this). Used identically by normal prediction and GPU-check probes."""
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(lease.index)
+    env[LEASE_FD_ENV] = str(lease.fileno())
+    if model == "openyolo3d":
+        env["LD_LIBRARY_PATH"] = os.path.join(OPENYOLO3D_CUDA_HOME, "lib64") + ":" + env.get("LD_LIBRARY_PATH", "")
+    return env
 
 
 def _pointcloud_path(scene_id):
@@ -67,14 +104,8 @@ def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, task
             raise RuntimeError(f"{model} needs frames but extraction produced none for {scene_id}")
         args += ["--frames", frames_dir]
 
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-    if lease is not None:
-        env[LEASE_FD_ENV] = str(lease.fileno())
-    if model == "openyolo3d":
-        env["LD_LIBRARY_PATH"] = os.path.join(OPENYOLO3D_CUDA_HOME, "lib64") + ":" + env.get("LD_LIBRARY_PATH", "")
-
-    pass_fds = () if lease is None else (lease.fileno(),)
+    env = child_env(lease, model)
+    pass_fds = (lease.fileno(),)
 
     print(f"[INFO] running {model} on {scene_id} (auto GPU {gpu}) ...")
     start = time.time()
@@ -88,6 +119,36 @@ def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, task
     except subprocess.CalledProcessError as e:
         print(f"[WARN] {model} on {scene_id} FAILED (gpu {gpu}, rc={e.returncode}) after {time.time() - start:.1f}s")
         return model, scene_id, None, time.time() - start, False
+
+
+def gpu_check_model(model, lease, hold_seconds=5):
+    """Distribution probe for one model in its own conda env under the lease: the probe
+    imports torch, requires exactly one visible CUDA device, allocates on it, prints a
+    JSON line, and holds briefly. No model code, frames, outputs, or task markers."""
+    probe = os.path.join(os.path.dirname(__file__), "models", "_gpu_check.py")
+    args = [MODEL_PYTHON[model], probe, "--method", model, "--hold", str(hold_seconds)]
+    env = child_env(lease, model)
+    start = time.time()
+    try:
+        r = subprocess.run(args, env=env, capture_output=True, text=True,
+                           pass_fds=(lease.fileno(),), timeout=hold_seconds + 90)
+    except subprocess.TimeoutExpired:
+        return dict(status="fail", reason=f"gpu_check timed out after {hold_seconds + 90}s")
+    import json
+    if r.returncode != 0:
+        return dict(status="fail", reason=f"probe rc={r.returncode}: "
+                                          f"{(r.stderr or r.stdout).strip()[-400:]}")
+    try:
+        info = json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        return dict(status="fail", reason=f"unparseable probe output: {r.stdout[-400:]}")
+    if info.get("physical") != lease.index:
+        return dict(status="fail", reason=f"probe saw device index {info.get('physical')}, "
+                                          f"expected {lease.index}")
+    return dict(status="pass", policy="managed", physical_gpu=lease.index,
+                visible_gpu=info.get("visible"), lease_fd=lease.fileno(),
+                runtime=info.get("device") or "torch",
+                seconds=round(time.time() - start, 1), reason=None)
 
 
 def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, replace=False):
@@ -115,10 +176,12 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
 
     eval_root = artifact_paths(spec)["evaluations"]
 
-    unknown = [m for m in models if m not in MODEL_PYTHON]
-    for m in unknown:
-        print(f"[WARN] unknown model '{m}', skipping")
-    models = [m for m in models if m in MODEL_PYTHON]
+    reasons = [preflight_model(m) for m in models]
+    bad = [(m, r) for m, r in zip(models, reasons) if r]
+    if bad:
+        raise ValueError("prediction preflight failed:\n" +
+                         "\n".join(f"  {m}: {r}" for m, r in bad))
+    models = [m for m in models if m in SUPPORTED_MODELS]
 
     for scene_id in scene_ids:
         if not os.path.isdir(os.path.join(SCANS_DIR, scene_id)):

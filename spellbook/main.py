@@ -12,6 +12,11 @@ def main():
                         help="visualize a ScanNet scene")
     parser.add_argument("--predict", action="store_true",
                         help="run model predictions on a scene")
+    parser.add_argument("--gpu-check", action="store_true",
+                        help="GPU distribution smoke: launch native runtimes of every "
+                             "prediction/reconstruction method under the settings GPU "
+                             "pool (1-4; physical GPU 0 user-reserved), prove the "
+                             "assignment, hold briefly, exit. Produces no results.")
     parser.add_argument("--models", type=str,
                         help="comma-separated models to predict with (e.g. mosaic3d,openins3d)")
     parser.add_argument("--classes", type=str, default=None,
@@ -30,7 +35,7 @@ def main():
                              "share the settings gpu_pool")
     parser.add_argument("--replace", action="store_true",
                         help="re-extract frames even if a complete set exists")
-    parser.add_argument("--scene", nargs="+", required=True,
+    parser.add_argument("--scene", nargs="+",
                         help="scene numbers (e.g., 0568_00 0304_00 or 9004 9009)")
     args = parser.parse_args()
 
@@ -38,14 +43,29 @@ def main():
     benchmark = args.benchmark or load_settings()["default"]
     spec = resolve_benchmark(benchmark)
 
-    if args.visualize:
-        if len(args.scene) != 1:
+    if args.gpu_check:
+        if args.visualize or args.predict:
+            parser.error("--gpu-check is exclusive with --visualize/--predict")
+        if args.scene:
+            parser.error("--gpu-check does not use --scene")
+        import sys as _sys
+        _sys.argv = ["gpu-check"]
+        if args.models:
+            _sys.argv += ["--models", args.models]
+        if args.engine:
+            _sys.argv += ["--engine", *args.engine]
+        from gpu_check import main as gpu_check_main
+        gpu_check_main()
+    elif args.visualize:
+        if len(args.scene or []) != 1:
             parser.error("--visualize takes exactly one --scene")
         from utils.visualize import visualize
         visualize(f"scene{args.scene[0]}", benchmark=benchmark, run_id=args.run_id)
     elif args.predict:
         if not args.models:
             parser.error("--predict requires --models")
+        if not args.scene:
+            parser.error("--predict requires --scene")
         run_id = args.run_id or time.strftime("run-%Y%m%d-%H%M%S")
         classes = args.classes.split(",") if args.classes else None
         n_classes = len(classes) if classes else len(spec.class_labels)
@@ -54,6 +74,8 @@ def main():
         predict([f"scene{s}" for s in args.scene], args.models.split(","),
                 classes, benchmark, run_id)
     elif args.engine:
+        if not args.scene:
+            parser.error("--engine requires --scene")
         from reconstruct.batch import run_batch
         ok, failed = run_batch([int(s) for s in args.scene], args.engine,
                                args.replace)

@@ -65,6 +65,43 @@ def preflight():
         return f"podman image {PODMAN_IMAGE} missing"
     return None
 
+
+def gpu_check(gpu=None, lease_fd=None, hold_seconds=5):
+    """Native RTAB-Map distribution check under the lease: the exact podman_gpu.sh
+    mapping used by the real run, image start, in-container NVIDIA runtime probe."""
+    if gpu is None or lease_fd is None:
+        return dict(status="fail", reason="managed check requires gpu + lease_fd")
+    import time
+
+    start = time.time()
+    try:
+        gpu_args = _podman_gpu_args(gpu)
+    except Exception as ex:
+        return dict(status="fail", reason=f"podman_gpu_args: {ex}")
+    container = f"spellbook-gpu-check-rtabmap-{os.getpid()}"
+    cmd = ["podman", "run", "--rm", "--name", container] + gpu_args + [
+        "-e", f"ROS_DOMAIN_ID={40 + gpu}",
+        PODMAN_IMAGE,
+        "bash", "-lc",
+        f"echo CUDA_VISIBLE_DEVICES=${{CUDA_VISIBLE_DEVICES:-unset}}; "
+        "nvidia-smi -L || echo no-nvidia-smi; sleep %d" % hold_seconds,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=hold_seconds + 120, pass_fds=(lease_fd,))
+    except subprocess.TimeoutExpired:
+        subprocess.run(["podman", "kill", container], capture_output=True)
+        return dict(status="fail", reason="rtabmap gpu_check timed out")
+    if r.returncode != 0:
+        return dict(status="fail", reason=f"rtabmap gpu_check rc={r.returncode}: "
+                                          f"{(r.stderr or r.stdout)[-400:]}")
+    if f"CUDA_VISIBLE_DEVICES={gpu}" not in (r.stdout or ""):
+        return dict(status="fail",
+                    reason=f"assigned env missing in container output: {r.stdout[-300:]}")
+    return dict(status="pass", policy="managed", physical_gpu=gpu, visible_gpu=gpu,
+                lease_fd=lease_fd, runtime="podman localhost/zed-rtabmap:jazzy",
+                seconds=round(time.time() - start, 1), reason=None)
+
 _INSIDE_SH = r"""#!/usr/bin/env bash
 # SVO2 -> rtabmap.db -> refined.db -> export, one container run.
 set -eo pipefail
@@ -286,9 +323,11 @@ echo "[inside] done"
 
 
 def _podman_gpu_args(gpu):
+    if gpu is None:
+        raise RuntimeError("_podman_gpu_args requires the leased physical GPU index")
     if not os.path.exists(GPU_SCRIPT):
         raise RuntimeError(f"podman_gpu.sh not found at {GPU_SCRIPT}")
-    r = subprocess.run(["bash", GPU_SCRIPT, str(gpu if gpu is not None else 0)],
+    r = subprocess.run(["bash", GPU_SCRIPT, str(gpu)],
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(f"podman_gpu.sh failed: {r.stderr.strip() or r.stdout.strip()}")
@@ -413,6 +452,9 @@ def _to_native_ply(export_dir, out_path):
 
 
 def reconstruct(work, root, gpu=None, lease_fd=None):
+    if gpu is None or lease_fd is None:
+        raise RuntimeError("rtabmap is GPU_POLICY managed: gpu + lease_fd required "
+                           "(run.py acquires the settings-pool lease)")
     marker = os.path.join(work, "svo_path.txt")
     if not os.path.exists(marker):
         raise RuntimeError("run.py must write recon/svo_path.txt before engines run")
@@ -448,7 +490,7 @@ def reconstruct(work, root, gpu=None, lease_fd=None):
     svo_dir, svo_base = os.path.split(svo_real)
     cmd = ["podman", "run", "--rm", "--name", CONTAINER_NAME] + gpu_args + [
         "--network=host", "--ipc=host",
-        "-e", f"ROS_DOMAIN_ID={40 + (gpu if gpu is not None else 0)}",
+        "-e", f"ROS_DOMAIN_ID={40 + gpu}",
         "-e", "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp",
         "-v", f"{svo_dir}:/input:ro",
         "-v", f"{rtab_dir}:/output:rw",
@@ -462,7 +504,7 @@ def reconstruct(work, root, gpu=None, lease_fd=None):
     ]
 
     log_path = os.path.join(log_dir, "rtabmap.log")
-    pass_fds = () if lease_fd is None else (lease_fd,)
+    pass_fds = (lease_fd,)
     with open(log_path, "w") as lf:
         lf.write("cmd: " + " ".join(cmd) + "\n")
         lf.flush()

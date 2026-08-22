@@ -7,8 +7,10 @@ Engines always recompute; frames are extracted once and reused (--replace re-ext
 GPU policy comes from the engine adapter's GPU_POLICY:
   - "managed": acquire a settings-backed cross-process lease (gpu_pool, never GPU 0)
     and forward the physical index + lease descriptor to the adapter;
-  - "zed-default"/"cpu": no lease, gpu=None (ZED SDK stays on the default device per
-    the measured SDK 5.4 bug #18; Open3D legacy TSDF is CPU-only).
+  - "cpu": no lease, gpu=None (Open3D legacy TSDF is CPU-only);
+  - "blocked": engine preflight returns a reason and run exits before any work
+    (ZED: SDK default-device path would use user-reserved GPU 0, #18).
+Adapter preflight runs before SVO checks, directory creation, or frame setup.
 The lease is held through engine, alignment, finalize, segmentator, and QC so the
 engine cannot outlive its reservation. CUDA_VISIBLE_DEVICES is cleared before any
 ZED SDK work and before GPU discovery so all physical devices are visible.
@@ -28,6 +30,8 @@ from . import scan_dir, scan_id, svo_path
 from . import extract as extract_mod
 from . import finalize, qc, scannet
 from utils.gpu import gpu_lease
+
+VALID_POLICIES = ("managed", "cpu", "blocked")
 
 
 def _pipeline(work, root, sid, svo, info, engine_name, mesh_native, poses, keep,
@@ -74,6 +78,17 @@ def main():
 
     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
+    engine = importlib.import_module(f"spellbook.reconstruct.engines.{args.engine}")
+    policy = engine.GPU_POLICY
+    if policy not in VALID_POLICIES:
+        sys.exit(f"[{args.engine}] invalid GPU_POLICY {policy!r} (expected one of "
+                 f"{VALID_POLICIES})")
+    reason = engine.preflight()
+    if reason:
+        sys.exit(f"[preflight] {args.engine} blocked: {reason}")
+    if policy == "blocked":
+        sys.exit(f"[{args.engine}] not runnable: {reason}")
+
     sid = scan_id(args.scene, args.engine)
     root = scan_dir(args.scene, args.engine)
     svo = args.svo or svo_path(args.scene)
@@ -101,8 +116,6 @@ def main():
     else:
         info = extract_mod.ensure_frames(svo, work, replace=args.replace)
 
-    engine = importlib.import_module(f"spellbook.reconstruct.engines.{args.engine}")
-    policy = getattr(engine, "GPU_POLICY", "managed")
     if policy == "managed":
         settings = load_settings()
         with gpu_lease(settings["gpu_pool"], settings["scannet_root"]) as lease:

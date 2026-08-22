@@ -61,6 +61,38 @@ def preflight():
     return None
 
 
+def gpu_check(gpu=None, lease_fd=None, hold_seconds=5):
+    """Native BundleFusion distribution check under the lease: container start with the
+    exact CUDA_VISIBLE_DEVICES mapping, in-container runtime probe, sleep, removal."""
+    if gpu is None or lease_fd is None:
+        return dict(status="fail", reason="managed check requires gpu + lease_fd")
+    import time
+
+    start = time.time()
+    container = f"spellbook-gpu-check-bundlefusion-{os.getpid()}"
+    cmd = ["docker", "run", "--rm", "--name", container, "--privileged",
+           "-e", f"CUDA_VISIBLE_DEVICES={gpu}",
+           _IMAGE,
+           "bash", "-lc",
+           f"echo CUDA_VISIBLE_DEVICES=${{CUDA_VISIBLE_DEVICES:-unset}}; "
+           "nvidia-smi -L 2>/dev/null || echo no-nvidia-smi; sleep %d" % hold_seconds]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=hold_seconds + 120, pass_fds=(lease_fd,))
+    except subprocess.TimeoutExpired:
+        subprocess.run(["docker", "kill", container], capture_output=True)
+        return dict(status="fail", reason="bundlefusion gpu_check timed out")
+    if r.returncode != 0:
+        return dict(status="fail", reason=f"bundlefusion gpu_check rc={r.returncode}: "
+                                          f"{(r.stderr or r.stdout)[-400:]}")
+    if f"CUDA_VISIBLE_DEVICES={gpu}" not in (r.stdout or ""):
+        return dict(status="fail",
+                    reason=f"assigned env missing in container output: {r.stdout[-300:]}")
+    return dict(status="pass", policy="managed", physical_gpu=gpu, visible_gpu=gpu,
+                lease_fd=lease_fd, runtime="docker bundlefusion:latest",
+                seconds=round(time.time() - start, 1), reason=None)
+
+
 def _png_size(path):
     """Return (width, height) of a PNG by parsing the IHDR chunk (no deps)."""
     with open(path, "rb") as f:
@@ -121,10 +153,13 @@ def _stage_input(bf_in, frames):
 
 
 def _run_docker(bf_in, bf_out, gpu, lease_fd=None):
+    if gpu is None or lease_fd is None:
+        raise RuntimeError("bundlefusion is GPU_POLICY managed: gpu + lease_fd required "
+                           "(run.py acquires the settings-pool lease)")
     container = f"bundlefusion_{os.getpid()}"
     cmd = [
         "docker", "run", "--rm", "--name", container, "--privileged",
-        "-e", f"CUDA_VISIBLE_DEVICES={gpu if gpu is not None else 0}",
+        "-e", f"CUDA_VISIBLE_DEVICES={gpu}",
         "-v", f"{bf_in}:/input:ro",
         "-v", f"{bf_out}:/output",
         _IMAGE,
@@ -134,7 +169,7 @@ def _run_docker(bf_in, bf_out, gpu, lease_fd=None):
         "/input", "/output",
         str(_OPT_ROUNDS),
     ]
-    pass_fds = () if lease_fd is None else (lease_fd,)
+    pass_fds = (lease_fd,)
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT,
                               pass_fds=pass_fds)
@@ -186,7 +221,7 @@ def reconstruct(work, root, gpu=None, lease_fd=None):
         shutil.copy2(_BUNDLE_CFG_SRC, os.path.join(bf_in, "zParametersBundlingScanNet.txt"))
 
         print(f"[bundlefusion] {len(names)} frames, K@640x480 = "
-              f"{fx * sx:.3f}/{fy * sy:.3f} f, {cx * sx:.1f}/{cy * sy:.1f} c, gpu={gpu or 0}")
+              f"{fx * sx:.3f}/{fy * sy:.3f} f, {cx * sx:.1f}/{cy * sy:.1f} c, gpu={gpu}")
         res = _run_docker(bf_in, bf_out, gpu, lease_fd)
         log_dir = os.path.join(work, "logs")
         os.makedirs(log_dir, exist_ok=True)

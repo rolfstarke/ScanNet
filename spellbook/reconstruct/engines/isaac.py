@@ -21,6 +21,7 @@ import numpy as np
 NGC_TAG = os.environ.get("ISAAC_ROS_TAG", "release-4.5")
 NGC_IMAGE = f"nvcr.io/nvidia/isaac/ros:{NGC_TAG}"
 LOCAL_IMAGE = "zed-isaac-nvblox:spellbook"
+GPU_SCRIPT = "/home/rolf/GIT/zed-rtabmap/scripts/podman_gpu.sh"
 TIMEOUT = 7200
 
 GPU_POLICY = "managed"
@@ -30,8 +31,39 @@ SERIAL = True
 def preflight():
     if _podman(["image", "exists", LOCAL_IMAGE]).returncode != 0:
         return (f"podman image {LOCAL_IMAGE} missing "
-                "(NGC pull + zed layer build required)")
+                "(NGC pull + zed layer build required, #22)")
     return None
+
+
+def gpu_check(gpu=None, lease_fd=None, hold_seconds=5):
+    """Native Isaac distribution check under the lease (podman_gpu.sh mapping, the
+    rtabmap-proven rootless pattern). The current host image is missing, so the
+    orchestrator records BLOCKED from preflight() and never calls this."""
+    if gpu is None or lease_fd is None:
+        return dict(status="fail", reason="managed check requires gpu + lease_fd")
+    if _podman(["image", "exists", LOCAL_IMAGE]).returncode != 0:
+        return dict(status="blocked", reason=preflight())
+    import time
+
+    start = time.time()
+    if not os.path.exists(GPU_SCRIPT):
+        return dict(status="fail", reason=f"podman_gpu.sh not found at {GPU_SCRIPT}")
+    r = _podman(["run", "--rm", "--name", f"spellbook-gpu-check-isaac-{os.getpid()}",
+                 "--device", "nvidia.com/gpu=all", "-e", f"CUDA_VISIBLE_DEVICES={gpu}",
+                 "--security-opt", "label=disable",
+                 LOCAL_IMAGE, "bash", "-lc",
+                 f"echo CUDA_VISIBLE_DEVICES=${{CUDA_VISIBLE_DEVICES:-unset}}; "
+                 "nvidia-smi -L || echo no-nvidia-smi; sleep %d" % hold_seconds],
+                timeout=hold_seconds + 120)
+    if r.returncode != 0:
+        return dict(status="fail", reason=f"isaac gpu_check rc={r.returncode}: "
+                                          f"{(r.stderr or r.stdout)[-400:]}")
+    if f"CUDA_VISIBLE_DEVICES={gpu}" not in (r.stdout or ""):
+        return dict(status="fail",
+                    reason=f"assigned env missing in container output: {r.stdout[-300:]}")
+    return dict(status="pass", policy="managed", physical_gpu=gpu, visible_gpu=gpu,
+                lease_fd=lease_fd, runtime="podman zed-isaac-nvblox:spellbook",
+                seconds=round(time.time() - start, 1), reason=None)
 
 # Runs inside the container via `python3 -c`; fails loudly if rosbags is missing.
 _POSE_EXTRACT = """import pathlib
@@ -213,7 +245,11 @@ python3 -c '{_POSE_EXTRACT}'
         f.write(script)
     os.chmod(inside, 0o755)
 
-    cuda = gpu if gpu is not None else 0
+    if gpu is None or lease_fd is None:
+        raise RuntimeError("isaac is GPU_POLICY managed: gpu + lease_fd required "
+                           "(run.py acquires the settings-pool lease)")
+
+    cuda = gpu
     cmd = ["podman", "run", "--rm", "--name", f"spellbook-isaac-{os.getpid()}",
            "--device", "nvidia.com/gpu=all", "-e", f"CUDA_VISIBLE_DEVICES={cuda}",
            "--security-opt", "label=disable", "--network", "host",
@@ -221,7 +257,7 @@ python3 -c '{_POSE_EXTRACT}'
            f"-v{log_dir}:/logs:ro", f"-v{os.path.dirname(svo)}:/svo:ro",
            LOCAL_IMAGE, "/bin/bash", "/inside.sh"]
     log_path = os.path.join(log_dir, "isaac.log")
-    pass_fds = () if lease_fd is None else (lease_fd,)
+    pass_fds = (lease_fd,)
     with open(log_path, "wb") as logf:
         try:
             subprocess.run(cmd, timeout=TIMEOUT, stdout=logf, stderr=subprocess.STDOUT,

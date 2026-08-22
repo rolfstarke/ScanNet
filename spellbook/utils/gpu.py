@@ -1,10 +1,10 @@
 """Cross-process GPU leasing for managed workloads.
 
 One persistent lock file per configured physical GPU (gpu-<index>.lock) under
-<scannet_root>/derived/locks/gpus/. GPU 0 is NEVER managed here: ZED SDK
-extraction/tracking stays on the default device (SDK 5.4 bug #18) and no gpu-0.lock
-file is ever created. Locks are advisory fcntl.flock leases; the kernel releases them
-automatically when the last holder descriptor closes, including on crash/SIGKILL.
+<scannet_root>/derived/locks/gpus/. Physical GPU 0 is NEVER managed here: it is
+user-reserved, no gpu-0.lock file is ever created, and no managed task may use it.
+Locks are advisory fcntl.flock leases; the kernel releases them automatically when
+the last holder descriptor closes, including on crash/SIGKILL.
 
 The lease descriptor can be forwarded to GPU children via subprocess pass_fds so a
 GPU job survives its orchestration parent; the child must keep the descriptor open

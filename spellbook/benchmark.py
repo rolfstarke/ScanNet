@@ -85,9 +85,8 @@ _validate()
 def validate_gpu_pool(pool):
     """Validate the managed GPU pool from settings.yaml.
 
-    Physical GPU 0 is never managed: it is reserved for ZED SDK extraction/tracking
-    (SDK 5.4 bug #18 forces the default device). The pool must therefore be a
-    non-empty list of unique positive integer indices.
+    Physical GPU 0 is user-reserved: Spellbook never locks, selects, or initializes
+    it. The pool must therefore be a non-empty list of unique positive integer indices.
     """
     if not isinstance(pool, list) or not pool:
         raise ValueError("settings.yaml: gpu_pool must be a non-empty list")
@@ -96,7 +95,7 @@ def validate_gpu_pool(pool):
             raise ValueError(f"settings.yaml: gpu_pool member {g!r} is not an integer")
         if g <= 0:
             raise ValueError("settings.yaml: gpu_pool must only contain indices > 0 "
-                             "(GPU 0 is reserved for the ZED SDK)")
+                             "(GPU 0 is user-reserved)")
     if len(set(pool)) != len(pool):
         raise ValueError(f"settings.yaml: gpu_pool has duplicates: {pool}")
     return list(pool)

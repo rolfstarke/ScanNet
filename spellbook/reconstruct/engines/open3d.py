@@ -22,6 +22,20 @@ def preflight():
     return None
 
 
+def gpu_check(gpu=None, lease_fd=None, hold_seconds=5):
+    """CPU distribution check: import the installed Open3D runtime, stay alive for the
+    hold interval. Takes no lease and must never initialize CUDA."""
+    import time
+
+    import open3d as o3d
+
+    start = time.time()
+    time.sleep(hold_seconds)
+    return dict(status="pass", policy="cpu", physical_gpu=None, visible_gpu=None,
+                lease_fd=None, runtime=f"open3d {o3d.__version__}",
+                seconds=round(time.time() - start, 1), reason=None)
+
+
 def reconstruct(work, root, gpu=None, lease_fd=None):
     """open3d engine: Stage A ZED tracking poses + shared TSDF integration."""
     frames = os.path.join(work, "frames")
