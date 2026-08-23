@@ -12,18 +12,18 @@ MAPPING_STATE.OK the whole run. The documented SDK recommendation for offline ma
 the .area two-pass (used here).
 
 Why blocked: the SDK selects its default CUDA device itself (sdk_gpu_id != 0 returns
-constant poses, #18), which lands on physical GPU 0 -- now user-reserved. Managed
-CUDA_VISIBLE_DEVICES remapping is not validated yet, so ZED runs are disabled until a
-separate pose-validity test approves a remapped path. ScanNet parameters (used by the
-historical runs, kept for the future remapped path): depth 0.1-6.0 m, voxel 2 cm
-(deviation, see open3d engine), truncation 0.06 m.
+constant poses, historical #18), which lands on physical GPU 0 -- now user-reserved.
+Managed CUDA_VISIBLE_DEVICES remapping is not validated yet (#29), so ZED runs are
+disabled until a separate pose-validity test approves a remapped path. ScanNet
+parameters (used by the historical runs, kept for the future remapped path): depth
+0.1-6.0 m, voxel 2 cm (deviation, see open3d engine), truncation 0.06 m.
 """
 
 GPU_POLICY = "blocked"
 SERIAL = True
 
 BLOCK_REASON = ("ZED disabled: its SDK default-device path would use user-reserved "
-                "physical GPU 0 (#18); managed remapping not validated")
+                "physical GPU 0 (#29); managed remapping not validated")
 
 
 def preflight():
