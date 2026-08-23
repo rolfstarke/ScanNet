@@ -23,9 +23,10 @@ DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "geometry_reference.yaml")
 METRIC = "observed_surface_voxel_mean_bidirectional_distance_v1"
 SCORE_KEY = "mean_bidirectional_distance_cm"
-CAD_RGB = np.array([1.0, 0.92, 0.05])
-RECON_RGB = np.array([0.05, 0.85, 0.90])
-CEILING_HEIGHT_M = 2.0
+# Yellow + cyan: equal mix → green; near=yellow, far=cyan
+CAD_RGB = np.array([1.00, 0.82, 0.08])
+RECON_RGB = np.array([0.08, 0.72, 0.88])
+CEILING_NORMAL_MIN = 0.70  # hide faces with n·up above this (display only)
 
 
 def load_config(path=None):
@@ -258,152 +259,164 @@ def _overlay_cell_m(ref_centres, recon_centres, target_cells=100, lo=0.05, hi=0.
     return float(np.clip(extent / target_cells, lo, hi))
 
 
-def _stamp_squares(pts2, lo, hi, half_xy, pixel):
-    """Coverage image: axis-aligned rectangles (half-extents per axis)."""
-    w = int(np.ceil((hi[0] - lo[0]) / pixel)) + 1
-    h = int(np.ceil((hi[1] - lo[1]) / pixel)) + 1
-    cov = np.zeros((h, w), dtype=np.float32)
-    hx, hy = half_xy[0] / pixel, half_xy[1] / pixel
-    for x, y in pts2:
-        c = (x - lo[0]) / pixel
-        r = (y - lo[1]) / pixel
-        r0, r1 = max(0, int(np.floor(r - hy))), min(h, int(np.ceil(r + hy)))
-        c0, c1 = max(0, int(np.floor(c - hx))), min(w, int(np.ceil(c + hx)))
-        if r0 < r1 and c0 < c1:
-            cov[r0:r1, c0:c1] += 1.0
+def _stamp_squares(pts2, lo, cell, n0, n1):
+    """Integer occupancy grid: each coarse cell → exactly one grid square (no gaps)."""
+    cov = np.zeros((n1, n0), dtype=np.float32)
+    # pts are cell centres; map to integer cell indices
+    ij = np.floor((pts2 - lo) / cell).astype(np.int64)
+    m = (ij[:, 0] >= 0) & (ij[:, 0] < n0) & (ij[:, 1] >= 0) & (ij[:, 1] < n1)
+    ij = ij[m]
+    if len(ij) == 0:
+        return cov
+    flat = ij[:, 1] * n0 + ij[:, 0]
+    cov.ravel()[:] = np.bincount(flat, minlength=n0 * n1).astype(np.float32)
     return cov
 
 
-def render_comparison(path, ref_centres, recon_centres, scene_id, score,
-                      accuracy_mean, completeness_mean):
-    """CAD yellow + recon cyan. Rough occupancy → square stamps, α=1/N_max.
-
-    Stamp half-extent per axis = 0.45 * min(cell, view_axis_extent / 48) so
-    elevation (short vertical span) gets smaller stamps than plan.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-
-    cad_rgb, rec_rgb = CAD_RGB, RECON_RGB
-    cell = _overlay_cell_m(ref_centres, recon_centres)
-    pixel = max(cell / 10.0, 0.012)
-    cad = _coarse_occupancy(ref_centres, cell)
-    rec = _coarse_occupancy(recon_centres, cell)
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), facecolor="white")
-    for ax, dims, label in ((axes[0], (0, 1), "plan x/y"),
-                            (axes[1], (0, 2), "elevation x/z")):
-        c2, r2 = cad[:, list(dims)], rec[:, list(dims)]
-        all2 = np.vstack([c2, r2])
-        ext = np.maximum(np.ptp(all2, axis=0), cell)
-        # per-axis stamp size: never larger than cell; shrink on short axes (elev z)
-        half = 0.45 * np.minimum(cell, ext / 48.0)
-        half = np.maximum(half, pixel)  # at least one pixel
-        lo, hi = all2.min(0) - half, all2.max(0) + half
-        cov_c = _stamp_squares(c2, lo, hi, half, pixel)
-        cov_r = _stamp_squares(r2, lo, hi, half, pixel)
-        n_max = max(float(cov_c.max()), float(cov_r.max()), 1.0)
-        cover_c = np.clip(cov_c / n_max, 0.0, 1.0)
-        cover_r = np.clip(cov_r / n_max, 0.0, 1.0)
-        rgb = np.ones(cov_c.shape + (3,), dtype=np.float64)
-        for i in range(3):
-            rgb[..., i] = 1.0 - cover_c * (1.0 - cad_rgb[i])
-        for i in range(3):
-            rgb[..., i] = rgb[..., i] * (1.0 - cover_r) + rec_rgb[i] * cover_r
-        ax.imshow(np.clip(rgb, 0, 1), origin="lower",
-                  extent=[lo[0], hi[0], lo[1], hi[1]],
-                  interpolation="nearest", aspect="equal")
-        ax.set_title(label)
-        ax.set_facecolor("white")
-
-    fig.legend([Patch(color=cad_rgb), Patch(color=rec_rgb)],
-               ["CAD", "recon"], loc="lower center", ncol=2)
-    fig.suptitle(
-        f"{scene_id}  {SCORE_KEY}={score:.2f}  "
-        f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})  "
-        f"cell={cell:.2f}m")
-    fig.tight_layout(rect=[0, 0.06, 1, 0.94])
-    fig.savefig(path, dpi=140, facecolor="white")
-    plt.close(fig)
+def _panel_overlay(ax, cad, rec, dims, cell, cad_rgb, rec_rgb):
+    """Plan/elevation: shared α=1/Nmax; colors mix by relative cover (overlap → green)."""
+    c2, r2 = cad[:, list(dims)], rec[:, list(dims)]
+    all2 = np.vstack([c2, r2])
+    lo = np.floor(all2.min(0) / cell) * cell
+    hi = np.ceil(all2.max(0) / cell) * cell
+    n0 = max(1, int(np.round((hi[0] - lo[0]) / cell)))
+    n1 = max(1, int(np.round((hi[1] - lo[1]) / cell)))
+    cov_c = _stamp_squares(c2, lo, cell, n0, n1)
+    cov_r = _stamp_squares(r2, lo, cell, n0, n1)
+    n_max = max(float(cov_c.max()), float(cov_r.max()), 1.0)
+    a_c = np.clip(cov_c / n_max, 0.0, 1.0)
+    a_r = np.clip(cov_r / n_max, 0.0, 1.0)
+    w = a_c + a_r
+    # alpha from either cloud; color = cover-weighted mix (equal → green)
+    alpha = np.clip(w, 0.0, 1.0)
+    mix = np.zeros((n1, n0, 3), dtype=np.float64)
+    m = w > 0
+    for i in range(3):
+        mix[..., i] = np.where(m, (cad_rgb[i] * a_c + rec_rgb[i] * a_r) / np.maximum(w, 1e-12), 1.0)
+    rgb = np.ones((n1, n0, 3), dtype=np.float64)
+    for i in range(3):
+        rgb[..., i] = (1.0 - alpha) + mix[..., i] * alpha
+    ax.imshow(np.clip(rgb, 0, 1), origin="lower",
+              extent=[lo[0], hi[0], lo[1], hi[1]],
+              interpolation="nearest", aspect="equal")
+    ax.set_facecolor("white")
 
 
-def render_isometric_distance(path, mesh, cad_centres, scene_id, score,
-                              ceiling_height=CEILING_HEIGHT_M):
-    """Isometric recon mesh coloured by distance to visible CAD (cm).
+def _hide_ceiling_faces(mesh, normal_min=CEILING_NORMAL_MIN):
+    """Drop upward-facing triangles (normals only). Display filter; no mesh save."""
+    m = mesh
+    if len(m.triangles) > 150000:
+        m = m.simplify_quadric_decimation(target_number_of_triangles=120000)
+    m.compute_triangle_normals()
+    N = np.asarray(m.triangle_normals)
+    F = np.asarray(m.triangles)
+    V = np.asarray(m.vertices)
+    keep = N[:, 2] < normal_min
+    F2 = F[keep]
+    if len(F2) == 0:
+        raise RuntimeError("no faces left after normal ceiling hide")
+    return V, F2
 
-    Ceiling: hide faces above floor_p1 + ceiling_height for display only (no crop saved).
-    Colour: CAD yellow at 0 cm → recon cyan at p95 (outliers clipped).
-    """
+
+def _iso_axis_off(ax):
+    """Bare 3D axes: no panes, ticks, or grid."""
+    ax.set_axis_off()
+    ax.grid(False)
+    try:
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        ax.xaxis.pane.set_edgecolor((1, 1, 1, 0))
+        ax.yaxis.pane.set_edgecolor((1, 1, 1, 0))
+        ax.zaxis.pane.set_edgecolor((1, 1, 1, 0))
+    except Exception:
+        pass
+
+
+def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, score,
+                           accuracy_mean, completeness_mean):
+    """One PNG: plan | elev on top; isometric = full bottom width (= both top panels)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.patches import Patch
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-    m = mesh
-    if len(m.triangles) > 120000:
-        m = m.simplify_quadric_decimation(target_number_of_triangles=100000)
-    V = np.asarray(m.vertices, dtype=np.float64)
-    F = np.asarray(m.triangles, dtype=np.int64)
-    if len(V) == 0 or len(F) == 0:
-        raise RuntimeError("empty mesh for isometric render")
+    cad_rgb, rec_rgb = CAD_RGB, RECON_RGB
+    cell = _overlay_cell_m(ref_centres, recon_centres)
+    cad = _coarse_occupancy(ref_centres, cell)
+    rec = _coarse_occupancy(recon_centres, cell)
 
-    d_cm = cKDTree(cad_centres).query(V, k=1, workers=-1)[0] * 100.0
-    up = 2
-    floor = float(np.percentile(V[:, up], 1))
-    keep_v = V[:, up] <= floor + ceiling_height
-    keep_f = keep_v[F[:, 0]] & keep_v[F[:, 1]] & keep_v[F[:, 2]]
-    F2 = F[keep_f]
-    if len(F2) == 0:
-        raise RuntimeError("no faces left after ceiling hide")
-
-    d_vis = d_cm[keep_v]
-    p95 = float(np.percentile(d_vis, 95)) if len(d_vis) else 1.0
+    V, F2 = _hide_ceiling_faces(mesh)
+    d_cm = cKDTree(ref_centres).query(V, k=1, workers=-1)[0] * 100.0
+    d_face = d_cm[F2].mean(axis=1)
+    p95 = float(np.percentile(d_face, 95)) if len(d_face) else 1.0
     p95 = max(p95, 1e-3)
-    t = np.clip(d_cm / p95, 0.0, 1.0)
-    vcol = CAD_RGB[None, :] * (1.0 - t)[:, None] + RECON_RGB[None, :] * t[:, None]
-    fcol = vcol[F2].mean(axis=1)
+    t = np.clip(d_face / p95, 0.0, 1.0)
+    fcol = cad_rgb[None, :] * (1.0 - t)[:, None] + rec_rgb[None, :] * t[:, None]
 
-    fig = plt.figure(figsize=(9, 7), facecolor="white")
-    ax = fig.add_subplot(111, projection="3d", computed_zorder=False)
+    # Top row height == bottom row height → iso area ≈ plan+elev combined
+    fig = plt.figure(figsize=(14, 12), facecolor="white")
+    gs = GridSpec(2, 2, figure=fig, height_ratios=[1.0, 1.0],
+                  hspace=0.18, wspace=0.16,
+                  left=0.05, right=0.98, top=0.93, bottom=0.06)
+
+    ax_plan = fig.add_subplot(gs[0, 0])
+    _panel_overlay(ax_plan, cad, rec, (0, 1), cell, cad_rgb, rec_rgb)
+    ax_plan.set_title("plan x/y")
+    ax_plan.set_xlabel("x")
+    ax_plan.set_ylabel("y")
+
+    ax_elev = fig.add_subplot(gs[0, 1])
+    _panel_overlay(ax_elev, cad, rec, (0, 2), cell, cad_rgb, rec_rgb)
+    ax_elev.set_title("elevation x/z")
+    ax_elev.set_xlabel("x")
+    ax_elev.set_ylabel("z")
+
+    ax_iso = fig.add_subplot(gs[1, :], projection="3d", computed_zorder=False)
     coll = Poly3DCollection(V[F2], linewidths=0, edgecolors="none")
     coll.set_facecolor(fcol)
-    ax.add_collection3d(coll)
-
-    Vk = V[keep_v]
-    lo, hi = Vk.min(0), Vk.max(0)
-    c = 0.5 * (lo + hi)
-    r = 0.5 * float(np.max(hi - lo)) + 0.2
-    ax.set_xlim(c[0] - r, c[0] + r)
-    ax.set_ylim(c[1] - r, c[1] + r)
-    ax.set_zlim(c[2] - r, c[2] + r)
+    ax_iso.add_collection3d(coll)
+    # Equal-aspect cube framed on CAD room
+    clo, chi = ref_centres.min(0), ref_centres.max(0)
+    c = 0.5 * (clo + chi)
+    r = 0.55 * float(np.max(chi - clo)) + 0.3
+    ax_iso.set_xlim(c[0] - r, c[0] + r)
+    ax_iso.set_ylim(c[1] - r, c[1] + r)
+    ax_iso.set_zlim(c[2] - r, c[2] + r)
     try:
-        ax.set_box_aspect((1, 1, 1))
+        ax_iso.set_box_aspect((1, 1, 1))
     except Exception:
         pass
-    ax.view_init(elev=30, azim=-45)
+    ax_iso.view_init(elev=28, azim=-50)
     try:
-        ax.set_proj_type("ortho")
+        ax_iso.set_proj_type("ortho")
     except Exception:
         pass
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-    ax.set_facecolor("white")
+    _iso_axis_off(ax_iso)
+    ax_iso.set_facecolor("white")
+    ax_iso.set_title(
+        f"isometric recon  (normals n·z≥{CEILING_NORMAL_MIN} hidden)  p95={p95:.1f} cm",
+        fontsize=11, pad=2)
 
     cmap = LinearSegmentedColormap.from_list("cad_recon", [CAD_RGB, RECON_RGB])
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, p95))
     sm.set_array([])
-    cb = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.08)
+    cb = fig.colorbar(sm, ax=ax_iso, fraction=0.03, pad=0.01, shrink=0.9)
     cb.set_label("distance to CAD (cm)")
 
-    ax.set_title(
-        f"{scene_id}  isometric recon  {SCORE_KEY}={score:.2f}  "
-        f"ceiling hide floor+{ceiling_height:.1f}m  p95={p95:.1f}cm")
-    fig.tight_layout()
-    fig.savefig(path, dpi=140, facecolor="white")
+    fig.legend([Patch(color=cad_rgb), Patch(color=rec_rgb),
+                Patch(color=0.5 * (cad_rgb + rec_rgb))],
+               ["CAD / near", "recon / far", "overlap"],
+               loc="lower center", ncol=3, bbox_to_anchor=(0.5, 0.005))
+    fig.suptitle(
+        f"{scene_id}  {SCORE_KEY}={score:.2f}  "
+        f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})  "
+        f"cell={cell:.2f}m",
+        y=0.98)
+    fig.savefig(path, dpi=160, facecolor="white")
     plt.close(fig)
 
 
@@ -479,19 +492,17 @@ def score_scan(scan_id, config_path=None):
     recon_dir = os.path.join(root, "recon")
     os.makedirs(recon_dir, exist_ok=True)
     png_rel = "recon/cad_comparison.png"
-    iso_rel = "recon/cad_distance_isometric.png"
     png_path = os.path.join(root, png_rel)
-    iso_path = os.path.join(root, iso_rel)
     yaml_path = os.path.join(recon_dir, "geometry_score.yaml")
+    # drop legacy separate isometric if present
+    legacy_iso = os.path.join(recon_dir, "cad_distance_isometric.png")
 
     fd1, tmp_png = tempfile.mkstemp(prefix=".tmp_cmp_", suffix=".png", dir=recon_dir)
     os.close(fd1)
-    fd2, tmp_iso = tempfile.mkstemp(prefix=".tmp_iso_", suffix=".png", dir=recon_dir)
-    os.close(fd2)
     try:
-        render_comparison(tmp_png, cad_centres, recon_centres_cad, scan_id,
-                          score, accuracy_mean, completeness_mean)
-        render_isometric_distance(tmp_iso, mesh_cad, cad_centres, scan_id, score)
+        render_geometry_report(
+            tmp_png, cad_centres, recon_centres_cad, mesh_cad, scan_id,
+            score, accuracy_mean, completeness_mean)
         doc = {
             "metric": METRIC,
             SCORE_KEY: float(round(score, 6)),
@@ -510,17 +521,19 @@ def score_scan(scan_id, config_path=None):
                 "recon_to_cad": T_recon_to_cad.reshape(-1).astype(float).tolist(),
             },
             "comparison": png_rel,
-            "isometric": iso_rel,
         }
         atomic_write_text(yaml_path, yaml.safe_dump(doc, sort_keys=False))
         os.replace(tmp_png, png_path)
-        os.replace(tmp_iso, iso_path)
-    except Exception:
-        for t in (tmp_png, tmp_iso):
+        if os.path.isfile(legacy_iso):
             try:
-                os.unlink(t)
+                os.unlink(legacy_iso)
             except OSError:
                 pass
+    except Exception:
+        try:
+            os.unlink(tmp_png)
+        except OSError:
+            pass
         raise
 
     print(f"[geometry] {scan_id} {SCORE_KEY}={score:.2f} "
