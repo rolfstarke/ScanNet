@@ -428,9 +428,8 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     _iso_axis_off(ax_iso)
     ax_iso.set_facecolor("white")
     ax_iso.set_title(
-        f"isometric recon only · colour = distance to CAD  "
-        f"(magenta=close → cyan=far) · ceiling floor+{CEILING_HEIGHT_M:.1f}m · "
-        f"p95={p95:.1f} cm",
+        f"isometric recon · distance to CAD  "
+        f"(ceiling floor+{CEILING_HEIGHT_M:.1f}m) · p95={p95:.1f} cm",
         fontsize=10, pad=4)
 
     cax = fig.add_axes([x0 + 2 * sx + gx + 0.012, y_iso + 0.06 * ih, 0.014, 0.88 * ih])
@@ -438,12 +437,11 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, p95))
     sm.set_array([])
     cb = fig.colorbar(sm, cax=cax)
-    cb.set_label("recon→CAD distance (cm)\nmagenta=close  cyan=far", fontsize=8)
+    cb.set_label("distance to CAD (cm)", fontsize=9)
 
-    fig.legend([Patch(color=cad_rgb), Patch(color=rec_rgb),
-                Patch(color=0.5 * (cad_rgb + rec_rgb))],
-               ["CAD occupancy / near", "recon occupancy / far", "plan·elev overlap"],
-               loc="lower center", ncol=3, bbox_to_anchor=(0.5, 0.01),
+    fig.legend([Patch(color=cad_rgb), Patch(color=rec_rgb)],
+               ["CAD (magenta)", "recon (cyan)"],
+               loc="lower center", ncol=2, bbox_to_anchor=(0.5, 0.01),
                frameon=False)
     fig.suptitle(
         f"{scene_id}  {SCORE_KEY}={score:.2f}  "
