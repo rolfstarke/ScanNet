@@ -352,33 +352,50 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     cad = _coarse_occupancy(ref_centres, cell)
     rec = _coarse_occupancy(recon_centres, cell)
 
+    # Recon mesh only (no CAD geometry drawn). Colour by distance to CAD.
     V, F2, _floor = _hide_ceiling_faces(mesh)
     d_cm = cKDTree(ref_centres).query(V, k=1, workers=-1)[0] * 100.0
     d_face = d_cm[F2].mean(axis=1)
     p95 = float(np.percentile(d_face, 95)) if len(d_face) else 1.0
     p95 = max(p95, 1e-3)
+    # magenta (close) → cyan (far); clip outliers at p95
     t = np.clip(d_face / p95, 0.0, 1.0)
     fcol = cad_rgb[None, :] * (1.0 - t)[:, None] + rec_rgb[None, :] * t[:, None]
 
-    # Top: two equal squares (plan | elev). Bottom: iso full figure width,
-    # taller than one square so the 3D view can grow (Axes3D is limited by
-    # the shorter side of its axes box).
-    S = 5.0          # inches: side of plan/elev square
-    iso_h = 1.65 * S  # inches: iso taller than one square
-    gap = 0.30
-    fig_w = 2 * S + gap + 1.2
-    fig_h = S + gap + iso_h + 1.35
+    # Smart full-frame zoom: recon faces inside CAD AABB (+small pad), tight
+    # data-aspect box (not unit cube) so the mesh fills the wide iso panel.
+    fc = V[F2].mean(axis=1)
+    clo, chi = ref_centres.min(0), ref_centres.max(0)
+    cad_span = np.maximum(chi - clo, 0.3)
+    pad = 0.08 * cad_span
+    in_room = np.all((fc >= clo - pad) & (fc <= chi + pad), axis=1)
+    if int(in_room.sum()) < 80:
+        in_room = d_face <= np.percentile(d_face, 80)
+    if int(in_room.sum()) < 30:
+        in_room = np.ones(len(F2), dtype=bool)
+    F_iso = F2[in_room]
+    fcol_iso = fcol[in_room]
+    pts_iso = V[np.unique(F_iso.ravel())]
+    plo, phi = pts_iso.min(0), pts_iso.max(0)
+    span = np.maximum(phi - plo, 0.2)
+    margin = 0.04 * span
+    lo, hi = plo - margin, phi + margin
+
+    # Top: plan | elev squares. Bottom: full-width iso, taller than top row.
+    S = 5.0
+    iso_h = 2.1 * S
+    gap = 0.28
+    fig_w = 2 * S + gap + 1.3
+    fig_h = S + gap + iso_h + 1.3
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
-    ml, mb = 0.55 / fig_w, 0.75 / fig_h
+    ml, mb = 0.55 / fig_w, 0.72 / fig_h
     sx, sy = S / fig_w, S / fig_h
     gx, gy = gap / fig_w, gap / fig_h
     ih = iso_h / fig_h
-    x0 = ml
-    y_iso = mb
+    x0, y_iso = ml, mb
     y_top = mb + ih + gy
     ax_plan = fig.add_axes([x0, y_top, sx, sy])
     ax_elev = fig.add_axes([x0 + sx + gx, y_top, sx, sy])
-    # full width under both top panels
     ax_iso = fig.add_axes([x0, y_iso, 2 * sx + gx, ih], projection="3d",
                           computed_zorder=False)
 
@@ -392,20 +409,18 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     ax_elev.set_xlabel("x")
     ax_elev.set_ylabel("z")
 
-    coll = Poly3DCollection(V[F2], linewidths=0, edgecolors="none")
-    coll.set_facecolor(fcol)
+    # Recon geometry only — no CAD mesh
+    coll = Poly3DCollection(V[F_iso], linewidths=0, edgecolors="none")
+    coll.set_facecolor(fcol_iso)
     ax_iso.add_collection3d(coll)
-    clo, chi = ref_centres.min(0), ref_centres.max(0)
-    c = 0.5 * (clo + chi)
-    r = 0.52 * float(np.max(chi - clo)) + 0.25
-    ax_iso.set_xlim(c[0] - r, c[0] + r)
-    ax_iso.set_ylim(c[1] - r, c[1] + r)
-    ax_iso.set_zlim(c[2] - r, c[2] + r)
+    ax_iso.set_xlim(lo[0], hi[0])
+    ax_iso.set_ylim(lo[1], hi[1])
+    ax_iso.set_zlim(lo[2], hi[2])
     try:
-        ax_iso.set_box_aspect((1, 1, 1))
+        ax_iso.set_box_aspect((hi - lo) / max(float((hi - lo).max()), 1e-6))
     except Exception:
         pass
-    ax_iso.view_init(elev=28, azim=-50)
+    ax_iso.view_init(elev=30, azim=-48)
     try:
         ax_iso.set_proj_type("ortho")
     except Exception:
@@ -413,21 +428,21 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     _iso_axis_off(ax_iso)
     ax_iso.set_facecolor("white")
     ax_iso.set_title(
-        f"isometric recon  (ceiling hide floor+{CEILING_HEIGHT_M:.1f}m)  "
+        f"isometric recon only · colour = distance to CAD  "
+        f"(magenta=close → cyan=far) · ceiling floor+{CEILING_HEIGHT_M:.1f}m · "
         f"p95={p95:.1f} cm",
-        fontsize=11, pad=4)
+        fontsize=10, pad=4)
 
-    # Colorbar strip just right of the full-width iso
     cax = fig.add_axes([x0 + 2 * sx + gx + 0.012, y_iso + 0.06 * ih, 0.014, 0.88 * ih])
-    cmap = LinearSegmentedColormap.from_list("cad_recon", [CAD_RGB, RECON_RGB])
+    cmap = LinearSegmentedColormap.from_list("near_far", [CAD_RGB, RECON_RGB])
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, p95))
     sm.set_array([])
     cb = fig.colorbar(sm, cax=cax)
-    cb.set_label("distance to CAD (cm)", fontsize=9)
+    cb.set_label("recon→CAD distance (cm)\nmagenta=close  cyan=far", fontsize=8)
 
     fig.legend([Patch(color=cad_rgb), Patch(color=rec_rgb),
                 Patch(color=0.5 * (cad_rgb + rec_rgb))],
-               ["CAD / near (magenta)", "recon / far (cyan)", "overlap"],
+               ["CAD occupancy / near", "recon occupancy / far", "plan·elev overlap"],
                loc="lower center", ncol=3, bbox_to_anchor=(0.5, 0.01),
                frameon=False)
     fig.suptitle(
