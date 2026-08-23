@@ -94,6 +94,8 @@ def _pointcloud_path(scene_id):
 def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, tasks_log, lease):
     """Run one (model, scene) task in a subprocess; appends scene_id to the task marker file
     on success. Returns (model, scene_id, out_dir, elapsed, ok)."""
+    from utils.scan_lock import exclusive_lock, prediction_index_lock_path
+
     os.makedirs(out_dir, exist_ok=True)
 
     run_script = os.path.join(os.path.dirname(__file__), MODEL_RUN_SCRIPT[model])
@@ -113,8 +115,11 @@ def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, task
         subprocess.run(args, env=env, check=True, pass_fds=pass_fds)
         elapsed = time.time() - start
         print(f"[INFO] {model} on {scene_id} done in {elapsed:.1f}s -> {out_dir}")
-        with open(tasks_log, "a") as f:
-            f.write(scene_id + "\n")
+        # append after lease release path is handled by caller; lock the tasks file
+        with exclusive_lock(prediction_index_lock_path()):
+            os.makedirs(os.path.dirname(tasks_log), exist_ok=True)
+            with open(tasks_log, "a") as f:
+                f.write(scene_id + "\n")
         return model, scene_id, out_dir, elapsed, True
     except subprocess.CalledProcessError as e:
         print(f"[WARN] {model} on {scene_id} FAILED (gpu {gpu}, rc={e.returncode}) after {time.time() - start:.1f}s")
@@ -183,41 +188,55 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
                          "\n".join(f"  {m}: {r}" for m, r in bad))
     models = [m for m in models if m in SUPPORTED_MODELS]
 
-    for scene_id in scene_ids:
-        if not os.path.isdir(os.path.join(SCANS_DIR, scene_id)):
-            raise ValueError(f"scene directory not found: {os.path.join(SCANS_DIR, scene_id)}")
-        if not os.path.isfile(_pointcloud_path(scene_id)):
-            raise ValueError(f"pointcloud not found: {_pointcloud_path(scene_id)}")
+    from utils.scan_lock import ScanLock, scan_lock_path
 
-    # Shared per-scene frame extraction, sequential up front (parallel dispatch would race on it).
-    need_frames = any(MODEL_NEEDS_FRAMES.get(m, False) for m in models)
-    frames_dir_by_scene = {}
-    if need_frames:
-        from predict.frames import extract_frames
-        for scene_id in scene_ids:
-            frames_dir_by_scene[scene_id] = extract_frames(scene_id, replace)
+    unique_scenes = sorted(set(scene_ids))
+    locks = []
+    try:
+        for scene_id in unique_scenes:
+            lk = ScanLock(scan_lock_path(scene_id, scannet_root), exclusive=True)
+            lk.acquire()
+            locks.append(lk)
 
-    tasks = [(m, s) for m in models for s in scene_ids]
-    print(f"[INFO] {len(tasks)} tasks, automatic GPU pool {gpu_pool}")
+        for scene_id in unique_scenes:
+            if not os.path.isdir(os.path.join(SCANS_DIR, scene_id)):
+                raise ValueError(f"scene directory not found: {os.path.join(SCANS_DIR, scene_id)}")
+            if not os.path.isfile(_pointcloud_path(scene_id)):
+                raise ValueError(f"pointcloud not found: {_pointcloud_path(scene_id)}")
 
-    def _task_args(model):
-        tasks_log = os.path.join(eval_root, run_id, f"{model}.tasks")
-        os.makedirs(os.path.dirname(tasks_log), exist_ok=True)
-        return submission_dir(spec, run_id, model), tasks_log
+        need_frames = any(MODEL_NEEDS_FRAMES.get(m, False) for m in models)
+        frames_dir_by_scene = {}
+        if need_frames:
+            from predict.frames import extract_frames
+            for scene_id in unique_scenes:
+                frames_dir_by_scene[scene_id] = extract_frames(scene_id, replace)
 
-    results = []
+        for lk in locks:
+            lk.downgrade_to_shared()
 
-    def work(task):
-        model, scene_id = task
-        out_dir, tasks_log = _task_args(model)
-        with gpu_lease(gpu_pool, scannet_root) as lease:
-            return _run_one(model, scene_id, frames_dir_by_scene.get(scene_id), classes,
-                            lease.index, out_dir, benchmark, tasks_log, lease)
+        tasks = [(m, s) for m in models for s in scene_ids]
+        print(f"[INFO] {len(tasks)} tasks, automatic GPU pool {gpu_pool}")
 
-    max_workers = max(1, min(len(gpu_pool), len(tasks)))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(work, t) for t in tasks]
-        for fut in futures:
-            results.append(fut.result())
+        def _task_args(model):
+            tasks_log = os.path.join(eval_root, run_id, f"{model}.tasks")
+            os.makedirs(os.path.dirname(tasks_log), exist_ok=True)
+            return submission_dir(spec, run_id, model), tasks_log
 
-    return results
+        results = []
+
+        def work(task):
+            model, scene_id = task
+            out_dir, tasks_log = _task_args(model)
+            with gpu_lease(gpu_pool, scannet_root) as lease:
+                return _run_one(model, scene_id, frames_dir_by_scene.get(scene_id), classes,
+                                lease.index, out_dir, benchmark, tasks_log, lease)
+
+        max_workers = max(1, min(len(gpu_pool), len(tasks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(work, t) for t in tasks]
+            for fut in futures:
+                results.append(fut.result())
+        return results
+    finally:
+        for lk in reversed(locks):
+            lk.release()

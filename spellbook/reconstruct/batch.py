@@ -1,15 +1,7 @@
 """Batch runner: many scenes x engines over the shared automatic GPU pool.
 
-Phase 1 (sequential): one shared frame set per scene under
-/data/scannet/derived/reconstruction/frames/<scene>, extracted at most once
-(--replace regenerates). Phase 2 (parallel): one subprocess per (scene, engine)
-task; each task acquires its own cross-process GPU lease from settings gpu_pool
-(never GPU 0; ZED/Open3D take no lease per their GPU_POLICY). stdout/stderr are
-piped to spellbook/tmp/logs/reconstruct-<run-id>/<scan_id>.log; the terminal only
-shows tqdm bars (one per worker slot). Engines flagged SERIAL in their adapter run
-one task at a time (Metashape license, Isaac, ZED tracking); engines whose runtime
-is missing are skipped with a clear reason from their own preflight() instead of
-failing the whole batch.
+Phase 1: ensure shared frames (multi-GPU extract for missing scenes).
+Phase 2: one subprocess per (scene, engine); child allocates its own run slot.
 """
 import importlib
 import os
@@ -27,10 +19,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 from benchmark import load_settings
-from . import ENGINE_INDEX, svo_path
+from . import ENGINE_INDEX, frames_pool_dir, svo_path
 from . import extract as extract_mod
 
-FRAMES_ROOT = "/data/scannet/derived/reconstruction/frames"
 LOG_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "tmp", "logs")
 
@@ -40,7 +31,6 @@ def _engine_module(engine):
 
 
 def _preflight_engines(engines):
-    """Return {engine: None|reason} from each adapter's own preflight()."""
     reasons = {}
     for e in engines:
         try:
@@ -53,25 +43,33 @@ def _preflight_engines(engines):
 
 
 def _prepare_frames(scenes, replace):
-    """Sequential per-scene extraction into FRAMES_ROOT; returns {scene: frames_dir}."""
-    os.makedirs(FRAMES_ROOT, exist_ok=True)
+    os.makedirs(extract_mod.FRAMES_ROOT, exist_ok=True)
     by_scene = {}
-    with tqdm(total=len(scenes), desc="frames", unit="scene", leave=False) as pbar:
-        for scene in scenes:
-            svo = svo_path(scene)
-            if not os.path.exists(svo):
-                raise SystemExit(f"svo not found: {svo}")
-            work_dir = os.path.join(FRAMES_ROOT, f"scene{scene:04d}")
-            os.makedirs(work_dir, exist_ok=True)
-            by_scene[scene] = os.path.join(work_dir, "frames")
-            extract_mod.ensure_frames(svo, work_dir, replace=replace)
-            pbar.update(1)
-            pbar.set_postfix_str(f"scene{scene:04d}")
+    need = []
+    for scene in scenes:
+        svo = svo_path(scene)
+        if not os.path.exists(svo):
+            raise SystemExit(f"svo not found: {svo}")
+        pool = frames_pool_dir(scene)
+        if scene == 9004 and not extract_mod.frames_complete(pool):
+            extract_mod.promote_scene9004_frames()
+        if extract_mod.frames_complete(pool) and not replace:
+            by_scene[scene] = pool
+        else:
+            need.append(scene)
+    if need:
+        extracted = extract_mod.extract_scenes(need, replace=replace)
+        by_scene.update(extracted)
+    for scene in scenes:
+        pool = frames_pool_dir(scene)
+        if not extract_mod.frames_complete(pool):
+            raise SystemExit(f"shared frames incomplete: {pool}")
+        by_scene[scene] = pool
     return by_scene
 
 
 def _run_task(scene, engine, frames_dir, log_path, bar, slot, proc_registry):
-    sid = f"scene{scene:04d}_{ENGINE_INDEX[engine]:02d}"
+    label = f"scene{scene:04d}_{engine}"
     cmd = [sys.executable, "-m", "spellbook.reconstruct.run",
            "--scene", str(scene), "--engine", engine, "--frames", frames_dir]
     env = os.environ.copy()
@@ -81,8 +79,8 @@ def _run_task(scene, engine, frames_dir, log_path, bar, slot, proc_registry):
                             text=True, bufsize=1, env=env)
     with proc_registry["lock"]:
         proc_registry["procs"].add(proc)
-    bar.set_description(f"slot{slot} {sid}")
-    stage, tail = "running", []
+    bar.set_description(f"slot{slot} {label}")
+    stage, tail, sid = "running", [], label
     with open(log_path, "w") as logf:
         logf.write("cmd: " + " ".join(cmd) + "\n")
         for line in proc.stdout:
@@ -90,8 +88,12 @@ def _run_task(scene, engine, frames_dir, log_path, bar, slot, proc_registry):
             tail.append(line.rstrip())
             if len(tail) > 20:
                 tail.pop(0)
-            m = re.match(r"^\[([a-z0-9]+)", line.strip())
-            if m and m.group(1) not in ("run", "extract", "qc", "gpu"):
+            m = re.match(r"^\[run\]\s+(scene\d{4}_\d{2})\b", line.strip())
+            if m:
+                sid = m.group(1)
+                bar.set_description(f"slot{slot} {sid}")
+            m = re.match(r"^\[([a-z0-9-]+)", line.strip())
+            if m and m.group(1) not in ("run", "extract", "gpu", "frames"):
                 stage = m.group(1)
                 bar.set_description(f"slot{slot} {sid}: {stage}")
             if m and m.group(1) == "gpu":
@@ -101,11 +103,18 @@ def _run_task(scene, engine, frames_dir, log_path, bar, slot, proc_registry):
         proc_registry["procs"].discard(proc)
     ok = rc == 0
     bar.set_description(f"slot{slot} {sid}: {'done' if ok else f'FAIL(rc={rc})'}")
-    return sid, ok, tail
+    # rename log to final sid if discovered
+    final_log = os.path.join(os.path.dirname(log_path), f"{sid}.log")
+    if final_log != log_path and os.path.isfile(log_path):
+        try:
+            os.replace(log_path, final_log)
+            log_path = final_log
+        except OSError:
+            pass
+    return sid, ok, tail, log_path
 
 
 def run_batch(scenes, engines, replace=False):
-    """Returns (n_ok, n_failed). Never raises on task failures."""
     engines = list(engines)
     scenes = [int(s) for s in scenes]
     unknown = [e for e in engines if e not in ENGINE_INDEX]
@@ -122,7 +131,6 @@ def run_batch(scenes, engines, replace=False):
         raise SystemExit("no engines left after preflight")
 
     gpu_pool = load_settings()["gpu_pool"]
-
     run_id = time.strftime("run-%Y%m%d-%H%M%S")
     log_dir = os.path.join(LOG_ROOT, f"reconstruct-{run_id}")
     os.makedirs(log_dir, exist_ok=True)
@@ -146,8 +154,7 @@ def run_batch(scenes, engines, replace=False):
             s.acquire()
         slot = free_slots.get()
         try:
-            log_path = os.path.join(log_dir,
-                                    f"scene{scene:04d}_{ENGINE_INDEX[engine]:02d}.log")
+            log_path = os.path.join(log_dir, f"scene{scene:04d}_{engine}.log")
             return _run_task(scene, engine, frames_by_scene[scene],
                              log_path, bars[slot], slot, registry)
         finally:
@@ -160,10 +167,10 @@ def run_batch(scenes, engines, replace=False):
         with ThreadPoolExecutor(max_workers=len(slots)) as pool:
             futures = [pool.submit(work, t) for t in tasks]
             for fut in as_completed(futures):
-                sid, ok, tail = fut.result()
+                sid, ok, tail, log_path = fut.result()
                 results.append((sid, ok))
                 if not ok:
-                    failed.append((sid, tail))
+                    failed.append((sid, tail, log_path))
     except KeyboardInterrupt:
         with registry["lock"]:
             for p in registry["procs"]:
@@ -175,9 +182,9 @@ def run_batch(scenes, engines, replace=False):
 
     n_ok = sum(1 for _, ok in results if ok)
     print(f"[batch] done {n_ok}/{len(tasks)} tasks, logs: {log_dir}")
-    for sid, tail in failed:
+    for sid, tail, log_path in failed:
         last = next((l for l in reversed(tail) if l.strip()), "")
-        print(f"[FAIL] {sid} ({last[:200]}) -> {os.path.join(log_dir, sid + '.log')}")
+        print(f"[FAIL] {sid} ({last[:200]}) -> {log_path}")
     return n_ok, len(failed)
 
 

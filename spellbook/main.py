@@ -33,6 +33,9 @@ def main():
                         help="reconstruct mode: SVO2 -> ScanNet-native scan per "
                              "(scene, engine); frames extracted once, tasks automatically "
                              "share the settings gpu_pool")
+    parser.add_argument("--extract-frames", action="store_true",
+                        help="main-checkout multi-GPU SVO frame extraction into the "
+                             "shared pool (never from engine worktrees)")
     parser.add_argument("--replace", action="store_true",
                         help="re-extract frames even if a complete set exists")
     parser.add_argument("--scene", nargs="+",
@@ -44,8 +47,8 @@ def main():
     spec = resolve_benchmark(benchmark)
 
     if args.gpu_check:
-        if args.visualize or args.predict:
-            parser.error("--gpu-check is exclusive with --visualize/--predict")
+        if args.visualize or args.predict or args.extract_frames:
+            parser.error("--gpu-check is exclusive with --visualize/--predict/--extract-frames")
         if args.scene:
             parser.error("--gpu-check does not use --scene")
         import sys as _sys
@@ -56,6 +59,13 @@ def main():
             _sys.argv += ["--engine", *args.engine]
         from gpu_check import main as gpu_check_main
         gpu_check_main()
+    elif args.extract_frames:
+        if args.visualize or args.predict or args.engine:
+            parser.error("--extract-frames is exclusive with --visualize/--predict/--engine")
+        if not args.scene:
+            parser.error("--extract-frames requires --scene")
+        from reconstruct.extract import extract_scenes
+        extract_scenes([int(s) for s in args.scene], replace=args.replace)
     elif args.visualize:
         if len(args.scene or []) != 1:
             parser.error("--visualize takes exactly one --scene")

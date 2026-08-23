@@ -1,0 +1,42 @@
+metric: observed_surface_voxel_f1_v1
+voxel_mm: 10
+distance_threshold_mm: 50
+max_surface_voxels: 12000000
+max_poses: 120
+min_views: 2
+ray_width: 240
+ray_height: 150
+scenes:
+  scene9004:
+    retained_runs: 10
+    cad_source: /data/08_TestEnvironments/06_BTU_LG2C_R312_order/02_3D-Model/LG2C_Raum312_v2.3dm
+    cad_source_sha256: ff00c139adededf46f94f69c7872a566f2da2617224305b6dd8583d5dd04994a
+    cad_ply: /data/scannet/custom/reference/scene9004_cad.ply
+    visible_voxels: /data/scannet/custom/reference/scene9004_visible_voxels.npz
+    reference_sha256: 766131128d262b8a7c0cf75243f88c3b269f4c88058c62d9750b380c8b4eb24d
+    visible_voxels_sha256: 9e47eb8667b43d0f2604f119909489d05db7989f469159368c5ab4414d724d9c
+    grid_origin_m:
+    - -7.16
+    - -4.82
+    - -1.0
+    bounds_min_m:
+    - -31.15250015258789
+    - -28.816498279571533
+    - -5.0
+    bounds_max_m:
+    - 31.15250015258789
+    - 28.816498279571533
+    - 8.30999994456768
+    cad_half_extents_m:
+    - 6.152500152587891
+    - 3.816498279571533
+    room_centre_m:
+    - 0.0
+    - 0.0
+    - 0.0
+    glass_excluded: 18
+    hardware_retained: 50
+    curves_omitted: 8
+    visibility_yaw_deg: 270
+    visibility_n_poses: 120
+    visibility_n_cells: 156689
