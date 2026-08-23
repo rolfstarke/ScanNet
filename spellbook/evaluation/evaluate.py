@@ -13,10 +13,14 @@ import sys
 
 import numpy as np
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_EVAL_DIR = os.path.dirname(os.path.abspath(__file__))
+_SPELLBOOK = os.path.dirname(_EVAL_DIR)
+_REPO_ROOT = os.path.dirname(_SPELLBOOK)
+sys.path.insert(0, _SPELLBOOK)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "BenchmarkScripts"))
 
-from benchmark import load_settings, resolve_benchmark, artifact_paths, submission_dir  # noqa: E402
+from evaluation.benchmark import (  # noqa: E402
+    load_settings, resolve_benchmark, artifact_paths, submission_dir)
 import util  # noqa: E402
 import util_3d  # noqa: E402
 
@@ -26,7 +30,7 @@ _LABEL_MAP_FALLBACK = "/data/scannet/v2/scannetv2-labels.combined.tsv"
 _EVALUATOR_SCRIPTS = {
     "official": os.path.join(
         _REPO_ROOT, "BenchmarkScripts", "3d_evaluation", "evaluate_semantic_instance.py"),
-    "scannet200": os.path.join(_REPO_ROOT, "spellbook", "scannet200_evaluator.py"),
+    "scannet200": os.path.join(_EVAL_DIR, "scannet200_evaluator.py"),
 }
 
 
@@ -198,6 +202,6 @@ if __name__ == "__main__":
         "evaluate": evaluate_cli,
     }
     if len(sys.argv) < 2 or sys.argv[1] not in sub_cmds:
-        print("usage: python evaluate.py {export-gt,evaluate} [options]")
+        print("usage: python spellbook/evaluation/evaluate.py {export-gt,evaluate} [options]")
         sys.exit(2)
     sub_cmds[sys.argv[1]](sys.argv[2:])

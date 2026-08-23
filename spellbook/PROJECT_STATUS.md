@@ -22,13 +22,14 @@ Bugs, problems, and their attempted fixes live in GitHub Issues (`rolfstarke/Sca
 spellbook/
 ├── main.py                      # CLI: --visualize, --predict, --engine, --extract-frames, --gpu-check
 ├── settings.yaml                # default benchmark + scannet_root + gpu_pool ([1,2,3,4]; 0 user-reserved)
-├── benchmark.py                 # BenchmarkSpec (ScanNet20: 18 classes / ScanNet200: 198 = 200 - wall/floor), paths, gpu_pool validation
-├── evaluate.py                  # GT export + evaluation dispatch (official / scannet200 evaluator)
-├── scannet200_evaluator.py      # Python-3 port of Rozenberszki's ScanNet200 evaluator (198-class)
 ├── gpu_check.py                 # --gpu-check: per-model/engine native distribution probe over real pool leases
 ├── environment.yaml             # 3disspellbook conda env (ZED SDK activation sets ZED_DIR/LD_LIBRARY_PATH)
 ├── PROJECT_STATUS.md            # this file
 ├── tmp/                          # active plans/research and transient logs
+├── evaluation/
+│   ├── benchmark.py             # BenchmarkSpec (ScanNet20 18 / ScanNet200 198), paths, gpu_pool validation
+│   ├── evaluate.py              # GT export + evaluation dispatch (official / scannet200)
+│   └── scannet200_evaluator.py  # Python-3 port of Rozenberszki ScanNet200 evaluator (198-class)
 ├── utils/
 │   ├── gpu.py                   # cross-process GPU leases (flock per pool index, pass_fds forwarding)
 │   ├── scan_lock.py             # frames / scene-engine / per-scan / prediction-index flock locks
@@ -168,7 +169,7 @@ Zed/open3d are local-pose baselines; multiroom drift and density remain tracked 
 13. **Depth/pose conventions**: ZED X native resolution (1920x1080 / 1920x1200 per recording); depth 0.1-6.0 m, invalid = 0, trailing SVO frame dropped; camera-to-world poses conjugated `diag(1,-1,-1,1)` from ZED's z-backward basis; gravity z-up alignment per `alignment.h`; the batch extracts each SVO once (shared frames, `--replace` to regenerate) and runs engine tasks in parallel subprocesses.
 14. **Geometry score (scene9004)**: observed surface-voxel F1 vs fixed CAD visibility mask (10 mm grid, 50 mm tolerance); score in `[0,100]` written after GPU lease release. No PASS/FAIL gate.
 15. **Frame extraction**: main checkout only via `--extract-frames`; multi-GPU leases on pool 1-4; `sdk_gpu_id` never set; scene9004 frames are promoted from the existing complete set, not re-extracted. Worktrees consume the shared pool read-only.
-16. **Foreign-environment imports**: model subprocesses load `spellbook/benchmark.py` by absolute `importlib` spec. Adding `spellbook/` to `sys.path` shadows model repositories' top-level packages such as OpenIns3D's `utils`.
+16. **Foreign-environment imports**: model subprocesses load `spellbook/evaluation/benchmark.py` by absolute `importlib` spec. Adding `spellbook/` to `sys.path` shadows model repositories' top-level packages such as OpenIns3D's `utils`.
 17. **Worktrees (convention)**: engine debugging happens one `debug/reconstruction-<engine>` branch+worktree per engine; prediction work uses `debug/prediction`. Seven linked worktrees exist: six engine trees from master `5a3fa9e` (2026-08-22) for open3d, zed, bundlefusion, metashape, rtabmap, isaac and `debug/prediction` from master `80752c6` (2026-08-23), all under `~/.local/share/opencode/worktree/<projectId>/debug/`; each branch may touch only its own scope; shared core files stay frozen. The worktree plugin forks a session (recorded against main) and launches a TUI from the tree; the fork must be relocated via OpenCode's control-plane move API (`moveChanges=false`) and renamed, then relaunched, so its tools and footer bind to the tree. `worktree_delete` works only from the session that created the tree and always adds a `chore(worktree): session snapshot` commit (tree must be clean first); the plugin holds one project-wide pending delete, so trees close strictly one at a time with `git worktree list` + plugin DB verification. Debugging is manual; integration merges `--no-ff` per branch.
 
 ---
@@ -181,10 +182,10 @@ python spellbook/main.py --predict --scene 0568_00 0304_00 --models mosaic3d,ope
     --benchmark ScanNet20 --run-id myrun        # classes default to the benchmark's official list
 
 # Ground truth export (all 20 scenes done; re-run after adding scenes)
-python spellbook/evaluate.py export-gt --scene 0568_00 --benchmark ScanNet20|ScanNet200
+python spellbook/evaluation/evaluate.py export-gt --scene 0568_00 --benchmark ScanNet20|ScanNet200
 
 # Evaluation (predictions must exist under predictions/<Benchmark>/<run-id>/<model>/)
-python spellbook/evaluate.py evaluate --run-id myrun --models mosaic3d,open3dis \
+python spellbook/evaluation/evaluate.py evaluate --run-id myrun --models mosaic3d,open3dis \
     --scenes 0568_00,0304_00,... --benchmark ScanNet20|ScanNet200
 
 # Visualization (opens GT; arrow keys select benchmark, compatible run/model, and mode)
@@ -206,7 +207,7 @@ python -m spellbook.reconstruct.geometry_score --scan-id scene9004_40
 python spellbook/main.py --gpu-check
 ```
 
-Class lists: derived in `spellbook/benchmark.py` from `BenchmarkScripts/ScanNet200/scannet200_constants.py` — ScanNet20: 20 minus wall/floor = 18 NYU40 ids; ScanNet200: 200 minus ids {1,3} = 198 raw ids.
+Class lists: derived in `spellbook/evaluation/benchmark.py` from `BenchmarkScripts/ScanNet200/scannet200_constants.py` — ScanNet20: 20 minus wall/floor = 18 NYU40 ids; ScanNet200: 200 minus ids {1,3} = 198 raw ids.
 
 ---
 

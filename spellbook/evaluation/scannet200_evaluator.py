@@ -14,8 +14,8 @@ Adaptations:
 - write_result_file parameterized on the evaluator's class tables.
 
 Metric math, greedy assignment, void handling, and min-region rules are unchanged.
-Usage: python scannet200_evaluator.py --pred_path <submission-root> --gt_path <gt-dir>
-       [--output_file <csv>]
+Usage: python spellbook/evaluation/scannet200_evaluator.py --pred_path <submission-root>
+       --gt_path <gt-dir> [--output_file <csv>]
 """
 import argparse
 import logging
@@ -25,7 +25,10 @@ from copy import deepcopy
 
 import numpy as np
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_EVAL_DIR = os.path.dirname(os.path.abspath(__file__))
+_SPELLBOOK = os.path.dirname(_EVAL_DIR)
+_REPO_ROOT = os.path.dirname(_SPELLBOOK)
+sys.path.insert(0, _SPELLBOOK)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "BenchmarkScripts"))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "BenchmarkScripts", "ScanNet200"))
 
@@ -33,7 +36,7 @@ import util_3d  # noqa: E402
 from scannet200_splits import (  # noqa: E402
     HEAD_CATS_SCANNET_200, COMMON_CATS_SCANNET_200, TAIL_CATS_SCANNET_200)
 
-from benchmark import resolve_benchmark  # noqa: E402
+from evaluation.benchmark import resolve_benchmark  # noqa: E402
 
 
 def setup_logging():

@@ -17,7 +17,7 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from benchmark import load_settings
+from evaluation.benchmark import load_settings
 
 SCANS_DIR = "/data/scannet/scans"
 
@@ -165,7 +165,7 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
     list; None -> the benchmark's official protocol classes. `run_id` isolates outputs;
     None -> one auto-generated run-YYYYMMDD-HHMMSS id for the whole call.
     Returns a list of (model, scene_id, out_dir, elapsed, ok) per task."""
-    from benchmark import artifact_paths, resolve_benchmark, submission_dir
+    from evaluation.benchmark import artifact_paths, resolve_benchmark, submission_dir
     from utils.gpu import gpu_lease
 
     settings = load_settings()

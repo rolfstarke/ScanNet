@@ -42,7 +42,7 @@ def main():
                         help="scene numbers (e.g., 0568_00 0304_00 or 9004 9009)")
     args = parser.parse_args()
 
-    from benchmark import load_settings, resolve_benchmark
+    from evaluation.benchmark import load_settings, resolve_benchmark
     benchmark = args.benchmark or load_settings()["default"]
     spec = resolve_benchmark(benchmark)
 

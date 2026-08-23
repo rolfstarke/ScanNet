@@ -21,7 +21,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from benchmark import load_settings
+from evaluation.benchmark import load_settings
 from utils.gpu import gpu_lease
 
 ENGINE_ORDER = ["zed", "open3d", "metashape", "rtabmap", "isaac", "bundlefusion"]

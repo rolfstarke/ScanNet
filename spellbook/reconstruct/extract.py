@@ -15,7 +15,7 @@ import zlib
 
 import numpy as np
 
-from benchmark import load_settings
+from evaluation.benchmark import load_settings
 from utils.gpu import gpu_lease
 from utils.scan_lock import exclusive_lock, frames_lock_path
 

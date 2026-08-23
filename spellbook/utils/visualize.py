@@ -16,7 +16,7 @@ _SPELLBOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, _SPELLBOOK)
 import util  # noqa: E402
 import util_3d  # noqa: E402
-from benchmark import BENCHMARKS, artifact_paths, resolve_benchmark, submission_dir  # noqa: E402
+from evaluation.benchmark import BENCHMARKS, artifact_paths, resolve_benchmark, submission_dir  # noqa: E402
 from utils import hud  # noqa: E402
 
 DEFAULT_SCANNET_DIR = "/data/scannet/scans"
@@ -206,7 +206,7 @@ def classify_ap50(gt_ids, pred_instances, spec, scene_id, overlap_th=AP50_THRESH
                 (per class: claimed TPs in GT order, then lower-confidence duplicates,
                 then unmatched FPs in prediction-file order).
     """
-    from scannet200_evaluator import Evaluator
+    from evaluation.scannet200_evaluator import Evaluator
     evaluator = Evaluator(spec.class_labels, spec.valid_ids)
     evaluator.add_gt(gt_ids, scene_id)
     evaluator.add_prediction(pred_instances, scene_id)

@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import yaml
 
-from benchmark import load_settings
+from evaluation.benchmark import load_settings
 from utils.gpu import gpu_lease
 from utils.scan_lock import exclusive_lock, frames_lock_path, scan_lock_path, scene_engine_lock_path
 from . import (SCANS_DIR, engine_run_range, frames_pool_dir, parse_scan_id, scan_dir, scan_id,

@@ -12,8 +12,10 @@ settings.yaml (spellbook/settings.yaml):
 import importlib.util
 import os
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.yaml")
+_EVAL_DIR = os.path.dirname(os.path.abspath(__file__))
+_SPELLBOOK = os.path.dirname(_EVAL_DIR)
+_REPO_ROOT = os.path.dirname(_SPELLBOOK)
+_SETTINGS_FILE = os.path.join(_SPELLBOOK, "settings.yaml")
 _SCANNET200_CONSTANTS = os.path.join(
     _REPO_ROOT, "BenchmarkScripts", "ScanNet200", "scannet200_constants.py")
 

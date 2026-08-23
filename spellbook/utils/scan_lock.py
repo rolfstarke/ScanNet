@@ -15,7 +15,7 @@ import fcntl
 import os
 from contextlib import contextmanager
 
-from benchmark import load_settings
+from evaluation.benchmark import load_settings
 
 LOCK_ROOT_REL = os.path.join("derived", "locks")
 

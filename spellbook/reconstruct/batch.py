@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
 
-from benchmark import load_settings
+from evaluation.benchmark import load_settings
 from . import ENGINE_INDEX, frames_pool_dir, svo_path
 from . import extract as extract_mod
 

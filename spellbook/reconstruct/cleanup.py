@@ -3,7 +3,7 @@ import glob
 import os
 import shutil
 
-from benchmark import BENCHMARKS, artifact_paths, load_settings
+from evaluation.benchmark import BENCHMARKS, artifact_paths, load_settings
 from utils.scan_lock import exclusive_lock, prediction_index_lock_path
 
 
