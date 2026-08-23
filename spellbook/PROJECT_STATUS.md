@@ -27,9 +27,7 @@ spellbook/
 ├── scannet200_evaluator.py      # Python-3 port of Rozenberszki's ScanNet200 evaluator (198-class)
 ├── environment.yaml             # 3disspellbook conda env (ZED SDK activation sets ZED_DIR/LD_LIBRARY_PATH)
 ├── PROJECT_STATUS.md            # this file
-├── archive/                      # completed action plans, research reports, and retained evidence
 ├── tmp/                          # active plans/research and transient logs
-├── tests/                        # unittest suite (test_gpu.py needs no real GPU); 23 tests
 ├── utils/
 │   ├── gpu.py                   # cross-process GPU leases (flock per pool index, pass_fds forwarding)
 │   ├── visualize.py             # Open3D viewer + ImGui legend (GT + official submission predictions)
@@ -69,6 +67,15 @@ spellbook/reconstruct/
     ├── isaac.py              # cuVSLAM + Nvblox in podman (managed GPU, serial) — see #22
     └── bundlefusion.py       # ScanNet's reference engine in docker (managed GPU, 4 mm)
 ```
+
+### Engine worktrees (parallel engine debugging layout)
+
+Seven git worktrees total: the main checkout on `master`, plus six linked worktrees under
+`~/.local/share/opencode/worktree/<projectId>/debug/reconstruction-<engine>` for
+`open3d, zed, bundlefusion, metashape, rtabmap, isaac` (branches `debug/reconstruction-*`,
+all created from `master` `5a3fa9e`). Each engine runs as its own opencode session in its own
+tmux window (`hoenecker` 2-7); sessions keep bare engine names and their stored directory is
+the worktree (relocated via opencode's control-plane move API after the plugin fork).
 
 ### Data Layout (`/data/scannet/` — scans/ stays official, artifacts outside)
 ```
@@ -153,7 +160,7 @@ Zed/open3d are local-pose baselines; multiroom drift and density remain tracked 
 13. **Depth/pose conventions**: ZED X native resolution (1920x1080 / 1920x1200 per recording); depth 0.1-6.0 m, invalid = 0, trailing SVO frame dropped; camera-to-world poses conjugated `diag(1,-1,-1,1)` from ZED's z-backward basis; gravity z-up alignment per `alignment.h`; the batch extracts each SVO once (shared frames, `--replace` to regenerate) and runs engine tasks in parallel subprocesses.
 14. **QC**: 13 metrics vs bars measured from real ScanNet scenes (`scannet_reference.yaml`); PASS/FAIL written to `recon/qc.yaml`, FAIL reported, never aborts.
 15. **Foreign-environment imports**: model subprocesses load `spellbook/benchmark.py` by absolute `importlib` spec. Adding `spellbook/` to `sys.path` shadows model repositories' top-level packages such as OpenIns3D's `utils`.
-16. **Engine worktrees (convention)**: engine debugging happens one `debug/reconstruction-<engine>` branch+worktree per engine, created from the then-current `master`; each branch may touch only its adapter (+ its own test file); shared core files stay frozen. Plugin constraints: the forked session records the main checkout as its cwd (verify `git rev-parse --show-toplevel` before editing), `worktree_delete` works only from the session that created the tree and always adds a `chore(worktree): session snapshot` commit (tree must be clean first), and the plugin holds one project-wide pending delete, so trees close strictly one at a time with `git worktree list` + plugin DB verification. Engine debugging is manual; integration merges `--no-ff` per engine branch.
+16. **Engine worktrees (convention)**: engine debugging happens one `debug/reconstruction-<engine>` branch+worktree per engine. Six linked worktrees exist from master `5a3fa9e` (2026-08-22) for open3d, zed, bundlefusion, metashape, rtabmap, isaac under `~/.local/share/opencode/worktree/<projectId>/debug/reconstruction-<engine>`; each branch may touch only its adapter; shared core files stay frozen. The worktree plugin forks a session (recorded against main) and launches a TUI from the tree; the fork must be relocated via OpenCode's control-plane move API (`moveChanges=false`) and renamed, then relaunched, so its tools and footer bind to the tree. `worktree_delete` works only from the session that created the tree and always adds a `chore(worktree): session snapshot` commit (tree must be clean first); the plugin holds one project-wide pending delete, so trees close strictly one at a time with `git worktree list` + plugin DB verification. Engine debugging is manual; integration merges `--no-ff` per engine branch.
 
 ---
 
@@ -211,8 +218,8 @@ Class lists: derived in `spellbook/benchmark.py` from `BenchmarkScripts/ScanNet2
 1. Investigate OpenIns3D's ScanNet200 collapse / anomaly scenes — #13.
 2. Hardening: atomic/resumable prediction outputs #16, batch supervision #17, Open3DIS tracker race #15, env reproducibility #14.
 3. Optional: extend from 20 to the full 312-scene val split once hardening is in place.
-4. Engine debugging (manual, per engine): create `debug/reconstruction-<engine>` worktrees from current master per decision 16; verify the never-run engines (bundlefusion, metashape, rtabmap, isaac #22) end-to-end and compare global methods against the local-pose baseline (#25). Per-engine QC results stay in `recon/qc.yaml` + issues. Frames for 9009 are complete and reusable; new extraction is blocked (ZED disabled, #29) — 9004 and any new SVO need the remapped-ZED work of #29 first.
+4. Engine debugging (manual, per engine): six `debug/reconstruction-<engine>` worktrees exist from master `5a3fa9e`; verify the never-run engines (bundlefusion, metashape, rtabmap, isaac #22) end-to-end and compare global methods against the local-pose baseline (#25). Per-engine QC results stay in `recon/qc.yaml` + issues. Frames for 9009 are complete and reusable; new extraction is blocked (ZED disabled, #29) — 9004 and any new SVO need the remapped-ZED work of #29 first.
 5. ZED: validate managed remapping (pool lease + CUDA_VISIBLE_DEVICES before pyzed import, sdk_gpu_id unset, 60-frame nonconstant-pose gate, full trajectory regression) to re-enable extraction and the zed engine — #29.
 6. Isaac: build `zed-isaac-nvblox:spellbook` from public Isaac debs (no NGC credentials) and switch off the broken CDI flag — #22.
-7. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS).
+7. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS) — #31.
 8. Integration: after each engine tree is closed (plugin `worktree_delete`, one at a time), merge `--no-ff debug/reconstruction-<engine>` into master and run the full batch without GPU arguments.
