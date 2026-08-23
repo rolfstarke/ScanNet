@@ -69,14 +69,20 @@ spellbook/reconstruct/
     └── bundlefusion.py       # ScanNet's reference engine in docker (managed GPU, 4 mm)
 ```
 
-### Engine worktrees (parallel engine debugging layout)
+### Worktrees (parallel engine debugging + prediction layout)
 
-Seven git worktrees total: the main checkout on `master`, plus six linked worktrees under
-`~/.local/share/opencode/worktree/<projectId>/debug/reconstruction-<engine>` for
-`open3d, zed, bundlefusion, metashape, rtabmap, isaac` (branches `debug/reconstruction-*`,
-all created from `master` `5a3fa9e`). Each engine runs as its own opencode session in its own
-tmux window (`hoenecker` 2-7); sessions keep bare engine names and their stored directory is
-the worktree (relocated via opencode's control-plane move API after the plugin fork).
+Eight git worktrees total: the main checkout on `master`, plus seven plugin-owned linked
+worktrees under `~/.local/share/opencode/worktree/<projectId>/debug/`:
+
+- `debug/reconstruction-{open3d,zed,bundlefusion,metashape,rtabmap,isaac}` — engine debugging;
+  all from `master` `5a3fa9e`, one opencode session per engine in tmux windows `hoenecker` 2-7.
+- `debug/prediction` — prediction work; from `master` `80752c6`, session `prediction` in tmux
+  window 8 (fork of the archived `main-prediction` session, which stays in the main checkout
+  with its 83 subagent children).
+
+Worktree sessions keep bare titles and their stored directory is the worktree (relocated via
+opencode's control-plane move API after the plugin fork). Executed procedure and verification:
+`spellbook/archive/reconstruction/worktree_session_topology_{plan,audit}.md`.
 
 ### Data Layout (`/data/scannet/` — scans/ stays official, artifacts outside)
 ```
@@ -161,7 +167,7 @@ Zed/open3d are local-pose baselines; multiroom drift and density remain tracked 
 13. **Depth/pose conventions**: ZED X native resolution (1920x1080 / 1920x1200 per recording); depth 0.1-6.0 m, invalid = 0, trailing SVO frame dropped; camera-to-world poses conjugated `diag(1,-1,-1,1)` from ZED's z-backward basis; gravity z-up alignment per `alignment.h`; the batch extracts each SVO once (shared frames, `--replace` to regenerate) and runs engine tasks in parallel subprocesses.
 14. **QC**: 13 metrics vs bars measured from real ScanNet scenes (`scannet_reference.yaml`); PASS/FAIL written to `recon/qc.yaml`, FAIL reported, never aborts.
 15. **Foreign-environment imports**: model subprocesses load `spellbook/benchmark.py` by absolute `importlib` spec. Adding `spellbook/` to `sys.path` shadows model repositories' top-level packages such as OpenIns3D's `utils`.
-16. **Engine worktrees (convention)**: engine debugging happens one `debug/reconstruction-<engine>` branch+worktree per engine. Six linked worktrees exist from master `5a3fa9e` (2026-08-22) for open3d, zed, bundlefusion, metashape, rtabmap, isaac under `~/.local/share/opencode/worktree/<projectId>/debug/reconstruction-<engine>`; each branch may touch only its adapter; shared core files stay frozen. The worktree plugin forks a session (recorded against main) and launches a TUI from the tree; the fork must be relocated via OpenCode's control-plane move API (`moveChanges=false`) and renamed, then relaunched, so its tools and footer bind to the tree. `worktree_delete` works only from the session that created the tree and always adds a `chore(worktree): session snapshot` commit (tree must be clean first); the plugin holds one project-wide pending delete, so trees close strictly one at a time with `git worktree list` + plugin DB verification. Engine debugging is manual; integration merges `--no-ff` per engine branch.
+16. **Worktrees (convention)**: engine debugging happens one `debug/reconstruction-<engine>` branch+worktree per engine; prediction work uses `debug/prediction`. Seven linked worktrees exist: six engine trees from master `5a3fa9e` (2026-08-22) for open3d, zed, bundlefusion, metashape, rtabmap, isaac and `debug/prediction` from master `80752c6` (2026-08-23), all under `~/.local/share/opencode/worktree/<projectId>/debug/`; each branch may touch only its own scope; shared core files stay frozen. The worktree plugin forks a session (recorded against main) and launches a TUI from the tree; the fork must be relocated via OpenCode's control-plane move API (`moveChanges=false`) and renamed, then relaunched, so its tools and footer bind to the tree. `worktree_delete` works only from the session that created the tree and always adds a `chore(worktree): session snapshot` commit (tree must be clean first); the plugin holds one project-wide pending delete, so trees close strictly one at a time with `git worktree list` + plugin DB verification. Debugging is manual; integration merges `--no-ff` per branch.
 
 ---
 
