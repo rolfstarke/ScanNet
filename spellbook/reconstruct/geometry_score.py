@@ -23,10 +23,10 @@ DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "geometry_reference.yaml")
 METRIC = "observed_surface_voxel_mean_bidirectional_distance_v1"
 SCORE_KEY = "mean_bidirectional_distance_cm"
-# Yellow + cyan: equal mix → green; near=yellow, far=cyan
-CAD_RGB = np.array([1.00, 0.82, 0.08])
-RECON_RGB = np.array([0.08, 0.72, 0.88])
-CEILING_NORMAL_MIN = 0.70  # hide faces with n·up above this (display only)
+# Magenta + cyan: equal mix → blue/purple; near=magenta, far=cyan
+CAD_RGB = np.array([0.92, 0.12, 0.72])
+RECON_RGB = np.array([0.08, 0.78, 0.90])
+CEILING_HEIGHT_M = 2.0  # hide verts above floor_p1 + this (display only)
 
 
 def load_config(path=None):
@@ -302,20 +302,21 @@ def _panel_overlay(ax, cad, rec, dims, cell, cad_rgb, rec_rgb):
     ax.set_facecolor("white")
 
 
-def _hide_ceiling_faces(mesh, normal_min=CEILING_NORMAL_MIN):
-    """Drop upward-facing triangles (normals only). Display filter; no mesh save."""
+def _hide_ceiling_faces(mesh, ceiling_height=CEILING_HEIGHT_M):
+    """Hide faces above floor_p1 + ceiling_height (display only; no mesh save)."""
     m = mesh
     if len(m.triangles) > 150000:
         m = m.simplify_quadric_decimation(target_number_of_triangles=120000)
-    m.compute_triangle_normals()
-    N = np.asarray(m.triangle_normals)
-    F = np.asarray(m.triangles)
-    V = np.asarray(m.vertices)
-    keep = N[:, 2] < normal_min
-    F2 = F[keep]
+    V = np.asarray(m.vertices, dtype=np.float64)
+    F = np.asarray(m.triangles, dtype=np.int64)
+    up = 2
+    floor = float(np.percentile(V[:, up], 1))
+    keep_v = V[:, up] <= floor + ceiling_height
+    keep_f = keep_v[F[:, 0]] & keep_v[F[:, 1]] & keep_v[F[:, 2]]
+    F2 = F[keep_f]
     if len(F2) == 0:
-        raise RuntimeError("no faces left after normal ceiling hide")
-    return V, F2
+        raise RuntimeError("no faces left after ceiling height hide")
+    return V, F2, floor
 
 
 def _iso_axis_off(ax):
@@ -335,7 +336,7 @@ def _iso_axis_off(ax):
 
 def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, score,
                            accuracy_mean, completeness_mean):
-    """One PNG: plan | elev on top; isometric = full bottom width (= both top panels)."""
+    """One PNG as four equal squares: plan | elev on top; iso = bottom two squares."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -349,7 +350,7 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     cad = _coarse_occupancy(ref_centres, cell)
     rec = _coarse_occupancy(recon_centres, cell)
 
-    V, F2 = _hide_ceiling_faces(mesh)
+    V, F2, floor = _hide_ceiling_faces(mesh)
     d_cm = cKDTree(ref_centres).query(V, k=1, workers=-1)[0] * 100.0
     d_face = d_cm[F2].mean(axis=1)
     p95 = float(np.percentile(d_face, 95)) if len(d_face) else 1.0
@@ -357,21 +358,21 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     t = np.clip(d_face / p95, 0.0, 1.0)
     fcol = cad_rgb[None, :] * (1.0 - t)[:, None] + rec_rgb[None, :] * t[:, None]
 
-    # Top row height == bottom row height → iso area ≈ plan+elev combined
-    fig = plt.figure(figsize=(14, 12), facecolor="white")
-    gs = GridSpec(2, 2, figure=fig, height_ratios=[1.0, 1.0],
-                  hspace=0.18, wspace=0.16,
-                  left=0.05, right=0.98, top=0.93, bottom=0.06)
+    # Four equal unit squares: (0,0) plan (0,1) elev (1,:) iso = 2 squares
+    fig = plt.figure(figsize=(12, 12), facecolor="white")
+    gs = GridSpec(2, 2, figure=fig, height_ratios=[1.0, 1.0], width_ratios=[1.0, 1.0],
+                  hspace=0.14, wspace=0.14,
+                  left=0.06, right=0.98, top=0.92, bottom=0.07)
 
     ax_plan = fig.add_subplot(gs[0, 0])
     _panel_overlay(ax_plan, cad, rec, (0, 1), cell, cad_rgb, rec_rgb)
-    ax_plan.set_title("plan x/y")
+    ax_plan.set_title("1  plan x/y")
     ax_plan.set_xlabel("x")
     ax_plan.set_ylabel("y")
 
     ax_elev = fig.add_subplot(gs[0, 1])
     _panel_overlay(ax_elev, cad, rec, (0, 2), cell, cad_rgb, rec_rgb)
-    ax_elev.set_title("elevation x/z")
+    ax_elev.set_title("2  elevation x/z")
     ax_elev.set_xlabel("x")
     ax_elev.set_ylabel("z")
 
@@ -379,7 +380,6 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     coll = Poly3DCollection(V[F2], linewidths=0, edgecolors="none")
     coll.set_facecolor(fcol)
     ax_iso.add_collection3d(coll)
-    # Equal-aspect cube framed on CAD room
     clo, chi = ref_centres.min(0), ref_centres.max(0)
     c = 0.5 * (clo + chi)
     r = 0.55 * float(np.max(chi - clo)) + 0.3
@@ -398,7 +398,8 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     _iso_axis_off(ax_iso)
     ax_iso.set_facecolor("white")
     ax_iso.set_title(
-        f"isometric recon  (normals n·z≥{CEILING_NORMAL_MIN} hidden)  p95={p95:.1f} cm",
+        f"3–4  isometric recon  (ceiling hide floor+{CEILING_HEIGHT_M:.1f}m)  "
+        f"p95={p95:.1f} cm",
         fontsize=11, pad=2)
 
     cmap = LinearSegmentedColormap.from_list("cad_recon", [CAD_RGB, RECON_RGB])
@@ -409,13 +410,13 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
 
     fig.legend([Patch(color=cad_rgb), Patch(color=rec_rgb),
                 Patch(color=0.5 * (cad_rgb + rec_rgb))],
-               ["CAD / near", "recon / far", "overlap"],
+               ["CAD / near (magenta)", "recon / far (cyan)", "overlap"],
                loc="lower center", ncol=3, bbox_to_anchor=(0.5, 0.005))
     fig.suptitle(
         f"{scene_id}  {SCORE_KEY}={score:.2f}  "
         f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})  "
         f"cell={cell:.2f}m",
-        y=0.98)
+        y=0.97)
     fig.savefig(path, dpi=160, facecolor="white")
     plt.close(fig)
 
