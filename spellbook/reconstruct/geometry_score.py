@@ -237,71 +237,80 @@ def align_cad_to_recon(cad_pts, recon_pts):
     return best[2], int(best[1])
 
 
-def _norm_density(H):
-    """Per-cloud log density in [0,1]; empty stays 0."""
-    H = np.asarray(H, dtype=np.float64)
-    nz = H[H > 0]
-    if nz.size == 0:
-        return np.zeros_like(H)
-    p99 = float(np.percentile(nz, 99))
-    denom = np.log1p(max(p99, 1.0))
-    return np.clip(np.log1p(np.maximum(H, 0.0)) / denom, 0.0, 1.0)
+def _coarse_occupancy(pts, cell_m):
+    """One centre per occupied cell on a rough grid."""
+    qi = np.unique(np.floor(np.asarray(pts, dtype=np.float64) / cell_m).astype(np.int64), axis=0)
+    return (qi.astype(np.float64) + 0.5) * cell_m
+
+
+def _overlay_cell_m(ref_centres, recon_centres, target_cells=64, lo=0.08, hi=0.25):
+    """cell ≈ longest plan extent / target_cells (clamped). Square side = cell."""
+    extent = float(np.ptp(np.vstack([ref_centres[:, :2], recon_centres[:, :2]]), axis=0).max())
+    return float(np.clip(extent / target_cells, lo, hi))
+
+
+def _stamp_squares(pts2, lo, hi, half, pixel):
+    """Coverage image: each point adds 1 over an axis-aligned square."""
+    w = int(np.ceil((hi[0] - lo[0]) / pixel)) + 1
+    h = int(np.ceil((hi[1] - lo[1]) / pixel)) + 1
+    cov = np.zeros((h, w), dtype=np.float32)
+    hs = half / pixel
+    for x, y in pts2:
+        c = (x - lo[0]) / pixel
+        r = (y - lo[1]) / pixel
+        r0, r1 = max(0, int(np.floor(r - hs))), min(h, int(np.ceil(r + hs)))
+        c0, c1 = max(0, int(np.floor(c - hs))), min(w, int(np.ceil(c + hs)))
+        if r0 < r1 and c0 < c1:
+            cov[r0:r1, c0:c1] += 1.0
+    return cov
 
 
 def render_comparison(path, ref_centres, recon_centres, scene_id, score,
                       accuracy_mean, completeness_mean):
-    """Two-cloud density overlay; each cloud normalized independently."""
+    """CAD yellow + recon cyan. Rough occupancy → square stamps, α=1/N_max."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
-    cad_rgb = np.array([1.0, 0.45, 0.0])
-    rec_rgb = np.array([0.15, 0.35, 1.0])
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    for ax, dims, label in ((axes[0], (0, 1), "plan x/y"), (axes[1], (0, 2), "elevation x/z")):
-        pts = np.vstack([ref_centres[:, list(dims)], recon_centres[:, list(dims)]])
-        lo = pts.min(axis=0)
-        hi = pts.max(axis=0)
-        pad = np.maximum(0.1, 0.02 * (hi - lo))
-        lo, hi = lo - pad, hi + pad
-        extent_xy = hi - lo
-        long = float(max(extent_xy[0], extent_xy[1], 1e-6))
-        bin_m = max(0.02, long / 400.0)
-        nx = max(8, int(np.ceil(extent_xy[0] / bin_m)))
-        ny = max(8, int(np.ceil(extent_xy[1] / bin_m)))
-        rng = [[float(lo[0]), float(hi[0])], [float(lo[1]), float(hi[1])]]
-        H_cad, xe, ye = np.histogram2d(
-            ref_centres[:, dims[0]], ref_centres[:, dims[1]], bins=[nx, ny], range=rng)
-        H_rec, _, _ = np.histogram2d(
-            recon_centres[:, dims[0]], recon_centres[:, dims[1]], bins=[xe, ye])
-        a_c = _norm_density(H_cad)
-        a_r = _norm_density(H_rec)
-        w = a_c + a_r
-        rgb = np.ones(H_cad.shape + (3,), dtype=np.float64)
-        mask = w > 0
-        mix = np.zeros_like(rgb)
-        mix[..., 0] = (cad_rgb[0] * a_c + rec_rgb[0] * a_r)
-        mix[..., 1] = (cad_rgb[1] * a_c + rec_rgb[1] * a_r)
-        mix[..., 2] = (cad_rgb[2] * a_c + rec_rgb[2] * a_r)
-        mix[mask] /= w[mask, None]
-        alpha = np.clip(np.maximum(a_c, a_r) * 0.95, 0.0, 0.95)[..., None]
-        img = rgb * (1.0 - alpha) + mix * alpha
-        ax.imshow(np.clip(img.transpose(1, 0, 2), 0, 1), origin="lower",
-                  extent=[xe[0], xe[-1], ye[0], ye[-1]], interpolation="nearest",
-                  aspect="equal")
+    cad_rgb = np.array([1.0, 0.92, 0.05])
+    rec_rgb = np.array([0.05, 0.85, 0.90])
+    cell = _overlay_cell_m(ref_centres, recon_centres)
+    half = 0.5 * cell
+    pixel = max(cell / 8.0, 0.015)
+    cad = _coarse_occupancy(ref_centres, cell)
+    rec = _coarse_occupancy(recon_centres, cell)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), facecolor="white")
+    for ax, dims, label in ((axes[0], (0, 1), "plan x/y"),
+                            (axes[1], (0, 2), "elevation x/z")):
+        c2, r2 = cad[:, list(dims)], rec[:, list(dims)]
+        all2 = np.vstack([c2, r2])
+        lo, hi = all2.min(0) - half, all2.max(0) + half
+        cov_c = _stamp_squares(c2, lo, hi, half, pixel)
+        cov_r = _stamp_squares(r2, lo, hi, half, pixel)
+        n_max = max(float(cov_c.max()), float(cov_r.max()), 1.0)
+        cover_c = np.clip(cov_c / n_max, 0.0, 1.0)
+        cover_r = np.clip(cov_r / n_max, 0.0, 1.0)
+        rgb = np.ones(cov_c.shape + (3,), dtype=np.float64)
+        for i in range(3):
+            rgb[..., i] = 1.0 - cover_c * (1.0 - cad_rgb[i])
+        for i in range(3):
+            rgb[..., i] = rgb[..., i] * (1.0 - cover_r) + rec_rgb[i] * cover_r
+        ax.imshow(np.clip(rgb, 0, 1), origin="lower",
+                  extent=[lo[0], hi[0], lo[1], hi[1]],
+                  interpolation="nearest", aspect="equal")
         ax.set_title(label)
-        ax.set_xlim(xe[0], xe[-1])
-        ax.set_ylim(ye[0], ye[-1])
-    fig.legend(
-        [Patch(facecolor=cad_rgb, edgecolor="none"),
-         Patch(facecolor=rec_rgb, edgecolor="none")],
-        ["CAD", "recon"], loc="lower center", ncol=2)
+        ax.set_facecolor("white")
+
+    fig.legend([Patch(color=cad_rgb), Patch(color=rec_rgb)],
+               ["CAD", "recon"], loc="lower center", ncol=2)
     fig.suptitle(
         f"{scene_id}  {SCORE_KEY}={score:.2f}  "
-        f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})")
+        f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})  "
+        f"cell={cell:.2f}m")
     fig.tight_layout(rect=[0, 0.06, 1, 0.94])
-    fig.savefig(path, dpi=140)
+    fig.savefig(path, dpi=140, facecolor="white")
     plt.close(fig)
 
 
