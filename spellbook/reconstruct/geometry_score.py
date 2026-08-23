@@ -360,27 +360,23 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     t = np.clip(d_face / p95, 0.0, 1.0)
     fcol = cad_rgb[None, :] * (1.0 - t)[:, None] + rec_rgb[None, :] * t[:, None]
 
-    # Explicit figure coords so 3D axes fill the bottom double-square (GridSpec
-    # leaves Axes3D padded and looking small).
-    # Layout (figure fraction):
-    #   top row:  two equal squares  [plan] [elev]
-    #   bottom:   one rect = two squares wide, one tall  [==== iso ====]
-    fig_w = 12.0
-    fig = plt.figure(figsize=(fig_w, fig_w), facecolor="white")
-    left, right = 0.06, 0.99
-    bottom, top = 0.09, 0.91
-    gap_x, gap_y = 0.04, 0.06
-    usable_w = right - left
-    usable_h = top - bottom
-    row_h = (usable_h - gap_y) / 2.0
-    col_w = (usable_w - gap_x) / 2.0
-    y_top = bottom + row_h + gap_y
-    y_bot = bottom
-
-    ax_plan = fig.add_axes([left, y_top, col_w, row_h])
-    ax_elev = fig.add_axes([left + col_w + gap_x, y_top, col_w, row_h])
-    # iso: full width of both top panels, same height as one row
-    ax_iso = fig.add_axes([left, y_bot, usable_w, row_h], projection="3d",
+    # Four unit squares in a 2×2 board (figure is square):
+    #   [1 plan][2 elev]   each side S
+    #   [3====iso====4]    width 2S+gap, height S  → double-width bottom
+    # Explicit axes positions so Axes3D actually owns the bottom double cell.
+    S = 5.2  # inches per unit square
+    gap = 0.35
+    fig_w = 2 * S + gap + 1.1
+    fig_h = 2 * S + gap + 1.3
+    fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
+    # convert inches → figure fraction
+    ml, mb = 0.55 / fig_w, 0.70 / fig_h   # left/bottom margin inches
+    sx, sy = S / fig_w, S / fig_h
+    gx, gy = gap / fig_w, gap / fig_h
+    x0, y0 = ml, mb
+    ax_plan = fig.add_axes([x0, y0 + sy + gy, sx, sy])
+    ax_elev = fig.add_axes([x0 + sx + gx, y0 + sy + gy, sx, sy])
+    ax_iso = fig.add_axes([x0, y0, 2 * sx + gx, sy], projection="3d",
                           computed_zorder=False)
 
     _panel_overlay(ax_plan, cad, rec, (0, 1), cell, cad_rgb, rec_rgb)
@@ -418,8 +414,8 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
         f"p95={p95:.1f} cm",
         fontsize=11, pad=4)
 
-    # Colorbar in a thin strip to the right of iso (does not shrink the 2×1 block)
-    cax = fig.add_axes([right - 0.018, y_bot + 0.04 * row_h, 0.012, row_h * 0.92])
+    # Colorbar strip just right of the iso double-cell
+    cax = fig.add_axes([x0 + 2 * sx + gx + 0.01, y0 + 0.05 * sy, 0.015, 0.9 * sy])
     cmap = LinearSegmentedColormap.from_list("cad_recon", [CAD_RGB, RECON_RGB])
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, p95))
     sm.set_array([])
