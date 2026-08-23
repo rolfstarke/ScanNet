@@ -360,23 +360,26 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     t = np.clip(d_face / p95, 0.0, 1.0)
     fcol = cad_rgb[None, :] * (1.0 - t)[:, None] + rec_rgb[None, :] * t[:, None]
 
-    # Four unit squares in a 2×2 board (figure is square):
-    #   [1 plan][2 elev]   each side S
-    #   [3====iso====4]    width 2S+gap, height S  → double-width bottom
-    # Explicit axes positions so Axes3D actually owns the bottom double cell.
-    S = 5.2  # inches per unit square
-    gap = 0.35
-    fig_w = 2 * S + gap + 1.1
-    fig_h = 2 * S + gap + 1.3
+    # Top: two equal squares (plan | elev). Bottom: iso full figure width,
+    # taller than one square so the 3D view can grow (Axes3D is limited by
+    # the shorter side of its axes box).
+    S = 5.0          # inches: side of plan/elev square
+    iso_h = 1.65 * S  # inches: iso taller than one square
+    gap = 0.30
+    fig_w = 2 * S + gap + 1.2
+    fig_h = S + gap + iso_h + 1.35
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
-    # convert inches → figure fraction
-    ml, mb = 0.55 / fig_w, 0.70 / fig_h   # left/bottom margin inches
+    ml, mb = 0.55 / fig_w, 0.75 / fig_h
     sx, sy = S / fig_w, S / fig_h
     gx, gy = gap / fig_w, gap / fig_h
-    x0, y0 = ml, mb
-    ax_plan = fig.add_axes([x0, y0 + sy + gy, sx, sy])
-    ax_elev = fig.add_axes([x0 + sx + gx, y0 + sy + gy, sx, sy])
-    ax_iso = fig.add_axes([x0, y0, 2 * sx + gx, sy], projection="3d",
+    ih = iso_h / fig_h
+    x0 = ml
+    y_iso = mb
+    y_top = mb + ih + gy
+    ax_plan = fig.add_axes([x0, y_top, sx, sy])
+    ax_elev = fig.add_axes([x0 + sx + gx, y_top, sx, sy])
+    # full width under both top panels
+    ax_iso = fig.add_axes([x0, y_iso, 2 * sx + gx, ih], projection="3d",
                           computed_zorder=False)
 
     _panel_overlay(ax_plan, cad, rec, (0, 1), cell, cad_rgb, rec_rgb)
@@ -414,8 +417,8 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
         f"p95={p95:.1f} cm",
         fontsize=11, pad=4)
 
-    # Colorbar strip just right of the iso double-cell
-    cax = fig.add_axes([x0 + 2 * sx + gx + 0.01, y0 + 0.05 * sy, 0.015, 0.9 * sy])
+    # Colorbar strip just right of the full-width iso
+    cax = fig.add_axes([x0 + 2 * sx + gx + 0.012, y_iso + 0.06 * ih, 0.014, 0.88 * ih])
     cmap = LinearSegmentedColormap.from_list("cad_recon", [CAD_RGB, RECON_RGB])
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, p95))
     sm.set_array([])
