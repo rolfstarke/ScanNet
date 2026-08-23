@@ -4,7 +4,7 @@
 
 Integrate open-vocabulary 3D instance segmentation models (Mosaic3D, OpenIns3D, OpenYOLO3D, Open3DIS) into the ScanNet repository structure, run them on official ScanNet val scenes, and evaluate them with ScanNet's own benchmark protocol — 18-class NYU40 and ScanNet200 (198-class instance protocol). ScanNet itself must remain fully intact and operable.
 
-Second goal: turn ZED X `.svo2` recordings into byte-format-identical ScanNet v2 scans (`.sens`, `<id>.txt`, `_vh_clean*.ply`, `.segs.json`) under custom ids `scene90NN_MM` (9000-range = custom; tens digit = engine, units digit = run), so ScanNet's own tooling works on them unchanged. Scene9004 geometry quality is scored against CAD with observed surface-voxel F1 (`geometry_score.py`).
+Second goal: turn ZED X `.svo2` recordings into byte-format-identical ScanNet v2 scans (`.sens`, `<id>.txt`, `_vh_clean*.ply`, `.segs.json`) under custom ids `scene90NN_MM` (9000-range = custom; tens digit = engine, units digit = run), so ScanNet's own tooling works on them unchanged. Scene9004 geometry quality is scored against CAD with observed surface-voxel Chamfer-L1 cm (`geometry_score.py`; lower better).
 
 Bugs, problems, and their attempted fixes live in GitHub Issues (`rolfstarke/ScanNet`, referenced as #N) — never in this file. This file is the repository structure explanation, goal, and project plan for new sessions.
 
@@ -53,7 +53,7 @@ spellbook/reconstruct/
 ├── run.py                    # allocate run slot -> reconstruct -> score scene9004 (post-GPU)
 ├── extract.py                # main-checkout multi-GPU SVO extraction into shared frame pools
 ├── _extract_run.py           # leased-GPU child: CUDA_VISIBLE_DEVICES set before pyzed import
-├── geometry_score.py         # CAD observed surface-voxel F1 for scene9004
+├── geometry_score.py         # CAD Chamfer-L1 cm + density overlay for scene9004
 ├── geometry_reference.yaml   # scene9004 CAD/visibility hashes, grid, retention
 ├── cleanup.py                # exact prediction/task-line purge on scan eviction/replace
 ├── tsdf.py                   # shared Open3D TSDF integration
@@ -115,7 +115,7 @@ TUI after a fast-forward so tools see new paths.
 │   *.sens/.txt/_vh_clean*.ply/.segs.json    # units=run 0-9; scene9004 keeps ten slots/engine
 └── recon/
     ├── frames -> derived/.../scene9004/frames   # symlink to shared pool
-    ├── geometry_score.yaml + cad_comparison.png # scene9004 only
+    ├── geometry_score.yaml + cad_comparison.png # scene9004: chamfer_l1_cm + density overlay
     ├── engine_native.ply mesh_aligned.ply final_poses.npy
     └── cmdline.txt svo_path.txt
 ```
@@ -150,7 +150,7 @@ Per-model integration issues: #2 (openyolo3d intrinsics), #3 (open3dis rescale),
 | rtabmap | RTAB-Map graph-optimized | RTAB-Map textured mesh | podman `localhost/zed-rtabmap:jazzy` |
 | isaac | cuVSLAM | Nvblox 4 mm TSDF | podman `zed-isaac-nvblox:spellbook` (see #22) |
 
-Zed/open3d are local-pose baselines; multiroom drift and density remain tracked in #25. BundleFusion, Metashape, RTAB-Map, and Isaac provide the global-optimization comparisons. Scene9004 scores live in `recon/geometry_score.yaml` + `recon/cad_comparison.png`.
+Zed/open3d are local-pose baselines; multiroom drift and density remain tracked in #25. BundleFusion, Metashape, RTAB-Map, and Isaac provide the global-optimization comparisons. Scene9004 scores live in `recon/geometry_score.yaml` (`chamfer_l1_cm`, lower better) + density overlay `recon/cad_comparison.png`.
 
 ---
 
@@ -164,12 +164,12 @@ Zed/open3d are local-pose baselines; multiroom drift and density remain tracked 
 6. **GPU scheduling (automatic)**: `settings.yaml gpu_pool` (`[1,2,3,4]`) is the only managed GPU list; `utils/gpu.py` leases a pool GPU via persistent `flock` lock files under `<scannet_root>/derived/locks/gpus/`, held for the whole task (descriptor forwarded to GPU children with `pass_fds`, kernel-released on crash). **Physical GPU 0 is user-reserved — Spellbook never locks, selects, or initializes it.** No manual `--gpu` exists anywhere; Open3D's legacy TSDF is CPU-only and takes no lease. Frame extraction uses the same pool via `--extract-frames`. The ZED reconstruction engine remains blocked until remapping is validated (#29).
 7. **Adapter metadata**: each engine adapter declares `GPU_POLICY` (`managed`/`cpu`/`blocked`), `SERIAL`, `preflight()` (runtime presence check) and `gpu_check()` (native distribution probe); `batch.py` and `--gpu-check` consume these instead of duplicated constants.
 8. **Evaluation**: flat per-vertex GT encoding via `evaluate.py export-gt` (ScanNet's own export tool is inconsistent with its evaluator, see #8); evaluators ported to Python 3 with edge-case fix (#8); `evaluate.py evaluate` dispatches per benchmark with pre-flight validation (#11).
-9. **Custom scan ids**: `scene90NN_MM` (9000-range unused by ScanNet v2); tens digit = engine, units digit = run 0-9 (scene9004 keeps ten slots per engine with lowest-score eviction; other scenes replace run 0). SVO discovery by filename (`custom/raw/scene<NNNN>.svo2`).
+9. **Custom scan ids**: `scene90NN_MM` (9000-range unused by ScanNet v2); tens digit = engine, units digit = run 0-9 (scene9004 keeps ten slots per engine with highest-`chamfer_l1_cm` eviction; other scenes replace run 0). SVO discovery by filename (`custom/raw/scene<NNNN>.svo2`).
 10. **Byte fidelity**: `.sens` v4 per `SensReader/c++/src/sensorData.h` (jpeg + zlib_ushort, depth_shift 1000); `<id>.txt` with the ScanNet 17 keys; `.segs.json` from ScanNet's own built Segmentator (defaults kThresh 0.01, segMinVerts 20).
 11. **Meshes**: ScanNet's `clean.mlx` filter chain via pymeshlab (equivalent calls — this pymeshlab cannot load `.mlx`), decimation `targetfacenum=300000` (absolute, not ScanNet's relative 20% — deviation); PLY written float32 binary (Segmentator's tinyply rejects double).
 12. **axisAlignment**: computed (pure z-rotation + translation, det == 1) and written to `<id>.txt`, NEVER applied — released ScanNet meshes and `.sens` poses share the raw frame (consumers apply it).
 13. **Depth/pose conventions**: ZED X native resolution (1920x1080 / 1920x1200 per recording); depth 0.1-6.0 m, invalid = 0, trailing SVO frame dropped; camera-to-world poses conjugated `diag(1,-1,-1,1)` from ZED's z-backward basis; gravity z-up alignment per `alignment.h`; the batch extracts each SVO once (shared frames, `--replace` to regenerate) and runs engine tasks in parallel subprocesses.
-14. **Geometry score (scene9004)**: observed surface-voxel F1 vs fixed CAD visibility mask (10 mm grid, 50 mm tolerance); score in `[0,100]` written after GPU lease release. No PASS/FAIL gate.
+14. **Geometry score (scene9004)**: symmetric Chamfer-L1 on 10 mm observed surface voxels vs fixed CAD visibility mask (`chamfer_l1_cm` = mean of recon→CAD and CAD→recon nearest means, centimetres, lower better). Written after GPU lease release with accuracy/completeness diagnostics and a two-cloud density overlay PNG. No PASS/FAIL gate; no threshold F1.
 15. **Frame extraction**: main checkout only via `--extract-frames`; multi-GPU leases on pool 1-4; `sdk_gpu_id` never set; scene9004 frames are promoted from the existing complete set, not re-extracted. Worktrees consume the shared pool read-only.
 16. **Foreign-environment imports**: model subprocesses load `spellbook/evaluation/benchmark.py` by absolute `importlib` spec. Adding `spellbook/` to `sys.path` shadows model repositories' top-level packages such as OpenIns3D's `utils`.
 17. **Worktrees (convention)**: engine debugging happens one `debug/reconstruction-<engine>` branch+worktree per engine; prediction work uses `debug/prediction`. Seven linked worktrees under `~/.local/share/opencode/worktree/<projectId>/debug/` stay fast-forwarded to `master` before each debug session (`git merge --ff-only master` in each clean tree). Each branch may touch only its own scope; shared core files stay frozen on master. The worktree plugin forks a session (recorded against main) and launches a TUI from the tree; the fork must be relocated via OpenCode's control-plane move API (`moveChanges=false`) and renamed, then relaunched, so its tools and footer bind to the tree. `worktree_delete` works only from the session that created the tree and always adds a `chore(worktree): session snapshot` commit (tree must be clean first); the plugin holds one project-wide pending delete, so trees close strictly one at a time with `git worktree list` + plugin DB verification. Debugging is manual; integration merges `--no-ff` per branch.

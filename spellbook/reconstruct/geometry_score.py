@@ -1,7 +1,8 @@
-"""CAD-referenced observed surface-voxel F1 scorer for scene9004 reconstructions.
+"""CAD-referenced Chamfer-L1 scorer for scene9004 reconstructions.
 
-Scores <scan_id>_vh_clean_2.ply against a fixed CAD visibility mask. CPU-only; never runs
-inside a managed GPU lease. Standalone:
+Scores <scan_id>_vh_clean_2.ply against a fixed CAD visibility mask using symmetric
+nearest-neighbour mean distance on 10 mm surface voxels (cm, lower better). CPU-only;
+never runs inside a managed GPU lease. Standalone:
 
     python -m spellbook.reconstruct.geometry_score --scan-id scene9004_40
 """
@@ -19,7 +20,7 @@ from . import SCANS_DIR
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "geometry_reference.yaml")
-METRIC = "observed_surface_voxel_f1_v1"
+METRIC = "observed_surface_voxel_chamfer_l1_v1"
 
 
 def load_config(path=None):
@@ -161,26 +162,27 @@ def yaw_matrix(deg):
     return T
 
 
-def match_f1(centres_a, centres_b, tau):
-    if len(centres_a) == 0 or len(centres_b) == 0:
-        raise RuntimeError("empty cell set in F1")
-    ta = cKDTree(centres_a)
-    tb = cKDTree(centres_b)
-    da, _ = tb.query(centres_a, k=1, workers=-1)
-    db, _ = ta.query(centres_b, k=1, workers=-1)
-    precision = float(np.mean(db <= tau))
-    recall = float(np.mean(da <= tau))
-    if precision + recall == 0:
-        f1 = 0.0
-    else:
-        f1 = 2 * precision * recall / (precision + recall)
-    matched_a = da <= tau
-    matched_b = db <= tau
-    return f1, precision, recall, matched_a, matched_b
+def chamfer_l1_cm(ref_centres, recon_centres):
+    """Symmetric Chamfer-L1 in cm: mean of recon→CAD and CAD→recon nearest means."""
+    if len(ref_centres) == 0 or len(recon_centres) == 0:
+        raise RuntimeError("empty cell set in Chamfer-L1")
+    t_ref = cKDTree(ref_centres)
+    t_rec = cKDTree(recon_centres)
+    d_rec, _ = t_ref.query(recon_centres, k=1, workers=-1)
+    d_ref, _ = t_rec.query(ref_centres, k=1, workers=-1)
+    accuracy_mean_m = float(np.mean(d_rec))
+    completeness_mean_m = float(np.mean(d_ref))
+    chamfer_l1_m = 0.5 * (accuracy_mean_m + completeness_mean_m)
+    chamfer_l1 = 100.0 * chamfer_l1_m
+    accuracy_mean = 100.0 * accuracy_mean_m
+    completeness_mean = 100.0 * completeness_mean_m
+    if not np.isfinite(chamfer_l1) or chamfer_l1 < 0:
+        raise RuntimeError(f"invalid chamfer_l1_cm {chamfer_l1}")
+    return chamfer_l1, accuracy_mean, completeness_mean
 
 
-def gauge_normalize(mesh, cfg, scene_cfg, cad_centres, tau):
-    """Floor/centre + four-yaw selection against CAD surface cells."""
+def gauge_normalize(mesh, cfg, scene_cfg, cad_centres):
+    """Floor/centre + four-yaw selection minimising Chamfer-L1 vs CAD surface cells."""
     voxel_m = _voxel_size_m(cfg)
     V = np.asarray(mesh.vertices)
     floor_z = float(np.percentile(V[:, 2], 1))
@@ -206,7 +208,6 @@ def gauge_normalize(mesh, cfg, scene_cfg, cad_centres, tau):
     origin = np.asarray(scene_cfg["grid_origin_m"], dtype=np.float64)
     bounds_min = scene_cfg.get("bounds_min_m")
     bounds_max = scene_cfg.get("bounds_max_m")
-    # Coarse yaw selection on a stride-subsampled CAD reference for speed.
     step = max(1, len(cad_centres) // 80000)
     cad_yaw = cad_centres[::step]
     best = None
@@ -219,56 +220,80 @@ def gauge_normalize(mesh, cfg, scene_cfg, cad_centres, tau):
         except RuntimeError:
             continue
         centres_r = voxel_centres(idx, origin, voxel_m)
-        f1, _, _, _, _ = match_f1(cad_yaw, centres_r[::max(1, len(centres_r)//80000)], tau)
-        if best is None or f1 > best[0] + 1e-15 or (abs(f1 - best[0]) <= 1e-15 and yaw < best[1]):
-            best = (f1, yaw, m, idx, centres_r, Ty @ T_c @ T_floor)
+        rec_yaw = centres_r[::max(1, len(centres_r) // 80000)]
+        ch, _, _ = chamfer_l1_cm(cad_yaw, rec_yaw)
+        if best is None or ch < best[0] - 1e-15 or (abs(ch - best[0]) <= 1e-15 and yaw < best[1]):
+            best = (ch, yaw, m, idx, centres_r, Ty @ T_c @ T_floor)
     if best is None:
         raise RuntimeError("gauge normalization failed for all yaw candidates")
     return best[2], best[3], best[4], best[1], best[5]
 
 
-def score_sets(ref_centres, recon_centres, tau):
-    f1, precision, recall, matched_c, matched_r = match_f1(ref_centres, recon_centres, tau)
-    score = 100.0 * f1
-    if not np.isfinite(score) or score < 0 or score > 100:
-        raise RuntimeError(f"invalid geometry_score {score}")
-    return score, precision, recall, matched_c, matched_r
+def _density_rgba(H, rgb, scale, alpha_cap=0.85):
+    """Map 2D counts to RGBA; empty bins fully transparent."""
+    a = np.clip(np.sqrt(np.maximum(H, 0.0)) / scale, 0.0, 1.0) * alpha_cap
+    out = np.zeros(H.shape + (4,), dtype=np.float64)
+    out[..., 0] = rgb[0]
+    out[..., 1] = rgb[1]
+    out[..., 2] = rgb[2]
+    out[..., 3] = a
+    return out
 
 
-def render_comparison(path, ref_centres, recon_centres, matched_c, matched_r, scene_id, score, tau_mm,
-                      bounds_min, bounds_max):
+def _composite_over(base_rgb, layer_rgba):
+    """Porter-Duff over: layer onto opaque RGB base."""
+    a = layer_rgba[..., 3:4]
+    return base_rgb * (1.0 - a) + layer_rgba[..., :3] * a
+
+
+def render_comparison(path, ref_centres, recon_centres, scene_id, chamfer_l1,
+                      accuracy_mean, completeness_mean):
+    """Two-cloud projected density overlay (CAD orange, recon blue)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 
-    def decimate(P, n=25000):
-        if len(P) <= n:
-            return P
-        step = int(np.ceil(len(P) / n))
-        return P[::step]
-
-    green_c = decimate(ref_centres[matched_c])
-    red = decimate(ref_centres[~matched_c])
-    blue = decimate(recon_centres[~matched_r])
+    cad_rgb = (1.0, 0.45, 0.0)
+    rec_rgb = (0.15, 0.35, 1.0)
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     for ax, dims, label in ((axes[0], (0, 1), "plan x/y"), (axes[1], (0, 2), "elevation x/z")):
-        if len(green_c):
-            ax.scatter(green_c[:, dims[0]], green_c[:, dims[1]], s=1, c="green", label="matched")
-        if len(red):
-            ax.scatter(red[:, dims[0]], red[:, dims[1]], s=1, c="red", label="missing CAD")
-        if len(blue):
-            ax.scatter(blue[:, dims[0]], blue[:, dims[1]], s=1, c="blue", label="extra recon")
-        ax.set_aspect("equal")
+        pts = np.vstack([ref_centres[:, list(dims)], recon_centres[:, list(dims)]])
+        lo = pts.min(axis=0)
+        hi = pts.max(axis=0)
+        pad = np.maximum(0.1, 0.02 * (hi - lo))
+        lo = lo - pad
+        hi = hi + pad
+        extent_xy = hi - lo
+        long = float(max(extent_xy[0], extent_xy[1], 1e-6))
+        bin_m = max(0.02, long / 400.0)
+        nx = max(8, int(np.ceil(extent_xy[0] / bin_m)))
+        ny = max(8, int(np.ceil(extent_xy[1] / bin_m)))
+        rng = [[float(lo[0]), float(hi[0])], [float(lo[1]), float(hi[1])]]
+        H_cad, xe, ye = np.histogram2d(
+            ref_centres[:, dims[0]], ref_centres[:, dims[1]], bins=[nx, ny], range=rng)
+        H_rec, _, _ = np.histogram2d(
+            recon_centres[:, dims[0]], recon_centres[:, dims[1]], bins=[xe, ye])
+        scale = float(np.sqrt(max(H_cad.max(), H_rec.max(), 1.0)))
+        white = np.ones((H_cad.shape[0], H_cad.shape[1], 3), dtype=np.float64)
+        img = _composite_over(white, _density_rgba(H_cad, cad_rgb, scale))
+        img = _composite_over(img, _density_rgba(H_rec, rec_rgb, scale))
+        # histogram2d first dim = x rows; imshow expects rows = y → transpose
+        ax.imshow(np.clip(img.transpose(1, 0, 2), 0, 1), origin="lower",
+                  extent=[xe[0], xe[-1], ye[0], ye[-1]], interpolation="nearest",
+                  aspect="equal")
         ax.set_title(label)
-        if bounds_min is not None and bounds_max is not None:
-            ax.set_xlim(bounds_min[dims[0]], bounds_max[dims[0]])
-            ax.set_ylim(bounds_min[dims[1]], bounds_max[dims[1]])
-    handles, labels = axes[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="lower center", ncol=3)
-    fig.suptitle(f"{scene_id}  {METRIC}  tau={tau_mm}mm  score={score:.2f}")
-    fig.tight_layout(rect=[0, 0.05, 1, 0.95])
-    fig.savefig(path, dpi=120)
+        ax.set_xlim(xe[0], xe[-1])
+        ax.set_ylim(ye[0], ye[-1])
+    fig.legend(
+        [Patch(facecolor=cad_rgb, edgecolor="none", label="CAD"),
+         Patch(facecolor=rec_rgb, edgecolor="none", label="recon")],
+        ["CAD", "recon"], loc="lower center", ncol=2)
+    fig.suptitle(
+        f"{scene_id}  chamfer_l1_cm={chamfer_l1:.2f}  "
+        f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})")
+    fig.tight_layout(rect=[0, 0.06, 1, 0.94])
+    fig.savefig(path, dpi=140)
     plt.close(fig)
 
 
@@ -291,8 +316,10 @@ def atomic_write_text(path, text):
     atomic_write_bytes(path, text.encode("utf-8"))
 
 
-def score_scan(scan_id, config_path=None, distance_mm=None):
+def score_scan(scan_id, config_path=None):
     cfg = load_config(config_path)
+    if cfg.get("metric") != METRIC:
+        raise RuntimeError(f"config metric {cfg.get('metric')!r} != {METRIC!r}")
     scene_num = int(scan_id[5:9])
     sc = scene_config(cfg, scene_num)
     if sc.get("reference_sha256") is None or sc.get("visible_voxels_sha256") is None:
@@ -314,25 +341,23 @@ def score_scan(scan_id, config_path=None, distance_mm=None):
     mesh = transform_mesh(mesh, A)
 
     voxel_m = _voxel_size_m(cfg)
-    tau = (float(distance_mm) if distance_mm is not None else float(cfg["distance_threshold_mm"])) / 1000.0
     origin = np.asarray(sc["grid_origin_m"], dtype=np.float64)
     cad_mesh = load_mesh(cad_path)
     cad_idx = surface_voxels(cad_mesh, origin, voxel_m, sc.get("bounds_min_m"), sc.get("bounds_max_m"),
                              cfg.get("max_surface_voxels"))
     cad_centres_full = voxel_centres(cad_idx, origin, voxel_m)
 
-    mesh_g, recon_idx, recon_centres, yaw, T = gauge_normalize(mesh, cfg, sc, cad_centres_full, tau)
+    _, _, recon_centres, yaw, T = gauge_normalize(mesh, cfg, sc, cad_centres_full)
 
     vis = np.load(vis_path)
     vis_idx = vis["indices"].astype(np.int32)
-    # intersect visible with CAD surface set
     cad_set = set(map(tuple, cad_idx.tolist()))
     vis_idx = np.array([i for i in vis_idx if tuple(i) in cad_set], dtype=np.int32)
     if len(vis_idx) == 0:
         raise RuntimeError("empty visible CAD cell set after intersection")
     ref_centres = voxel_centres(vis_idx, origin, voxel_m)
 
-    score, precision, recall, matched_c, matched_r = score_sets(ref_centres, recon_centres, tau)
+    chamfer_l1, accuracy_mean, completeness_mean = chamfer_l1_cm(ref_centres, recon_centres)
 
     recon_dir = os.path.join(root, "recon")
     os.makedirs(recon_dir, exist_ok=True)
@@ -343,17 +368,17 @@ def score_scan(scan_id, config_path=None, distance_mm=None):
     fd, tmp_png = tempfile.mkstemp(prefix=".tmp_cmp_", suffix=".png", dir=recon_dir)
     os.close(fd)
     try:
-        render_comparison(tmp_png, ref_centres, recon_centres, matched_c, matched_r,
-                          scan_id, score, int(round(tau * 1000)),
-                          sc.get("bounds_min_m"), sc.get("bounds_max_m"))
+        render_comparison(tmp_png, ref_centres, recon_centres, scan_id,
+                          chamfer_l1, accuracy_mean, completeness_mean)
         doc = {
             "metric": METRIC,
-            "geometry_score": float(round(score, 6)),
+            "chamfer_l1_cm": float(round(chamfer_l1, 6)),
+            "accuracy_mean_cm": float(round(accuracy_mean, 6)),
+            "completeness_mean_cm": float(round(completeness_mean, 6)),
             "scene": scan_id,
             "reference_sha256": sc["reference_sha256"],
             "visible_voxels_sha256": sc["visible_voxels_sha256"],
             "voxel_mm": int(cfg["voxel_mm"]),
-            "distance_threshold_mm": int(round(tau * 1000)),
             "alignment": {
                 "axis_alignment_applied": True,
                 "yaw_deg": int(yaw),
@@ -371,17 +396,17 @@ def score_scan(scan_id, config_path=None, distance_mm=None):
             pass
         raise
 
-    print(f"[geometry] {scan_id} score={score:.2f}")
+    print(f"[geometry] {scan_id} chamfer_l1_cm={chamfer_l1:.2f} "
+          f"(acc={accuracy_mean:.2f} comp={completeness_mean:.2f})")
     return doc
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CAD geometry score for a ScanNet-style scan")
+    ap = argparse.ArgumentParser(description="CAD Chamfer-L1 geometry score for a ScanNet-style scan")
     ap.add_argument("--scan-id", required=True)
-    ap.add_argument("--distance-mm", type=float, default=None)
     ap.add_argument("--reference-config", default=DEFAULT_CONFIG)
     args = ap.parse_args()
-    score_scan(args.scan_id, args.reference_config, args.distance_mm)
+    score_scan(args.scan_id, args.reference_config)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
-metric: observed_surface_voxel_f1_v1
+metric: observed_surface_voxel_chamfer_l1_v1
 voxel_mm: 10
-distance_threshold_mm: 50
 max_surface_voxels: 12000000
 max_poses: 120
 min_views: 2
