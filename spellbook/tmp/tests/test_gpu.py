@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from benchmark import load_settings, validate_gpu_pool  # noqa: E402
 from utils import gpu as gpu_mod  # noqa: E402
