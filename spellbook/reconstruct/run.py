@@ -64,7 +64,7 @@ def _score_comparable(path):
             return False
         if int(doc.get("voxel_mm", -1)) != int(cfg.get("voxel_mm", -2)):
             return False
-        s = float(doc["chamfer_l1_cm"])
+        s = float(doc["mean_bidirectional_distance_cm"])
         acc = float(doc["accuracy_mean_cm"])
         comp = float(doc["completeness_mean_cm"])
         return all(np.isfinite(x) and x >= 0.0 for x in (s, acc, comp))
@@ -73,9 +73,9 @@ def _score_comparable(path):
 
 
 def _read_score(path):
-    """Chamfer-L1 cm; lower is better."""
+    """Mean bidirectional distance cm; lower is better."""
     with open(path) as f:
-        return float(yaml.safe_load(f)["chamfer_l1_cm"])
+        return float(yaml.safe_load(f)["mean_bidirectional_distance_cm"])
 
 
 def _pipeline(work, root, sid, info, engine_name, mesh_native, poses, keep, convention):
@@ -179,10 +179,10 @@ def _allocate(scene, engine):
         run_num = 0
         return run_num, scan_id(scene, engine, run_num), scan_dir(scene, engine, run_num)
 
-    # evict worst = highest chamfer_l1_cm
+    # evict worst = highest mean_bidirectional_distance_cm
     scored.sort(key=lambda c: (-c[4], c[5], c[1]))
     _, run_num, sid, root, scv, _ = scored[0]
-    print(f"[evict] {sid} chamfer_l1_cm={scv:.2f}")
+    print(f"[evict] {sid} mean_bidirectional_distance_cm={scv:.2f}")
     with exclusive_lock(scan_lock_path(sid)):
         cleanup.purge_scan_predictions(sid)
         cleanup.remove_scan_dir(root)

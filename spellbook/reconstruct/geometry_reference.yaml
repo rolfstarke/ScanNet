@@ -1,4 +1,4 @@
-metric: observed_surface_voxel_chamfer_l1_v1
+metric: observed_surface_voxel_mean_bidirectional_distance_v1
 voxel_mm: 10
 max_surface_voxels: 12000000
 max_poses: 120

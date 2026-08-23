@@ -1,8 +1,8 @@
-"""CAD-referenced Chamfer-L1 scorer for scene9004 reconstructions.
+"""CAD-referenced mean bidirectional distance scorer for scene9004.
 
-Scores <scan_id>_vh_clean_2.ply against a fixed CAD visibility mask using symmetric
-nearest-neighbour mean distance on 10 mm surface voxels (cm, lower better). CPU-only;
-never runs inside a managed GPU lease. Standalone:
+Scores <scan_id>_vh_clean_2.ply against a fixed CAD visibility mask. Reconstruction
+stays in scanworld; only an in-memory CAD copy is rigidly oriented for the score.
+CPU-only; never runs inside a managed GPU lease.
 
     python -m spellbook.reconstruct.geometry_score --scan-id scene9004_40
 """
@@ -20,7 +20,8 @@ from . import SCANS_DIR
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "geometry_reference.yaml")
-METRIC = "observed_surface_voxel_chamfer_l1_v1"
+METRIC = "observed_surface_voxel_mean_bidirectional_distance_v1"
+SCORE_KEY = "mean_bidirectional_distance_cm"
 
 
 def load_config(path=None):
@@ -90,11 +91,7 @@ def _voxel_size_m(cfg):
 
 
 def surface_voxels(mesh, origin, voxel_m, bounds_min=None, bounds_max=None, max_voxels=None):
-    """Return sorted (N,3) int32 voxel indices on a fixed grid origin.
-
-    Triangle-surface sampling (deterministic barycentric) rather than Open3D's slower
-    mesh voxelizer; density is at least one sample per voxel along each edge.
-    """
+    """Return sorted (N,3) int32 voxel indices on a fixed grid origin."""
     V = np.asarray(mesh.vertices, dtype=np.float64)
     F = np.asarray(mesh.triangles, dtype=np.int64)
     if len(F) == 0:
@@ -111,7 +108,6 @@ def surface_voxels(mesh, origin, voxel_m, bounds_min=None, bounds_max=None, max_
         np.linalg.norm(c - b, axis=1),
         np.linalg.norm(a - c, axis=1),
     ])
-    # Group triangles by required subdivision level for vectorized sampling.
     levels = np.clip(np.ceil(edge / max(voxel_m, 1e-9)).astype(np.int32), 1, 64)
     chunks = [V]
     for k in np.unique(levels):
@@ -125,7 +121,6 @@ def surface_voxels(mesh, origin, voxel_m, bounds_min=None, bounds_max=None, max_
         mask = (uu + vv) <= 1.0 + 1e-12
         wu, wv = uu[mask], vv[mask]
         ww = 1.0 - wu - wv
-        # (T,S,3)
         p = (aa[:, None, :] * ww[None, :, None]
              + bb[:, None, :] * wu[None, :, None]
              + cc[:, None, :] * wv[None, :, None])
@@ -146,13 +141,6 @@ def voxel_centres(idx, origin, voxel_m):
     return origin + (np.asarray(idx, dtype=np.float64) + 0.5) * voxel_m
 
 
-def preliminary_voxels(mesh, voxel_m):
-    """Local-origin preliminary pass for robust floor/centre only."""
-    V = np.asarray(mesh.vertices)
-    lo = np.floor(V.min(axis=0) / voxel_m) * voxel_m - voxel_m
-    return surface_voxels(mesh, lo, voxel_m)
-
-
 def yaw_matrix(deg):
     a = np.deg2rad(deg)
     c, s = np.cos(a), np.sin(a)
@@ -162,108 +150,121 @@ def yaw_matrix(deg):
     return T
 
 
-def chamfer_l1_cm(ref_centres, recon_centres):
-    """Symmetric Chamfer-L1 in cm: mean of recon→CAD and CAD→recon nearest means."""
+def apply_T(pts, T):
+    T = np.asarray(T, dtype=np.float64)
+    return (T[:3, :3] @ np.asarray(pts, dtype=np.float64).T).T + T[:3, 3]
+
+
+def mean_bidirectional_distance_cm(ref_centres, recon_centres):
+    """Mean of recon→CAD and CAD→recon nearest-neighbour means, in cm."""
     if len(ref_centres) == 0 or len(recon_centres) == 0:
-        raise RuntimeError("empty cell set in Chamfer-L1")
+        raise RuntimeError("empty cell set in mean bidirectional distance")
     t_ref = cKDTree(ref_centres)
     t_rec = cKDTree(recon_centres)
     d_rec, _ = t_ref.query(recon_centres, k=1, workers=-1)
     d_ref, _ = t_rec.query(ref_centres, k=1, workers=-1)
     accuracy_mean_m = float(np.mean(d_rec))
     completeness_mean_m = float(np.mean(d_ref))
-    chamfer_l1_m = 0.5 * (accuracy_mean_m + completeness_mean_m)
-    chamfer_l1 = 100.0 * chamfer_l1_m
+    score_m = 0.5 * (accuracy_mean_m + completeness_mean_m)
+    score = 100.0 * score_m
     accuracy_mean = 100.0 * accuracy_mean_m
     completeness_mean = 100.0 * completeness_mean_m
-    if not np.isfinite(chamfer_l1) or chamfer_l1 < 0:
-        raise RuntimeError(f"invalid chamfer_l1_cm {chamfer_l1}")
-    return chamfer_l1, accuracy_mean, completeness_mean
+    if not np.isfinite(score) or score < 0:
+        raise RuntimeError(f"invalid {SCORE_KEY} {score}")
+    return score, accuracy_mean, completeness_mean
 
 
-def gauge_normalize(mesh, cfg, scene_cfg, cad_centres):
-    """Floor/centre + four-yaw selection minimising Chamfer-L1 vs CAD surface cells."""
-    voxel_m = _voxel_size_m(cfg)
-    V = np.asarray(mesh.vertices)
-    floor_z = float(np.percentile(V[:, 2], 1))
-    T_floor = np.eye(4)
-    T_floor[2, 3] = -floor_z
-    mesh_f = transform_mesh(mesh, T_floor)
-    Vf = np.asarray(mesh_f.vertices)
-    med = np.median(Vf[:, :2], axis=0)
-    half = np.asarray(scene_cfg.get("cad_half_extents_m") or [7.0, 5.0], dtype=np.float64)
-    if half.size < 2:
-        half = np.array([7.0, 5.0])
-    keep = (np.abs(Vf[:, 0] - med[0]) <= half[0] + 1.0) & (np.abs(Vf[:, 1] - med[1]) <= half[1] + 1.0)
-    if keep.sum() < 100:
-        keep = np.ones(len(Vf), dtype=bool)
-    sel = Vf[keep]
-    cx = 0.5 * (np.percentile(sel[:, 0], 1) + np.percentile(sel[:, 0], 99))
-    cy = 0.5 * (np.percentile(sel[:, 1], 1) + np.percentile(sel[:, 1], 99))
-    room = np.asarray(scene_cfg.get("room_centre_m") or [0.0, 0.0, 0.0], dtype=np.float64)
-    T_c = np.eye(4)
-    T_c[0, 3] = room[0] - cx
-    T_c[1, 3] = room[1] - cy
-    mesh_c = transform_mesh(mesh_f, T_c)
-    origin = np.asarray(scene_cfg["grid_origin_m"], dtype=np.float64)
-    bounds_min = scene_cfg.get("bounds_min_m")
-    bounds_max = scene_cfg.get("bounds_max_m")
-    step = max(1, len(cad_centres) // 80000)
-    cad_yaw = cad_centres[::step]
+def recon_surface_centres(mesh, voxel_m, max_voxels=None):
+    """10 mm surface centres of recon in its own frame (local grid origin)."""
+    V = np.asarray(mesh.vertices, dtype=np.float64)
+    origin = np.floor(V.min(axis=0) / voxel_m) * voxel_m - voxel_m
+    idx = surface_voxels(mesh, origin, voxel_m, max_voxels=max_voxels)
+    return voxel_centres(idx, origin, voxel_m)
+
+
+def _pcd(pts):
+    p = o3d.geometry.PointCloud()
+    p.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=np.float64))
+    return p
+
+
+def _downsample(pts, voxel=0.05, max_n=25000):
+    a = np.asarray(_pcd(pts).voxel_down_sample(voxel).points, dtype=np.float64)
+    if len(a) == 0:
+        raise RuntimeError("downsample produced empty cloud")
+    if len(a) > max_n:
+        a = a[::int(np.ceil(len(a) / max_n))]
+    return a
+
+
+def _icp(source, target, init, max_corr, max_iter):
+    crit = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter)
+    reg = o3d.pipelines.registration.registration_icp(
+        source, target, max_corr, init,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        crit)
+    return np.asarray(reg.transformation, dtype=np.float64)
+
+
+def align_cad_to_recon(cad_pts, recon_pts):
+    """Quick temporary rigid CAD→recon (debug gauge only). Recon is never moved."""
+    cad_ds = _downsample(cad_pts)
+    rec_ds = _downsample(recon_pts)
+    cad_c = cad_ds.mean(axis=0)
+    rec_c = rec_ds.mean(axis=0)
+    src = _pcd(cad_ds)
+    tgt = _pcd(rec_ds)
     best = None
     for yaw in (0, 90, 180, 270):
-        Ty = yaw_matrix(yaw)
-        m = transform_mesh(mesh_c, Ty)
-        try:
-            idx = surface_voxels(m, origin, voxel_m, bounds_min, bounds_max,
-                                 cfg.get("max_surface_voxels"))
-        except RuntimeError:
-            continue
-        centres_r = voxel_centres(idx, origin, voxel_m)
-        rec_yaw = centres_r[::max(1, len(centres_r) // 80000)]
-        ch, _, _ = chamfer_l1_cm(cad_yaw, rec_yaw)
-        if best is None or ch < best[0] - 1e-15 or (abs(ch - best[0]) <= 1e-15 and yaw < best[1]):
-            best = (ch, yaw, m, idx, centres_r, Ty @ T_c @ T_floor)
+        T_to_c = np.eye(4)
+        T_to_c[:3, 3] = -cad_c
+        T_from_c = np.eye(4)
+        T_from_c[:3, 3] = cad_c
+        T_yaw = T_from_c @ yaw_matrix(yaw) @ T_to_c
+        cad_yaw = apply_T(cad_ds, T_yaw)
+        T_init = np.eye(4)
+        T_init[:3, :3] = T_yaw[:3, :3]
+        T_init[:3, 3] = T_yaw[:3, 3] + (rec_c - cad_yaw.mean(axis=0))
+        T1 = _icp(src, tgt, T_init, 1.0, 20)
+        T2 = _icp(src, tgt, T1, 0.25, 10)
+        cad_al = apply_T(cad_ds, T2)
+        score, _, _ = mean_bidirectional_distance_cm(cad_al, rec_ds)
+        if best is None or score < best[0] - 1e-9 or (
+                abs(score - best[0]) <= 1e-9 and yaw < best[1]):
+            best = (score, yaw, T2)
     if best is None:
-        raise RuntimeError("gauge normalization failed for all yaw candidates")
-    return best[2], best[3], best[4], best[1], best[5]
+        raise RuntimeError("CAD→recon alignment failed for all yaw seeds")
+    return best[2], int(best[1])
 
 
-def _density_rgba(H, rgb, scale, alpha_cap=0.85):
-    """Map 2D counts to RGBA; empty bins fully transparent."""
-    a = np.clip(np.sqrt(np.maximum(H, 0.0)) / scale, 0.0, 1.0) * alpha_cap
-    out = np.zeros(H.shape + (4,), dtype=np.float64)
-    out[..., 0] = rgb[0]
-    out[..., 1] = rgb[1]
-    out[..., 2] = rgb[2]
-    out[..., 3] = a
-    return out
+def _norm_density(H):
+    """Per-cloud log density in [0,1]; empty stays 0."""
+    H = np.asarray(H, dtype=np.float64)
+    nz = H[H > 0]
+    if nz.size == 0:
+        return np.zeros_like(H)
+    p99 = float(np.percentile(nz, 99))
+    denom = np.log1p(max(p99, 1.0))
+    return np.clip(np.log1p(np.maximum(H, 0.0)) / denom, 0.0, 1.0)
 
 
-def _composite_over(base_rgb, layer_rgba):
-    """Porter-Duff over: layer onto opaque RGB base."""
-    a = layer_rgba[..., 3:4]
-    return base_rgb * (1.0 - a) + layer_rgba[..., :3] * a
-
-
-def render_comparison(path, ref_centres, recon_centres, scene_id, chamfer_l1,
+def render_comparison(path, ref_centres, recon_centres, scene_id, score,
                       accuracy_mean, completeness_mean):
-    """Two-cloud projected density overlay (CAD orange, recon blue)."""
+    """Two-cloud density overlay; each cloud normalized independently."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
-    cad_rgb = (1.0, 0.45, 0.0)
-    rec_rgb = (0.15, 0.35, 1.0)
+    cad_rgb = np.array([1.0, 0.45, 0.0])
+    rec_rgb = np.array([0.15, 0.35, 1.0])
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     for ax, dims, label in ((axes[0], (0, 1), "plan x/y"), (axes[1], (0, 2), "elevation x/z")):
         pts = np.vstack([ref_centres[:, list(dims)], recon_centres[:, list(dims)]])
         lo = pts.min(axis=0)
         hi = pts.max(axis=0)
         pad = np.maximum(0.1, 0.02 * (hi - lo))
-        lo = lo - pad
-        hi = hi + pad
+        lo, hi = lo - pad, hi + pad
         extent_xy = hi - lo
         long = float(max(extent_xy[0], extent_xy[1], 1e-6))
         bin_m = max(0.02, long / 400.0)
@@ -274,11 +275,18 @@ def render_comparison(path, ref_centres, recon_centres, scene_id, chamfer_l1,
             ref_centres[:, dims[0]], ref_centres[:, dims[1]], bins=[nx, ny], range=rng)
         H_rec, _, _ = np.histogram2d(
             recon_centres[:, dims[0]], recon_centres[:, dims[1]], bins=[xe, ye])
-        scale = float(np.sqrt(max(H_cad.max(), H_rec.max(), 1.0)))
-        white = np.ones((H_cad.shape[0], H_cad.shape[1], 3), dtype=np.float64)
-        img = _composite_over(white, _density_rgba(H_cad, cad_rgb, scale))
-        img = _composite_over(img, _density_rgba(H_rec, rec_rgb, scale))
-        # histogram2d first dim = x rows; imshow expects rows = y → transpose
+        a_c = _norm_density(H_cad)
+        a_r = _norm_density(H_rec)
+        w = a_c + a_r
+        rgb = np.ones(H_cad.shape + (3,), dtype=np.float64)
+        mask = w > 0
+        mix = np.zeros_like(rgb)
+        mix[..., 0] = (cad_rgb[0] * a_c + rec_rgb[0] * a_r)
+        mix[..., 1] = (cad_rgb[1] * a_c + rec_rgb[1] * a_r)
+        mix[..., 2] = (cad_rgb[2] * a_c + rec_rgb[2] * a_r)
+        mix[mask] /= w[mask, None]
+        alpha = np.clip(np.maximum(a_c, a_r) * 0.95, 0.0, 0.95)[..., None]
+        img = rgb * (1.0 - alpha) + mix * alpha
         ax.imshow(np.clip(img.transpose(1, 0, 2), 0, 1), origin="lower",
                   extent=[xe[0], xe[-1], ye[0], ye[-1]], interpolation="nearest",
                   aspect="equal")
@@ -286,11 +294,11 @@ def render_comparison(path, ref_centres, recon_centres, scene_id, chamfer_l1,
         ax.set_xlim(xe[0], xe[-1])
         ax.set_ylim(ye[0], ye[-1])
     fig.legend(
-        [Patch(facecolor=cad_rgb, edgecolor="none", label="CAD"),
-         Patch(facecolor=rec_rgb, edgecolor="none", label="recon")],
+        [Patch(facecolor=cad_rgb, edgecolor="none"),
+         Patch(facecolor=rec_rgb, edgecolor="none")],
         ["CAD", "recon"], loc="lower center", ncol=2)
     fig.suptitle(
-        f"{scene_id}  chamfer_l1_cm={chamfer_l1:.2f}  "
+        f"{scene_id}  {SCORE_KEY}={score:.2f}  "
         f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})")
     fig.tight_layout(rect=[0, 0.06, 1, 0.94])
     fig.savefig(path, dpi=140)
@@ -336,28 +344,32 @@ def score_scan(scan_id, config_path=None):
     txt_path = os.path.join(root, f"{scan_id}.txt")
     if not os.path.isfile(mesh_path):
         raise FileNotFoundError(mesh_path)
+
+    # Recon stays in scanworld (only ScanNet axisAlignment from its own .txt).
     mesh = load_mesh(mesh_path)
     A = parse_axis_alignment(txt_path) if os.path.isfile(txt_path) else np.eye(4)
     mesh = transform_mesh(mesh, A)
-
     voxel_m = _voxel_size_m(cfg)
+    recon_centres = recon_surface_centres(mesh, voxel_m, cfg.get("max_surface_voxels"))
+
+    # CAD + visibility in CAD frame, then temporary rigid CAD→recon.
     origin = np.asarray(sc["grid_origin_m"], dtype=np.float64)
     cad_mesh = load_mesh(cad_path)
-    cad_idx = surface_voxels(cad_mesh, origin, voxel_m, sc.get("bounds_min_m"), sc.get("bounds_max_m"),
-                             cfg.get("max_surface_voxels"))
-    cad_centres_full = voxel_centres(cad_idx, origin, voxel_m)
-
-    _, _, recon_centres, yaw, T = gauge_normalize(mesh, cfg, sc, cad_centres_full)
-
-    vis = np.load(vis_path)
-    vis_idx = vis["indices"].astype(np.int32)
+    cad_idx = surface_voxels(cad_mesh, origin, voxel_m, sc.get("bounds_min_m"),
+                             sc.get("bounds_max_m"), cfg.get("max_surface_voxels"))
     cad_set = set(map(tuple, cad_idx.tolist()))
-    vis_idx = np.array([i for i in vis_idx if tuple(i) in cad_set], dtype=np.int32)
+    vis = np.load(vis_path)
+    vis_idx = np.array([i for i in vis["indices"].astype(np.int32)
+                        if tuple(i) in cad_set], dtype=np.int32)
     if len(vis_idx) == 0:
         raise RuntimeError("empty visible CAD cell set after intersection")
-    ref_centres = voxel_centres(vis_idx, origin, voxel_m)
+    cad_centres = voxel_centres(vis_idx, origin, voxel_m)
 
-    chamfer_l1, accuracy_mean, completeness_mean = chamfer_l1_cm(ref_centres, recon_centres)
+    T_cad, yaw0 = align_cad_to_recon(cad_centres, recon_centres)
+    ref_centres = apply_T(cad_centres, T_cad)
+
+    score, accuracy_mean, completeness_mean = mean_bidirectional_distance_cm(
+        ref_centres, recon_centres)
 
     recon_dir = os.path.join(root, "recon")
     os.makedirs(recon_dir, exist_ok=True)
@@ -369,10 +381,10 @@ def score_scan(scan_id, config_path=None):
     os.close(fd)
     try:
         render_comparison(tmp_png, ref_centres, recon_centres, scan_id,
-                          chamfer_l1, accuracy_mean, completeness_mean)
+                          score, accuracy_mean, completeness_mean)
         doc = {
             "metric": METRIC,
-            "chamfer_l1_cm": float(round(chamfer_l1, 6)),
+            SCORE_KEY: float(round(score, 6)),
             "accuracy_mean_cm": float(round(accuracy_mean, 6)),
             "completeness_mean_cm": float(round(completeness_mean, 6)),
             "scene": scan_id,
@@ -380,14 +392,16 @@ def score_scan(scan_id, config_path=None):
             "visible_voxels_sha256": sc["visible_voxels_sha256"],
             "voxel_mm": int(cfg["voxel_mm"]),
             "alignment": {
-                "axis_alignment_applied": True,
-                "yaw_deg": int(yaw),
-                "transform": T.reshape(-1).astype(float).tolist(),
+                "method": "temporary_cad_rigid_icp",
+                "moved": "cad",
+                "reconstruction_transformed": False,
+                "axis_alignment_applied_to_recon": True,
+                "initial_yaw_deg": int(yaw0),
+                "cad_to_scanworld": T_cad.reshape(-1).astype(float).tolist(),
             },
             "comparison": png_rel,
         }
-        text = yaml.safe_dump(doc, sort_keys=False)
-        atomic_write_text(yaml_path, text)
+        atomic_write_text(yaml_path, yaml.safe_dump(doc, sort_keys=False))
         os.replace(tmp_png, png_path)
     except Exception:
         try:
@@ -396,13 +410,14 @@ def score_scan(scan_id, config_path=None):
             pass
         raise
 
-    print(f"[geometry] {scan_id} chamfer_l1_cm={chamfer_l1:.2f} "
+    print(f"[geometry] {scan_id} {SCORE_KEY}={score:.2f} "
           f"(acc={accuracy_mean:.2f} comp={completeness_mean:.2f})")
     return doc
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CAD Chamfer-L1 geometry score for a ScanNet-style scan")
+    ap = argparse.ArgumentParser(
+        description="CAD mean bidirectional distance score for a ScanNet-style scan")
     ap.add_argument("--scan-id", required=True)
     ap.add_argument("--reference-config", default=DEFAULT_CONFIG)
     args = ap.parse_args()
