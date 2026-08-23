@@ -9,7 +9,10 @@ import shutil
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_SPELLBOOK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(_SPELLBOOK)
+sys.path.insert(0, _SPELLBOOK)
+sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import yaml

@@ -12,7 +12,10 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_SPELLBOOK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(_SPELLBOOK)
+sys.path.insert(0, _SPELLBOOK)
+sys.path.insert(0, _REPO_ROOT)
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -22,8 +25,7 @@ from evaluation.benchmark import load_settings
 from . import ENGINE_INDEX, frames_pool_dir, svo_path
 from . import extract as extract_mod
 
-LOG_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "tmp", "logs")
+LOG_ROOT = os.path.join(_SPELLBOOK, "tmp", "logs")
 
 
 def _engine_module(engine):
@@ -75,6 +77,9 @@ def _run_task(scene, engine, frames_dir, log_path, bar, slot, proc_registry):
     env = os.environ.copy()
     env.pop("CUDA_VISIBLE_DEVICES", None)
     env["PYTHONUNBUFFERED"] = "1"
+    # -m spellbook.reconstruct.run needs repo root on PYTHONPATH
+    pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = _REPO_ROOT + (os.pathsep + pp if pp else "")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1, env=env)
     with proc_registry["lock"]:
