@@ -25,6 +25,7 @@ spellbook/
 ├── benchmark.py                 # BenchmarkSpec (ScanNet20: 18 classes / ScanNet200: 198 = 200 - wall/floor), paths, gpu_pool validation
 ├── evaluate.py                  # GT export + evaluation dispatch (official / scannet200 evaluator)
 ├── scannet200_evaluator.py      # Python-3 port of Rozenberszki's ScanNet200 evaluator (198-class)
+├── gpu_check.py                 # --gpu-check: per-model/engine native distribution probe over real pool leases
 ├── environment.yaml             # 3disspellbook conda env (ZED SDK activation sets ZED_DIR/LD_LIBRARY_PATH)
 ├── PROJECT_STATUS.md            # this file
 ├── tmp/                          # active plans/research and transient logs
