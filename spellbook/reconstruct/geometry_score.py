@@ -1,8 +1,9 @@
 """CAD-referenced mean bidirectional distance scorer for scene9004.
 
-Scores <scan_id>_vh_clean_2.ply against a fixed CAD visibility mask. Reconstruction
-stays in scanworld; only an in-memory CAD copy is rigidly oriented for the score.
-CPU-only; never runs inside a managed GPU lease.
+Scores <scan_id>_vh_clean_2.ply against a fixed CAD visibility mask. CAD stays in
+its original frame; only an in-memory recon copy is rigidly oriented for scoring
+and debug views. On-disk meshes/poses are never modified. CPU-only; never runs
+inside a managed GPU lease.
 
     python -m spellbook.reconstruct.geometry_score --scan-id scene9004_40
 """
@@ -22,6 +23,9 @@ DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "geometry_reference.yaml")
 METRIC = "observed_surface_voxel_mean_bidirectional_distance_v1"
 SCORE_KEY = "mean_bidirectional_distance_cm"
+CAD_RGB = np.array([1.0, 0.92, 0.05])
+RECON_RGB = np.array([0.05, 0.85, 0.90])
+CEILING_HEIGHT_M = 2.0
 
 
 def load_config(path=None):
@@ -207,7 +211,8 @@ def _icp(source, target, init, max_corr, max_iter):
 
 
 def align_cad_to_recon(cad_pts, recon_pts):
-    """Quick temporary rigid CAD→recon (debug gauge only). Recon is never moved."""
+    """Estimate rigid T mapping CAD→recon (four-yaw ICP). Used inverted so recon
+    moves into CAD frame; CAD and on-disk recon stay fixed."""
     cad_ds = _downsample(cad_pts)
     rec_ds = _downsample(recon_pts)
     cad_c = cad_ds.mean(axis=0)
@@ -233,8 +238,12 @@ def align_cad_to_recon(cad_pts, recon_pts):
                 abs(score - best[0]) <= 1e-9 and yaw < best[1]):
             best = (score, yaw, T2)
     if best is None:
-        raise RuntimeError("CAD→recon alignment failed for all yaw seeds")
-    return best[2], int(best[1])
+        raise RuntimeError("CAD↔recon alignment failed for all yaw seeds")
+    T_cad_to_recon = best[2]
+    det = float(np.linalg.det(T_cad_to_recon[:3, :3]))
+    if abs(det - 1.0) > 1e-3:
+        raise RuntimeError(f"non-rigid ICP rotation det={det}")
+    return T_cad_to_recon, int(best[1])
 
 
 def _coarse_occupancy(pts, cell_m):
@@ -277,8 +286,7 @@ def render_comparison(path, ref_centres, recon_centres, scene_id, score,
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
-    cad_rgb = np.array([1.0, 0.92, 0.05])
-    rec_rgb = np.array([0.05, 0.85, 0.90])
+    cad_rgb, rec_rgb = CAD_RGB, RECON_RGB
     cell = _overlay_cell_m(ref_centres, recon_centres)
     pixel = max(cell / 10.0, 0.012)
     cad = _coarse_occupancy(ref_centres, cell)
@@ -317,6 +325,84 @@ def render_comparison(path, ref_centres, recon_centres, scene_id, score,
         f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})  "
         f"cell={cell:.2f}m")
     fig.tight_layout(rect=[0, 0.06, 1, 0.94])
+    fig.savefig(path, dpi=140, facecolor="white")
+    plt.close(fig)
+
+
+def render_isometric_distance(path, mesh, cad_centres, scene_id, score,
+                              ceiling_height=CEILING_HEIGHT_M):
+    """Isometric recon mesh coloured by distance to visible CAD (cm).
+
+    Ceiling: hide faces above floor_p1 + ceiling_height for display only (no crop saved).
+    Colour: CAD yellow at 0 cm → recon cyan at p95 (outliers clipped).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    m = mesh
+    if len(m.triangles) > 120000:
+        m = m.simplify_quadric_decimation(target_number_of_triangles=100000)
+    V = np.asarray(m.vertices, dtype=np.float64)
+    F = np.asarray(m.triangles, dtype=np.int64)
+    if len(V) == 0 or len(F) == 0:
+        raise RuntimeError("empty mesh for isometric render")
+
+    d_cm = cKDTree(cad_centres).query(V, k=1, workers=-1)[0] * 100.0
+    up = 2
+    floor = float(np.percentile(V[:, up], 1))
+    keep_v = V[:, up] <= floor + ceiling_height
+    keep_f = keep_v[F[:, 0]] & keep_v[F[:, 1]] & keep_v[F[:, 2]]
+    F2 = F[keep_f]
+    if len(F2) == 0:
+        raise RuntimeError("no faces left after ceiling hide")
+
+    d_vis = d_cm[keep_v]
+    p95 = float(np.percentile(d_vis, 95)) if len(d_vis) else 1.0
+    p95 = max(p95, 1e-3)
+    t = np.clip(d_cm / p95, 0.0, 1.0)
+    vcol = CAD_RGB[None, :] * (1.0 - t)[:, None] + RECON_RGB[None, :] * t[:, None]
+    fcol = vcol[F2].mean(axis=1)
+
+    fig = plt.figure(figsize=(9, 7), facecolor="white")
+    ax = fig.add_subplot(111, projection="3d", computed_zorder=False)
+    coll = Poly3DCollection(V[F2], linewidths=0, edgecolors="none")
+    coll.set_facecolor(fcol)
+    ax.add_collection3d(coll)
+
+    Vk = V[keep_v]
+    lo, hi = Vk.min(0), Vk.max(0)
+    c = 0.5 * (lo + hi)
+    r = 0.5 * float(np.max(hi - lo)) + 0.2
+    ax.set_xlim(c[0] - r, c[0] + r)
+    ax.set_ylim(c[1] - r, c[1] + r)
+    ax.set_zlim(c[2] - r, c[2] + r)
+    try:
+        ax.set_box_aspect((1, 1, 1))
+    except Exception:
+        pass
+    ax.view_init(elev=30, azim=-45)
+    try:
+        ax.set_proj_type("ortho")
+    except Exception:
+        pass
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    ax.set_facecolor("white")
+
+    cmap = LinearSegmentedColormap.from_list("cad_recon", [CAD_RGB, RECON_RGB])
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, p95))
+    sm.set_array([])
+    cb = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.08)
+    cb.set_label("distance to CAD (cm)")
+
+    ax.set_title(
+        f"{scene_id}  isometric recon  {SCORE_KEY}={score:.2f}  "
+        f"ceiling hide floor+{ceiling_height:.1f}m  p95={p95:.1f}cm")
+    fig.tight_layout()
     fig.savefig(path, dpi=140, facecolor="white")
     plt.close(fig)
 
@@ -361,14 +447,14 @@ def score_scan(scan_id, config_path=None):
     if not os.path.isfile(mesh_path):
         raise FileNotFoundError(mesh_path)
 
-    # Recon stays in scanworld (only ScanNet axisAlignment from its own .txt).
+    # Recon: ScanNet axisAlignment only (part of scan metadata), then voxelize.
     mesh = load_mesh(mesh_path)
     A = parse_axis_alignment(txt_path) if os.path.isfile(txt_path) else np.eye(4)
-    mesh = transform_mesh(mesh, A)
+    mesh_a = transform_mesh(mesh, A)
     voxel_m = _voxel_size_m(cfg)
-    recon_centres = recon_surface_centres(mesh, voxel_m, cfg.get("max_surface_voxels"))
+    recon_centres = recon_surface_centres(mesh_a, voxel_m, cfg.get("max_surface_voxels"))
 
-    # CAD + visibility in CAD frame, then temporary rigid CAD→recon.
+    # CAD stays in original frame (visible surface voxels).
     origin = np.asarray(sc["grid_origin_m"], dtype=np.float64)
     cad_mesh = load_mesh(cad_path)
     cad_idx = surface_voxels(cad_mesh, origin, voxel_m, sc.get("bounds_min_m"),
@@ -381,23 +467,31 @@ def score_scan(scan_id, config_path=None):
         raise RuntimeError("empty visible CAD cell set after intersection")
     cad_centres = voxel_centres(vis_idx, origin, voxel_m)
 
-    T_cad, yaw0 = align_cad_to_recon(cad_centres, recon_centres)
-    ref_centres = apply_T(cad_centres, T_cad)
+    # Temporary rigid recon→CAD (invert CAD→recon ICP). In-memory only.
+    T_cad_to_recon, yaw0 = align_cad_to_recon(cad_centres, recon_centres)
+    T_recon_to_cad = np.linalg.inv(T_cad_to_recon)
+    recon_centres_cad = apply_T(recon_centres, T_recon_to_cad)
+    mesh_cad = transform_mesh(mesh_a, T_recon_to_cad)
 
     score, accuracy_mean, completeness_mean = mean_bidirectional_distance_cm(
-        ref_centres, recon_centres)
+        cad_centres, recon_centres_cad)
 
     recon_dir = os.path.join(root, "recon")
     os.makedirs(recon_dir, exist_ok=True)
     png_rel = "recon/cad_comparison.png"
+    iso_rel = "recon/cad_distance_isometric.png"
     png_path = os.path.join(root, png_rel)
+    iso_path = os.path.join(root, iso_rel)
     yaml_path = os.path.join(recon_dir, "geometry_score.yaml")
 
-    fd, tmp_png = tempfile.mkstemp(prefix=".tmp_cmp_", suffix=".png", dir=recon_dir)
-    os.close(fd)
+    fd1, tmp_png = tempfile.mkstemp(prefix=".tmp_cmp_", suffix=".png", dir=recon_dir)
+    os.close(fd1)
+    fd2, tmp_iso = tempfile.mkstemp(prefix=".tmp_iso_", suffix=".png", dir=recon_dir)
+    os.close(fd2)
     try:
-        render_comparison(tmp_png, ref_centres, recon_centres, scan_id,
+        render_comparison(tmp_png, cad_centres, recon_centres_cad, scan_id,
                           score, accuracy_mean, completeness_mean)
+        render_isometric_distance(tmp_iso, mesh_cad, cad_centres, scan_id, score)
         doc = {
             "metric": METRIC,
             SCORE_KEY: float(round(score, 6)),
@@ -408,22 +502,25 @@ def score_scan(scan_id, config_path=None):
             "visible_voxels_sha256": sc["visible_voxels_sha256"],
             "voxel_mm": int(cfg["voxel_mm"]),
             "alignment": {
-                "method": "temporary_cad_rigid_icp",
-                "moved": "cad",
-                "reconstruction_transformed": False,
+                "method": "temporary_recon_rigid_icp",
+                "moved": "recon_in_memory_only",
+                "reconstruction_saved": False,
                 "axis_alignment_applied_to_recon": True,
                 "initial_yaw_deg": int(yaw0),
-                "cad_to_scanworld": T_cad.reshape(-1).astype(float).tolist(),
+                "recon_to_cad": T_recon_to_cad.reshape(-1).astype(float).tolist(),
             },
             "comparison": png_rel,
+            "isometric": iso_rel,
         }
         atomic_write_text(yaml_path, yaml.safe_dump(doc, sort_keys=False))
         os.replace(tmp_png, png_path)
+        os.replace(tmp_iso, iso_path)
     except Exception:
-        try:
-            os.unlink(tmp_png)
-        except OSError:
-            pass
+        for t in (tmp_png, tmp_iso):
+            try:
+                os.unlink(t)
+            except OSError:
+                pass
         raise
 
     print(f"[geometry] {scan_id} {SCORE_KEY}={score:.2f} "
