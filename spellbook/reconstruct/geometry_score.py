@@ -1,9 +1,7 @@
-"""CAD-referenced mean bidirectional distance scorer for scene9004.
+"""CAD mean bidirectional distance scorer for scene9004.
 
-Scores <scan_id>_vh_clean_2.ply against a fixed CAD visibility mask. CAD stays in
-its original frame; only an in-memory recon copy is rigidly oriented for scoring
-and debug views. On-disk meshes/poses are never modified. CPU-only; never runs
-inside a managed GPU lease.
+CAD stays fixed; an in-memory recon copy is rigidly aligned for scoring/views only.
+On-disk meshes are never modified.
 
     python -m spellbook.reconstruct.geometry_score --scan-id scene9004_40
 """
@@ -23,10 +21,9 @@ DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "geometry_reference.yaml")
 METRIC = "observed_surface_voxel_mean_bidirectional_distance_v1"
 SCORE_KEY = "mean_bidirectional_distance_cm"
-# Magenta + cyan: equal mix → blue/purple; near=magenta, far=cyan
-CAD_RGB = np.array([0.92, 0.12, 0.72])
-RECON_RGB = np.array([0.08, 0.78, 0.90])
-CEILING_HEIGHT_M = 2.5  # hide verts above floor_p1 + this (display only)
+CAD_RGB = np.array([0.92, 0.12, 0.72])   # magenta
+RECON_RGB = np.array([0.08, 0.78, 0.90])  # cyan
+CEILING_HEIGHT_M = 2.5
 
 
 def load_config(path=None):
@@ -60,59 +57,50 @@ def parse_axis_alignment(txt_path):
                 if len(vals) != 16:
                     raise ValueError(f"bad axisAlignment in {txt_path}")
                 A = np.array(vals, dtype=np.float64).reshape(4, 4)
-                det = np.linalg.det(A[:3, :3])
-                if abs(det - 1.0) > 0.05:
-                    raise ValueError(f"axisAlignment det={det:.4f} (expected ~1)")
+                if abs(np.linalg.det(A[:3, :3]) - 1.0) > 0.05:
+                    raise ValueError(f"axisAlignment det bad in {txt_path}")
                 return A
     return np.eye(4)
 
 
 def load_mesh(path):
     mesh = o3d.io.read_triangle_mesh(path)
-    if mesh.is_empty():
-        raise RuntimeError(f"empty mesh: {path}")
+    if mesh.is_empty() or not mesh.has_triangles():
+        raise RuntimeError(f"empty/non-triangular mesh: {path}")
     mesh.compute_vertex_normals()
-    if not mesh.has_triangles():
-        raise RuntimeError(f"non-triangular mesh: {path}")
-    V = np.asarray(mesh.vertices)
-    if not np.isfinite(V).all():
+    if not np.isfinite(np.asarray(mesh.vertices)).all():
         raise RuntimeError(f"non-finite vertices: {path}")
     return mesh
 
 
 def transform_mesh(mesh, T):
-    if hasattr(mesh, "clone"):
-        out = mesh.clone()
-    else:
-        out = o3d.geometry.TriangleMesh(
-            o3d.utility.Vector3dVector(np.asarray(mesh.vertices).copy()),
-            o3d.utility.Vector3iVector(np.asarray(mesh.triangles).copy()))
+    out = mesh.clone() if hasattr(mesh, "clone") else o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(np.asarray(mesh.vertices).copy()),
+        o3d.utility.Vector3iVector(np.asarray(mesh.triangles).copy()))
     out.transform(np.asarray(T, dtype=np.float64))
     return out
 
 
-def _voxel_size_m(cfg):
-    return float(cfg["voxel_mm"]) / 1000.0
+def apply_T(pts, T):
+    T = np.asarray(T, dtype=np.float64)
+    return (T[:3, :3] @ np.asarray(pts, dtype=np.float64).T).T + T[:3, 3]
 
 
 def surface_voxels(mesh, origin, voxel_m, bounds_min=None, bounds_max=None, max_voxels=None):
-    """Return sorted (N,3) int32 voxel indices on a fixed grid origin."""
+    """Sorted (N,3) int32 surface voxel indices via barycentric triangle sampling."""
     V = np.asarray(mesh.vertices, dtype=np.float64)
     F = np.asarray(mesh.triangles, dtype=np.int64)
     if len(F) == 0:
         raise RuntimeError("surface voxelization produced zero cells")
     origin = np.asarray(origin, dtype=np.float64)
     if bounds_min is not None and bounds_max is not None:
-        lo = np.asarray(bounds_min, dtype=np.float64)
-        hi = np.asarray(bounds_max, dtype=np.float64)
+        lo, hi = np.asarray(bounds_min, float), np.asarray(bounds_max, float)
         if (V < lo - 1e-9).any() or (V > hi + 1e-9).any():
             raise RuntimeError("mesh vertices outside configured evaluation bounds")
     a, b, c = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
-    edge = np.maximum.reduce([
-        np.linalg.norm(b - a, axis=1),
-        np.linalg.norm(c - b, axis=1),
-        np.linalg.norm(a - c, axis=1),
-    ])
+    edge = np.maximum.reduce([np.linalg.norm(b - a, axis=1),
+                              np.linalg.norm(c - b, axis=1),
+                              np.linalg.norm(a - c, axis=1)])
     levels = np.clip(np.ceil(edge / max(voxel_m, 1e-9)).astype(np.int32), 1, 64)
     chunks = [V]
     for k in np.unique(levels):
@@ -126,220 +114,119 @@ def surface_voxels(mesh, origin, voxel_m, bounds_min=None, bounds_max=None, max_
         mask = (uu + vv) <= 1.0 + 1e-12
         wu, wv = uu[mask], vv[mask]
         ww = 1.0 - wu - wv
-        p = (aa[:, None, :] * ww[None, :, None]
-             + bb[:, None, :] * wu[None, :, None]
-             + cc[:, None, :] * wv[None, :, None])
+        p = (aa[:, None] * ww[None, :, None] + bb[:, None] * wu[None, :, None]
+             + cc[:, None] * wv[None, :, None])
         chunks.append(p.reshape(-1, 3))
-    pts = np.concatenate(chunks, axis=0)
-    idx = np.floor((pts - origin) / voxel_m).astype(np.int32)
-    idx = np.unique(idx, axis=0)
+    idx = np.unique(np.floor((np.concatenate(chunks) - origin) / voxel_m).astype(np.int32), axis=0)
     if idx.size == 0:
         raise RuntimeError("surface voxelization produced zero cells")
     if max_voxels is not None and len(idx) > max_voxels:
         raise RuntimeError(f"surface voxels {len(idx)} exceed cap {max_voxels}")
-    order = np.lexsort((idx[:, 2], idx[:, 1], idx[:, 0]))
-    return idx[order]
+    return idx[np.lexsort((idx[:, 2], idx[:, 1], idx[:, 0]))]
 
 
 def voxel_centres(idx, origin, voxel_m):
-    origin = np.asarray(origin, dtype=np.float64)
-    return origin + (np.asarray(idx, dtype=np.float64) + 0.5) * voxel_m
+    return np.asarray(origin, float) + (np.asarray(idx, float) + 0.5) * voxel_m
 
 
-def yaw_matrix(deg):
-    a = np.deg2rad(deg)
-    c, s = np.cos(a), np.sin(a)
-    T = np.eye(4)
-    T[0, 0], T[0, 1] = c, -s
-    T[1, 0], T[1, 1] = s, c
-    return T
-
-
-def apply_T(pts, T):
-    T = np.asarray(T, dtype=np.float64)
-    return (T[:3, :3] @ np.asarray(pts, dtype=np.float64).T).T + T[:3, 3]
-
-
-def mean_bidirectional_distance_cm(ref_centres, recon_centres):
-    """Mean of recon→CAD and CAD→recon nearest-neighbour means, in cm."""
-    if len(ref_centres) == 0 or len(recon_centres) == 0:
+def mean_bidirectional_distance_cm(ref, recon):
+    if len(ref) == 0 or len(recon) == 0:
         raise RuntimeError("empty cell set in mean bidirectional distance")
-    t_ref = cKDTree(ref_centres)
-    t_rec = cKDTree(recon_centres)
-    d_rec, _ = t_ref.query(recon_centres, k=1, workers=-1)
-    d_ref, _ = t_rec.query(ref_centres, k=1, workers=-1)
-    accuracy_mean_m = float(np.mean(d_rec))
-    completeness_mean_m = float(np.mean(d_ref))
-    score_m = 0.5 * (accuracy_mean_m + completeness_mean_m)
-    score = 100.0 * score_m
-    accuracy_mean = 100.0 * accuracy_mean_m
-    completeness_mean = 100.0 * completeness_mean_m
+    d_rec = cKDTree(ref).query(recon, k=1, workers=-1)[0]
+    d_ref = cKDTree(recon).query(ref, k=1, workers=-1)[0]
+    acc, comp = float(np.mean(d_rec)) * 100.0, float(np.mean(d_ref)) * 100.0
+    score = 0.5 * (acc + comp)
     if not np.isfinite(score) or score < 0:
         raise RuntimeError(f"invalid {SCORE_KEY} {score}")
-    return score, accuracy_mean, completeness_mean
+    return score, acc, comp
 
 
 def recon_surface_centres(mesh, voxel_m, max_voxels=None):
-    """10 mm surface centres of recon in its own frame (local grid origin)."""
     V = np.asarray(mesh.vertices, dtype=np.float64)
-    origin = np.floor(V.min(axis=0) / voxel_m) * voxel_m - voxel_m
-    idx = surface_voxels(mesh, origin, voxel_m, max_voxels=max_voxels)
-    return voxel_centres(idx, origin, voxel_m)
-
-
-def _pcd(pts):
-    p = o3d.geometry.PointCloud()
-    p.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=np.float64))
-    return p
-
-
-def _downsample(pts, voxel=0.05, max_n=25000):
-    a = np.asarray(_pcd(pts).voxel_down_sample(voxel).points, dtype=np.float64)
-    if len(a) == 0:
-        raise RuntimeError("downsample produced empty cloud")
-    if len(a) > max_n:
-        a = a[::int(np.ceil(len(a) / max_n))]
-    return a
-
-
-def _icp(source, target, init, max_corr, max_iter):
-    crit = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter)
-    reg = o3d.pipelines.registration.registration_icp(
-        source, target, max_corr, init,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        crit)
-    return np.asarray(reg.transformation, dtype=np.float64)
+    origin = np.floor(V.min(0) / voxel_m) * voxel_m - voxel_m
+    return voxel_centres(surface_voxels(mesh, origin, voxel_m, max_voxels=max_voxels),
+                         origin, voxel_m)
 
 
 def align_cad_to_recon(cad_pts, recon_pts):
-    """Estimate rigid T mapping CAD→recon (four-yaw ICP). Used inverted so recon
-    moves into CAD frame; CAD and on-disk recon stay fixed."""
-    cad_ds = _downsample(cad_pts)
-    rec_ds = _downsample(recon_pts)
-    cad_c = cad_ds.mean(axis=0)
-    rec_c = rec_ds.mean(axis=0)
-    src = _pcd(cad_ds)
-    tgt = _pcd(rec_ds)
+    """Rigid T: CAD→recon (four-yaw ICP). Caller inverts so recon moves into CAD frame."""
+    def pcd(p):
+        c = o3d.geometry.PointCloud()
+        c.points = o3d.utility.Vector3dVector(np.asarray(p, float))
+        return c
+
+    def down(p, v=0.05, n=25000):
+        a = np.asarray(pcd(p).voxel_down_sample(v).points, float)
+        if len(a) == 0:
+            raise RuntimeError("downsample empty")
+        return a[::int(np.ceil(len(a) / n))] if len(a) > n else a
+
+    def icp(src, tgt, init, corr, it):
+        crit = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=it)
+        reg = o3d.pipelines.registration.registration_icp(
+            src, tgt, corr, init,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(), crit)
+        return np.asarray(reg.transformation, float)
+
+    cad_ds, rec_ds = down(cad_pts), down(recon_pts)
+    cad_c, rec_c = cad_ds.mean(0), rec_ds.mean(0)
+    src, tgt = pcd(cad_ds), pcd(rec_ds)
     best = None
     for yaw in (0, 90, 180, 270):
-        T_to_c = np.eye(4)
-        T_to_c[:3, 3] = -cad_c
-        T_from_c = np.eye(4)
-        T_from_c[:3, 3] = cad_c
-        T_yaw = T_from_c @ yaw_matrix(yaw) @ T_to_c
-        cad_yaw = apply_T(cad_ds, T_yaw)
-        T_init = np.eye(4)
-        T_init[:3, :3] = T_yaw[:3, :3]
-        T_init[:3, 3] = T_yaw[:3, 3] + (rec_c - cad_yaw.mean(axis=0))
-        T1 = _icp(src, tgt, T_init, 1.0, 20)
-        T2 = _icp(src, tgt, T1, 0.25, 10)
-        cad_al = apply_T(cad_ds, T2)
-        score, _, _ = mean_bidirectional_distance_cm(cad_al, rec_ds)
-        if best is None or score < best[0] - 1e-9 or (
-                abs(score - best[0]) <= 1e-9 and yaw < best[1]):
-            best = (score, yaw, T2)
+        a = np.deg2rad(yaw)
+        R = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
+        T0 = np.eye(4)
+        T0[:3, :3] = R
+        T0[:3, 3] = cad_c - R @ cad_c
+        cad_yaw = apply_T(cad_ds, T0)
+        T0[:3, 3] += rec_c - cad_yaw.mean(0)
+        T = icp(src, tgt, icp(src, tgt, T0, 1.0, 20), 0.25, 10)
+        sc, _, _ = mean_bidirectional_distance_cm(apply_T(cad_ds, T), rec_ds)
+        if best is None or sc < best[0] - 1e-9 or (abs(sc - best[0]) <= 1e-9 and yaw < best[1]):
+            best = (sc, yaw, T)
     if best is None:
-        raise RuntimeError("CAD↔recon alignment failed for all yaw seeds")
-    T_cad_to_recon = best[2]
-    det = float(np.linalg.det(T_cad_to_recon[:3, :3]))
-    if abs(det - 1.0) > 1e-3:
-        raise RuntimeError(f"non-rigid ICP rotation det={det}")
-    return T_cad_to_recon, int(best[1])
+        raise RuntimeError("CAD↔recon alignment failed")
+    if abs(np.linalg.det(best[2][:3, :3]) - 1.0) > 1e-3:
+        raise RuntimeError("non-rigid ICP rotation")
+    return best[2], int(best[1])
 
 
-def _coarse_occupancy(pts, cell_m):
-    """One centre per occupied cell on a rough grid."""
-    qi = np.unique(np.floor(np.asarray(pts, dtype=np.float64) / cell_m).astype(np.int64), axis=0)
-    return (qi.astype(np.float64) + 0.5) * cell_m
-
-
-def _overlay_cell_m(ref_centres, recon_centres, target_cells=100, lo=0.05, hi=0.12):
-    """Occupancy cell from longest plan extent / target_cells (clamped)."""
-    extent = float(np.ptp(np.vstack([ref_centres[:, :2], recon_centres[:, :2]]), axis=0).max())
-    return float(np.clip(extent / target_cells, lo, hi))
-
-
-def _stamp_squares(pts2, lo, cell, n0, n1):
-    """Integer occupancy grid: each coarse cell → exactly one grid square (no gaps)."""
-    cov = np.zeros((n1, n0), dtype=np.float32)
-    # pts are cell centres; map to integer cell indices
-    ij = np.floor((pts2 - lo) / cell).astype(np.int64)
-    m = (ij[:, 0] >= 0) & (ij[:, 0] < n0) & (ij[:, 1] >= 0) & (ij[:, 1] < n1)
-    ij = ij[m]
-    if len(ij) == 0:
-        return cov
-    flat = ij[:, 1] * n0 + ij[:, 0]
-    cov.ravel()[:] = np.bincount(flat, minlength=n0 * n1).astype(np.float32)
-    return cov
-
-
-def _panel_overlay(ax, cad, rec, dims, cell, cad_rgb, rec_rgb):
-    """Plan/elevation: shared α=1/Nmax; colors mix by relative cover (overlap → green)."""
+def _occupancy_panel(ax, cad, rec, dims, cell):
+    """Integer-grid occupancy; cover-weighted magenta/cyan mix; α shared via Nmax."""
     c2, r2 = cad[:, list(dims)], rec[:, list(dims)]
     all2 = np.vstack([c2, r2])
     lo = np.floor(all2.min(0) / cell) * cell
     hi = np.ceil(all2.max(0) / cell) * cell
     n0 = max(1, int(np.round((hi[0] - lo[0]) / cell)))
     n1 = max(1, int(np.round((hi[1] - lo[1]) / cell)))
-    cov_c = _stamp_squares(c2, lo, cell, n0, n1)
-    cov_r = _stamp_squares(r2, lo, cell, n0, n1)
-    n_max = max(float(cov_c.max()), float(cov_r.max()), 1.0)
-    a_c = np.clip(cov_c / n_max, 0.0, 1.0)
-    a_r = np.clip(cov_r / n_max, 0.0, 1.0)
+
+    def cov(pts):
+        ij = np.floor((pts - lo) / cell).astype(np.int64)
+        m = (ij[:, 0] >= 0) & (ij[:, 0] < n0) & (ij[:, 1] >= 0) & (ij[:, 1] < n1)
+        ij = ij[m]
+        out = np.zeros((n1, n0), np.float32)
+        if len(ij):
+            out.ravel()[:] = np.bincount(ij[:, 1] * n0 + ij[:, 0], minlength=n0 * n1)
+        return out
+
+    a_c, a_r = cov(c2), cov(r2)
+    n_max = max(float(a_c.max()), float(a_r.max()), 1.0)
+    a_c, a_r = a_c / n_max, a_r / n_max
     w = a_c + a_r
-    # alpha from either cloud; color = cover-weighted mix (equal → green)
-    alpha = np.clip(w, 0.0, 1.0)
-    mix = np.zeros((n1, n0, 3), dtype=np.float64)
+    alpha = np.clip(w, 0, 1)
+    rgb = np.ones((n1, n0, 3))
     m = w > 0
     for i in range(3):
-        mix[..., i] = np.where(m, (cad_rgb[i] * a_c + rec_rgb[i] * a_r) / np.maximum(w, 1e-12), 1.0)
-    rgb = np.ones((n1, n0, 3), dtype=np.float64)
-    for i in range(3):
-        rgb[..., i] = (1.0 - alpha) + mix[..., i] * alpha
-    ax.imshow(np.clip(rgb, 0, 1), origin="lower",
-              extent=[lo[0], hi[0], lo[1], hi[1]],
+        mix = np.where(m, (CAD_RGB[i] * a_c + RECON_RGB[i] * a_r) / np.maximum(w, 1e-12), 1.0)
+        rgb[..., i] = (1.0 - alpha) + mix * alpha
+    ax.imshow(np.clip(rgb, 0, 1), origin="lower", extent=[lo[0], hi[0], lo[1], hi[1]],
               interpolation="nearest", aspect="equal")
     ax.set_facecolor("white")
 
 
-def _hide_ceiling_faces(mesh, ceiling_height=CEILING_HEIGHT_M):
-    """Hide faces above floor_p1 + ceiling_height (display only; no mesh save)."""
-    m = mesh
-    if len(m.triangles) > 150000:
-        m = m.simplify_quadric_decimation(target_number_of_triangles=120000)
-    V = np.asarray(m.vertices, dtype=np.float64)
-    F = np.asarray(m.triangles, dtype=np.int64)
-    up = 2
-    floor = float(np.percentile(V[:, up], 1))
-    keep_v = V[:, up] <= floor + ceiling_height
-    keep_f = keep_v[F[:, 0]] & keep_v[F[:, 1]] & keep_v[F[:, 2]]
-    F2 = F[keep_f]
-    if len(F2) == 0:
-        raise RuntimeError("no faces left after ceiling height hide")
-    return V, F2, floor
-
-
-def _iso_axis_off(ax):
-    """Bare 3D axes: no panes, ticks, or grid."""
-    ax.set_axis_off()
-    ax.grid(False)
-    try:
-        ax.xaxis.pane.fill = False
-        ax.yaxis.pane.fill = False
-        ax.zaxis.pane.fill = False
-        ax.xaxis.pane.set_edgecolor((1, 1, 1, 0))
-        ax.yaxis.pane.set_edgecolor((1, 1, 1, 0))
-        ax.zaxis.pane.set_edgecolor((1, 1, 1, 0))
-    except Exception:
-        pass
-
-
 def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, score,
                            accuracy_mean, completeness_mean):
-    """One PNG: four equal squares — plan | elev on top; iso = bottom two (full width).
-
-    Magenta/cyan locked. Ceiling hide = floor_p1 + CEILING_HEIGHT_M (display only).
-    """
+    """Plan | elev on top; full-width isometric recon (distance-coloured) below."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -347,117 +234,106 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     from matplotlib.patches import Patch
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-    cad_rgb, rec_rgb = CAD_RGB, RECON_RGB
-    cell = _overlay_cell_m(ref_centres, recon_centres)
-    cad = _coarse_occupancy(ref_centres, cell)
-    rec = _coarse_occupancy(recon_centres, cell)
+    extent = float(np.ptp(np.vstack([ref_centres[:, :2], recon_centres[:, :2]]), 0).max())
+    cell = float(np.clip(extent / 100.0, 0.05, 0.12))
 
-    # Recon mesh only (no CAD geometry drawn). Colour by distance to CAD.
-    V, F2, _floor = _hide_ceiling_faces(mesh)
+    def coarse(p):
+        qi = np.unique(np.floor(np.asarray(p, float) / cell).astype(np.int64), axis=0)
+        return (qi.astype(float) + 0.5) * cell
+
+    cad, rec = coarse(ref_centres), coarse(recon_centres)
+
+    # Recon mesh only: ceiling height-hide, colour by distance to CAD
+    m = mesh
+    if len(m.triangles) > 150000:
+        m = m.simplify_quadric_decimation(120000)
+    V, F = np.asarray(m.vertices, float), np.asarray(m.triangles, np.int64)
+    floor = float(np.percentile(V[:, 2], 1))
+    kv = V[:, 2] <= floor + CEILING_HEIGHT_M
+    F2 = F[kv[F[:, 0]] & kv[F[:, 1]] & kv[F[:, 2]]]
+    if len(F2) == 0:
+        raise RuntimeError("no faces left after ceiling hide")
     d_cm = cKDTree(ref_centres).query(V, k=1, workers=-1)[0] * 100.0
-    d_face = d_cm[F2].mean(axis=1)
-    p95 = float(np.percentile(d_face, 95)) if len(d_face) else 1.0
-    p95 = max(p95, 1e-3)
-    # magenta (close) → cyan (far); clip outliers at p95
-    t = np.clip(d_face / p95, 0.0, 1.0)
-    fcol = cad_rgb[None, :] * (1.0 - t)[:, None] + rec_rgb[None, :] * t[:, None]
+    d_face = d_cm[F2].mean(1)
+    p95 = max(float(np.percentile(d_face, 95)), 1e-3)
+    t = np.clip(d_face / p95, 0, 1)
+    fcol = CAD_RGB * (1 - t)[:, None] + RECON_RGB * t[:, None]
 
-    # Smart full-frame zoom: recon faces inside CAD AABB (+small pad), tight
-    # data-aspect box (not unit cube) so the mesh fills the wide iso panel.
-    fc = V[F2].mean(axis=1)
+    # Zoom to recon faces inside CAD room
+    fc = V[F2].mean(1)
     clo, chi = ref_centres.min(0), ref_centres.max(0)
-    cad_span = np.maximum(chi - clo, 0.3)
-    pad = 0.08 * cad_span
-    in_room = np.all((fc >= clo - pad) & (fc <= chi + pad), axis=1)
-    if int(in_room.sum()) < 80:
-        in_room = d_face <= np.percentile(d_face, 80)
-    if int(in_room.sum()) < 30:
-        in_room = np.ones(len(F2), dtype=bool)
-    F_iso = F2[in_room]
-    fcol_iso = fcol[in_room]
-    pts_iso = V[np.unique(F_iso.ravel())]
-    plo, phi = pts_iso.min(0), pts_iso.max(0)
+    pad = 0.08 * np.maximum(chi - clo, 0.3)
+    keep = np.all((fc >= clo - pad) & (fc <= chi + pad), 1)
+    if keep.sum() < 80:
+        keep = d_face <= np.percentile(d_face, 80)
+    if keep.sum() < 30:
+        keep = np.ones(len(F2), bool)
+    F_iso, fcol_iso = F2[keep], fcol[keep]
+    pts = V[np.unique(F_iso.ravel())]
+    plo, phi = pts.min(0), pts.max(0)
     span = np.maximum(phi - plo, 0.2)
-    margin = 0.04 * span
-    lo, hi = plo - margin, phi + margin
+    lo, hi = plo - 0.04 * span, phi + 0.04 * span
 
-    # Top: plan | elev squares. Bottom: full-width iso, taller than top row.
-    S = 5.0
-    iso_h = 2.1 * S
-    gap = 0.28
-    fig_w = 2 * S + gap + 1.3
-    fig_h = S + gap + iso_h + 1.3
+    S, iso_h, gap = 5.0, 2.1 * 5.0, 0.28
+    fig_w, fig_h = 2 * S + gap + 1.3, S + gap + iso_h + 1.3
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
     ml, mb = 0.55 / fig_w, 0.72 / fig_h
-    sx, sy = S / fig_w, S / fig_h
-    gx, gy = gap / fig_w, gap / fig_h
+    sx, sy, gx, gy = S / fig_w, S / fig_h, gap / fig_w, gap / fig_h
     ih = iso_h / fig_h
     x0, y_iso = ml, mb
     y_top = mb + ih + gy
-    ax_plan = fig.add_axes([x0, y_top, sx, sy])
-    ax_elev = fig.add_axes([x0 + sx + gx, y_top, sx, sy])
-    ax_iso = fig.add_axes([x0, y_iso, 2 * sx + gx, ih], projection="3d",
-                          computed_zorder=False)
+    ax_p = fig.add_axes([x0, y_top, sx, sy])
+    ax_e = fig.add_axes([x0 + sx + gx, y_top, sx, sy])
+    ax_i = fig.add_axes([x0, y_iso, 2 * sx + gx, ih], projection="3d", computed_zorder=False)
 
-    _panel_overlay(ax_plan, cad, rec, (0, 1), cell, cad_rgb, rec_rgb)
-    ax_plan.set_title("plan x/y")
-    ax_plan.set_xlabel("x")
-    ax_plan.set_ylabel("y")
+    _occupancy_panel(ax_p, cad, rec, (0, 1), cell)
+    ax_p.set_title("plan x/y"); ax_p.set_xlabel("x"); ax_p.set_ylabel("y")
+    _occupancy_panel(ax_e, cad, rec, (0, 2), cell)
+    ax_e.set_title("elevation x/z"); ax_e.set_xlabel("x"); ax_e.set_ylabel("z")
 
-    _panel_overlay(ax_elev, cad, rec, (0, 2), cell, cad_rgb, rec_rgb)
-    ax_elev.set_title("elevation x/z")
-    ax_elev.set_xlabel("x")
-    ax_elev.set_ylabel("z")
-
-    # Recon geometry only — no CAD mesh
     coll = Poly3DCollection(V[F_iso], linewidths=0, edgecolors="none")
     coll.set_facecolor(fcol_iso)
-    ax_iso.add_collection3d(coll)
-    ax_iso.set_xlim(lo[0], hi[0])
-    ax_iso.set_ylim(lo[1], hi[1])
-    ax_iso.set_zlim(lo[2], hi[2])
+    ax_i.add_collection3d(coll)
+    ax_i.set_xlim(lo[0], hi[0]); ax_i.set_ylim(lo[1], hi[1]); ax_i.set_zlim(lo[2], hi[2])
     try:
-        ax_iso.set_box_aspect((hi - lo) / max(float((hi - lo).max()), 1e-6))
+        ax_i.set_box_aspect((hi - lo) / max(float((hi - lo).max()), 1e-6))
     except Exception:
         pass
-    ax_iso.view_init(elev=30, azim=-48)
+    ax_i.view_init(30, -48)
     try:
-        ax_iso.set_proj_type("ortho")
+        ax_i.set_proj_type("ortho")
     except Exception:
         pass
-    _iso_axis_off(ax_iso)
-    ax_iso.set_facecolor("white")
-    ax_iso.set_title(
-        f"isometric recon · distance to CAD  "
-        f"(ceiling floor+{CEILING_HEIGHT_M:.1f}m) · p95={p95:.1f} cm",
-        fontsize=10, pad=4)
+    ax_i.set_axis_off()
+    ax_i.grid(False)
+    ax_i.set_facecolor("white")
+    ax_i.set_title(
+        f"isometric recon · distance to CAD  (ceiling floor+{CEILING_HEIGHT_M:.1f}m) · "
+        f"p95={p95:.1f} cm", fontsize=10, pad=4)
 
     cax = fig.add_axes([x0 + 2 * sx + gx + 0.012, y_iso + 0.06 * ih, 0.014, 0.88 * ih])
-    cmap = LinearSegmentedColormap.from_list("near_far", [CAD_RGB, RECON_RGB])
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, p95))
+    sm = plt.cm.ScalarMappable(
+        cmap=LinearSegmentedColormap.from_list("nf", [CAD_RGB, RECON_RGB]),
+        norm=plt.Normalize(0, p95))
     sm.set_array([])
-    cb = fig.colorbar(sm, cax=cax)
-    cb.set_label("distance to CAD (cm)", fontsize=9)
-
-    fig.legend([Patch(color=cad_rgb), Patch(color=rec_rgb)],
+    fig.colorbar(sm, cax=cax).set_label("distance to CAD (cm)", fontsize=9)
+    fig.legend([Patch(color=CAD_RGB), Patch(color=RECON_RGB)],
                ["CAD (magenta)", "recon (cyan)"],
-               loc="lower center", ncol=2, bbox_to_anchor=(0.5, 0.01),
-               frameon=False)
+               loc="lower center", ncol=2, bbox_to_anchor=(0.5, 0.01), frameon=False)
     fig.suptitle(
         f"{scene_id}  {SCORE_KEY}={score:.2f}  "
-        f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})  "
-        f"cell={cell:.2f}m",
+        f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})  cell={cell:.2f}m",
         y=0.97)
     fig.savefig(path, dpi=160, facecolor="white")
     plt.close(fig)
 
 
-def atomic_write_bytes(path, data):
+def atomic_write_text(path, text):
     d = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(prefix=".tmp_", dir=d)
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
         os.replace(tmp, path)
     except Exception:
         try:
@@ -467,24 +343,19 @@ def atomic_write_bytes(path, data):
         raise
 
 
-def atomic_write_text(path, text):
-    atomic_write_bytes(path, text.encode("utf-8"))
-
-
 def score_scan(scan_id, config_path=None):
     cfg = load_config(config_path)
     if cfg.get("metric") != METRIC:
         raise RuntimeError(f"config metric {cfg.get('metric')!r} != {METRIC!r}")
-    scene_num = int(scan_id[5:9])
-    sc = scene_config(cfg, scene_num)
-    if sc.get("reference_sha256") is None or sc.get("visible_voxels_sha256") is None:
-        raise RuntimeError("geometry reference not finalized; build CAD/visibility first")
-    cad_path = sc["cad_ply"]
-    vis_path = sc["visible_voxels"]
-    if file_sha256(cad_path) != sc["reference_sha256"]:
-        raise RuntimeError("CAD hash mismatch against geometry_reference.yaml")
-    if file_sha256(vis_path) != sc["visible_voxels_sha256"]:
-        raise RuntimeError("visible voxels hash mismatch against geometry_reference.yaml")
+    sc = scene_config(cfg, int(scan_id[5:9]))
+    for key, path, label in (
+        ("reference_sha256", sc["cad_ply"], "CAD"),
+        ("visible_voxels_sha256", sc["visible_voxels"], "visible voxels"),
+    ):
+        if sc.get(key) is None:
+            raise RuntimeError("geometry reference not finalized")
+        if file_sha256(path) != sc[key]:
+            raise RuntimeError(f"{label} hash mismatch against geometry_reference.yaml")
 
     root = os.path.join(SCANS_DIR, scan_id)
     mesh_path = os.path.join(root, f"{scan_id}_vh_clean_2.ply")
@@ -492,54 +363,43 @@ def score_scan(scan_id, config_path=None):
     if not os.path.isfile(mesh_path):
         raise FileNotFoundError(mesh_path)
 
-    # Recon: ScanNet axisAlignment only (part of scan metadata), then voxelize.
     mesh = load_mesh(mesh_path)
     A = parse_axis_alignment(txt_path) if os.path.isfile(txt_path) else np.eye(4)
     mesh_a = transform_mesh(mesh, A)
-    voxel_m = _voxel_size_m(cfg)
+    voxel_m = float(cfg["voxel_mm"]) / 1000.0
     recon_centres = recon_surface_centres(mesh_a, voxel_m, cfg.get("max_surface_voxels"))
 
-    # CAD stays in original frame (visible surface voxels).
-    origin = np.asarray(sc["grid_origin_m"], dtype=np.float64)
-    cad_mesh = load_mesh(cad_path)
+    origin = np.asarray(sc["grid_origin_m"], float)
+    cad_mesh = load_mesh(sc["cad_ply"])
     cad_idx = surface_voxels(cad_mesh, origin, voxel_m, sc.get("bounds_min_m"),
                              sc.get("bounds_max_m"), cfg.get("max_surface_voxels"))
     cad_set = set(map(tuple, cad_idx.tolist()))
-    vis = np.load(vis_path)
-    vis_idx = np.array([i for i in vis["indices"].astype(np.int32)
+    vis_idx = np.array([i for i in np.load(sc["visible_voxels"])["indices"].astype(np.int32)
                         if tuple(i) in cad_set], dtype=np.int32)
     if len(vis_idx) == 0:
         raise RuntimeError("empty visible CAD cell set after intersection")
     cad_centres = voxel_centres(vis_idx, origin, voxel_m)
 
-    # Temporary rigid recon→CAD (invert CAD→recon ICP). In-memory only.
-    T_cad_to_recon, yaw0 = align_cad_to_recon(cad_centres, recon_centres)
-    T_recon_to_cad = np.linalg.inv(T_cad_to_recon)
-    recon_centres_cad = apply_T(recon_centres, T_recon_to_cad)
-    mesh_cad = transform_mesh(mesh_a, T_recon_to_cad)
-
-    score, accuracy_mean, completeness_mean = mean_bidirectional_distance_cm(
-        cad_centres, recon_centres_cad)
+    T_c2r, yaw0 = align_cad_to_recon(cad_centres, recon_centres)
+    T_r2c = np.linalg.inv(T_c2r)
+    recon_cad = apply_T(recon_centres, T_r2c)
+    mesh_cad = transform_mesh(mesh_a, T_r2c)
+    score, acc, comp = mean_bidirectional_distance_cm(cad_centres, recon_cad)
 
     recon_dir = os.path.join(root, "recon")
     os.makedirs(recon_dir, exist_ok=True)
-    png_rel = "recon/cad_comparison.png"
-    png_path = os.path.join(root, png_rel)
+    png_rel, png_path = "recon/cad_comparison.png", os.path.join(root, "recon/cad_comparison.png")
     yaml_path = os.path.join(recon_dir, "geometry_score.yaml")
-    # drop legacy separate isometric if present
-    legacy_iso = os.path.join(recon_dir, "cad_distance_isometric.png")
-
-    fd1, tmp_png = tempfile.mkstemp(prefix=".tmp_cmp_", suffix=".png", dir=recon_dir)
-    os.close(fd1)
+    fd, tmp_png = tempfile.mkstemp(prefix=".tmp_cmp_", suffix=".png", dir=recon_dir)
+    os.close(fd)
     try:
-        render_geometry_report(
-            tmp_png, cad_centres, recon_centres_cad, mesh_cad, scan_id,
-            score, accuracy_mean, completeness_mean)
+        render_geometry_report(tmp_png, cad_centres, recon_cad, mesh_cad, scan_id,
+                               score, acc, comp)
         doc = {
             "metric": METRIC,
             SCORE_KEY: float(round(score, 6)),
-            "accuracy_mean_cm": float(round(accuracy_mean, 6)),
-            "completeness_mean_cm": float(round(completeness_mean, 6)),
+            "accuracy_mean_cm": float(round(acc, 6)),
+            "completeness_mean_cm": float(round(comp, 6)),
             "scene": scan_id,
             "reference_sha256": sc["reference_sha256"],
             "visible_voxels_sha256": sc["visible_voxels_sha256"],
@@ -550,15 +410,16 @@ def score_scan(scan_id, config_path=None):
                 "reconstruction_saved": False,
                 "axis_alignment_applied_to_recon": True,
                 "initial_yaw_deg": int(yaw0),
-                "recon_to_cad": T_recon_to_cad.reshape(-1).astype(float).tolist(),
+                "recon_to_cad": T_r2c.reshape(-1).astype(float).tolist(),
             },
             "comparison": png_rel,
         }
         atomic_write_text(yaml_path, yaml.safe_dump(doc, sort_keys=False))
         os.replace(tmp_png, png_path)
-        if os.path.isfile(legacy_iso):
+        legacy = os.path.join(recon_dir, "cad_distance_isometric.png")
+        if os.path.isfile(legacy):
             try:
-                os.unlink(legacy_iso)
+                os.unlink(legacy)
             except OSError:
                 pass
     except Exception:
@@ -568,14 +429,12 @@ def score_scan(scan_id, config_path=None):
             pass
         raise
 
-    print(f"[geometry] {scan_id} {SCORE_KEY}={score:.2f} "
-          f"(acc={accuracy_mean:.2f} comp={completeness_mean:.2f})")
+    print(f"[geometry] {scan_id} {SCORE_KEY}={score:.2f} (acc={acc:.2f} comp={comp:.2f})")
     return doc
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="CAD mean bidirectional distance score for a ScanNet-style scan")
+    ap = argparse.ArgumentParser(description="CAD mean bidirectional distance score")
     ap.add_argument("--scan-id", required=True)
     ap.add_argument("--reference-config", default=DEFAULT_CONFIG)
     args = ap.parse_args()
