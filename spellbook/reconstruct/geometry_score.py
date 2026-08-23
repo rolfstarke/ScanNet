@@ -243,23 +243,23 @@ def _coarse_occupancy(pts, cell_m):
     return (qi.astype(np.float64) + 0.5) * cell_m
 
 
-def _overlay_cell_m(ref_centres, recon_centres, target_cells=64, lo=0.08, hi=0.25):
-    """cell ≈ longest plan extent / target_cells (clamped). Square side = cell."""
+def _overlay_cell_m(ref_centres, recon_centres, target_cells=100, lo=0.05, hi=0.12):
+    """Occupancy cell from longest plan extent / target_cells (clamped)."""
     extent = float(np.ptp(np.vstack([ref_centres[:, :2], recon_centres[:, :2]]), axis=0).max())
     return float(np.clip(extent / target_cells, lo, hi))
 
 
-def _stamp_squares(pts2, lo, hi, half, pixel):
-    """Coverage image: each point adds 1 over an axis-aligned square."""
+def _stamp_squares(pts2, lo, hi, half_xy, pixel):
+    """Coverage image: axis-aligned rectangles (half-extents per axis)."""
     w = int(np.ceil((hi[0] - lo[0]) / pixel)) + 1
     h = int(np.ceil((hi[1] - lo[1]) / pixel)) + 1
     cov = np.zeros((h, w), dtype=np.float32)
-    hs = half / pixel
+    hx, hy = half_xy[0] / pixel, half_xy[1] / pixel
     for x, y in pts2:
         c = (x - lo[0]) / pixel
         r = (y - lo[1]) / pixel
-        r0, r1 = max(0, int(np.floor(r - hs))), min(h, int(np.ceil(r + hs)))
-        c0, c1 = max(0, int(np.floor(c - hs))), min(w, int(np.ceil(c + hs)))
+        r0, r1 = max(0, int(np.floor(r - hy))), min(h, int(np.ceil(r + hy)))
+        c0, c1 = max(0, int(np.floor(c - hx))), min(w, int(np.ceil(c + hx)))
         if r0 < r1 and c0 < c1:
             cov[r0:r1, c0:c1] += 1.0
     return cov
@@ -267,7 +267,11 @@ def _stamp_squares(pts2, lo, hi, half, pixel):
 
 def render_comparison(path, ref_centres, recon_centres, scene_id, score,
                       accuracy_mean, completeness_mean):
-    """CAD yellow + recon cyan. Rough occupancy → square stamps, α=1/N_max."""
+    """CAD yellow + recon cyan. Rough occupancy → square stamps, α=1/N_max.
+
+    Stamp half-extent per axis = 0.45 * min(cell, view_axis_extent / 48) so
+    elevation (short vertical span) gets smaller stamps than plan.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -276,8 +280,7 @@ def render_comparison(path, ref_centres, recon_centres, scene_id, score,
     cad_rgb = np.array([1.0, 0.92, 0.05])
     rec_rgb = np.array([0.05, 0.85, 0.90])
     cell = _overlay_cell_m(ref_centres, recon_centres)
-    half = 0.5 * cell
-    pixel = max(cell / 8.0, 0.015)
+    pixel = max(cell / 10.0, 0.012)
     cad = _coarse_occupancy(ref_centres, cell)
     rec = _coarse_occupancy(recon_centres, cell)
 
@@ -286,6 +289,10 @@ def render_comparison(path, ref_centres, recon_centres, scene_id, score,
                             (axes[1], (0, 2), "elevation x/z")):
         c2, r2 = cad[:, list(dims)], rec[:, list(dims)]
         all2 = np.vstack([c2, r2])
+        ext = np.maximum(np.ptp(all2, axis=0), cell)
+        # per-axis stamp size: never larger than cell; shrink on short axes (elev z)
+        half = 0.45 * np.minimum(cell, ext / 48.0)
+        half = np.maximum(half, pixel)  # at least one pixel
         lo, hi = all2.min(0) - half, all2.max(0) + half
         cov_c = _stamp_squares(c2, lo, hi, half, pixel)
         cov_r = _stamp_squares(r2, lo, hi, half, pixel)
