@@ -26,7 +26,7 @@ SCORE_KEY = "mean_bidirectional_distance_cm"
 # Magenta + cyan: equal mix → blue/purple; near=magenta, far=cyan
 CAD_RGB = np.array([0.92, 0.12, 0.72])
 RECON_RGB = np.array([0.08, 0.78, 0.90])
-CEILING_HEIGHT_M = 2.0  # hide verts above floor_p1 + this (display only)
+CEILING_HEIGHT_M = 2.5  # hide verts above floor_p1 + this (display only)
 
 
 def load_config(path=None):
@@ -336,12 +336,14 @@ def _iso_axis_off(ax):
 
 def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, score,
                            accuracy_mean, completeness_mean):
-    """One PNG as four equal squares: plan | elev on top; iso = bottom two squares."""
+    """One PNG: four equal squares — plan | elev on top; iso = bottom two (full width).
+
+    Magenta/cyan locked. Ceiling hide = floor_p1 + CEILING_HEIGHT_M (display only).
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
-    from matplotlib.gridspec import GridSpec
     from matplotlib.patches import Patch
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -350,7 +352,7 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     cad = _coarse_occupancy(ref_centres, cell)
     rec = _coarse_occupancy(recon_centres, cell)
 
-    V, F2, floor = _hide_ceiling_faces(mesh)
+    V, F2, _floor = _hide_ceiling_faces(mesh)
     d_cm = cKDTree(ref_centres).query(V, k=1, workers=-1)[0] * 100.0
     d_face = d_cm[F2].mean(axis=1)
     p95 = float(np.percentile(d_face, 95)) if len(d_face) else 1.0
@@ -358,31 +360,45 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     t = np.clip(d_face / p95, 0.0, 1.0)
     fcol = cad_rgb[None, :] * (1.0 - t)[:, None] + rec_rgb[None, :] * t[:, None]
 
-    # Four equal unit squares: (0,0) plan (0,1) elev (1,:) iso = 2 squares
-    fig = plt.figure(figsize=(12, 12), facecolor="white")
-    gs = GridSpec(2, 2, figure=fig, height_ratios=[1.0, 1.0], width_ratios=[1.0, 1.0],
-                  hspace=0.14, wspace=0.14,
-                  left=0.06, right=0.98, top=0.92, bottom=0.07)
+    # Explicit figure coords so 3D axes fill the bottom double-square (GridSpec
+    # leaves Axes3D padded and looking small).
+    # Layout (figure fraction):
+    #   top row:  two equal squares  [plan] [elev]
+    #   bottom:   one rect = two squares wide, one tall  [==== iso ====]
+    fig_w = 12.0
+    fig = plt.figure(figsize=(fig_w, fig_w), facecolor="white")
+    left, right = 0.06, 0.99
+    bottom, top = 0.09, 0.91
+    gap_x, gap_y = 0.04, 0.06
+    usable_w = right - left
+    usable_h = top - bottom
+    row_h = (usable_h - gap_y) / 2.0
+    col_w = (usable_w - gap_x) / 2.0
+    y_top = bottom + row_h + gap_y
+    y_bot = bottom
 
-    ax_plan = fig.add_subplot(gs[0, 0])
+    ax_plan = fig.add_axes([left, y_top, col_w, row_h])
+    ax_elev = fig.add_axes([left + col_w + gap_x, y_top, col_w, row_h])
+    # iso: full width of both top panels, same height as one row
+    ax_iso = fig.add_axes([left, y_bot, usable_w, row_h], projection="3d",
+                          computed_zorder=False)
+
     _panel_overlay(ax_plan, cad, rec, (0, 1), cell, cad_rgb, rec_rgb)
-    ax_plan.set_title("1  plan x/y")
+    ax_plan.set_title("plan x/y")
     ax_plan.set_xlabel("x")
     ax_plan.set_ylabel("y")
 
-    ax_elev = fig.add_subplot(gs[0, 1])
     _panel_overlay(ax_elev, cad, rec, (0, 2), cell, cad_rgb, rec_rgb)
-    ax_elev.set_title("2  elevation x/z")
+    ax_elev.set_title("elevation x/z")
     ax_elev.set_xlabel("x")
     ax_elev.set_ylabel("z")
 
-    ax_iso = fig.add_subplot(gs[1, :], projection="3d", computed_zorder=False)
     coll = Poly3DCollection(V[F2], linewidths=0, edgecolors="none")
     coll.set_facecolor(fcol)
     ax_iso.add_collection3d(coll)
     clo, chi = ref_centres.min(0), ref_centres.max(0)
     c = 0.5 * (clo + chi)
-    r = 0.55 * float(np.max(chi - clo)) + 0.3
+    r = 0.52 * float(np.max(chi - clo)) + 0.25
     ax_iso.set_xlim(c[0] - r, c[0] + r)
     ax_iso.set_ylim(c[1] - r, c[1] + r)
     ax_iso.set_zlim(c[2] - r, c[2] + r)
@@ -398,20 +414,23 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     _iso_axis_off(ax_iso)
     ax_iso.set_facecolor("white")
     ax_iso.set_title(
-        f"3–4  isometric recon  (ceiling hide floor+{CEILING_HEIGHT_M:.1f}m)  "
+        f"isometric recon  (ceiling hide floor+{CEILING_HEIGHT_M:.1f}m)  "
         f"p95={p95:.1f} cm",
-        fontsize=11, pad=2)
+        fontsize=11, pad=4)
 
+    # Colorbar in a thin strip to the right of iso (does not shrink the 2×1 block)
+    cax = fig.add_axes([right - 0.018, y_bot + 0.04 * row_h, 0.012, row_h * 0.92])
     cmap = LinearSegmentedColormap.from_list("cad_recon", [CAD_RGB, RECON_RGB])
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, p95))
     sm.set_array([])
-    cb = fig.colorbar(sm, ax=ax_iso, fraction=0.03, pad=0.01, shrink=0.9)
-    cb.set_label("distance to CAD (cm)")
+    cb = fig.colorbar(sm, cax=cax)
+    cb.set_label("distance to CAD (cm)", fontsize=9)
 
     fig.legend([Patch(color=cad_rgb), Patch(color=rec_rgb),
                 Patch(color=0.5 * (cad_rgb + rec_rgb))],
                ["CAD / near (magenta)", "recon / far (cyan)", "overlap"],
-               loc="lower center", ncol=3, bbox_to_anchor=(0.5, 0.005))
+               loc="lower center", ncol=3, bbox_to_anchor=(0.5, 0.01),
+               frameon=False)
     fig.suptitle(
         f"{scene_id}  {SCORE_KEY}={score:.2f}  "
         f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})  "
