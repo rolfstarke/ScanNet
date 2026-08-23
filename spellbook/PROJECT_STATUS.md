@@ -80,8 +80,7 @@ worktrees under `~/.local/share/opencode/worktree/<projectId>/debug/`:
   with its 83 subagent children).
 
 Worktree sessions keep bare titles and their stored directory is the worktree (relocated via
-opencode's control-plane move API after the plugin fork). Executed procedure and verification:
-`spellbook/archive/reconstruction/worktree_session_topology_{plan,audit}.md`.
+opencode's control-plane move API after the plugin fork).
 
 ### Data Layout (`/data/scannet/` — scans/ stays official, artifacts outside)
 ```
@@ -96,23 +95,26 @@ opencode's control-plane move API after the plugin fork). Executed procedure and
 ├── predictions/<Benchmark>/<run-id>/<model>/   # official submission root (zippable as-is)
 │   ├── sceneXXXX_YY.txt                       # "predicted_masks/<scene>_NNN.txt <label> <conf>"
 │   └── predicted_masks/<scene>_NNN.txt
+├── custom/
+│   ├── raw/scene900X.svo2                   # SVO symlinks (9004-9007, 9009)
+│   └── reference/                           # scene9004 CAD PLY + visible-voxel NPZ
 ├── derived/
-│   ├── ground_truth/<Benchmark>/<scene>.txt   # flat per-vertex label*1000+instance
-│   ├── evaluations/<Benchmark>/<run-id>/      # result CSVs + <model>.tasks completion markers
-│   └── legacy/                                # pre-migration results (18-class valid, 189-class invalid per #12)
-└── v2/scannetv2-labels.combined.tsv           # label map (raw_category -> nyu40id | id)
+│   ├── ground_truth/<Benchmark>/<scene>.txt
+│   ├── evaluations/<Benchmark>/<run-id>/    # result CSVs + <model>.tasks
+│   ├── reconstruction/frames/sceneNNNN/frames/   # shared SVO frame pools
+│   └── locks/{gpus,reconstruction,scans}/  # GPU + scan/frame flock leases
+└── v2/scannetv2-labels.combined.tsv
 ```
 
-### Custom scans (9000-range; SVO symlinks in `/data/scannet/custom/raw/<scene>.svo2`)
+### Custom scans (9000-range)
 ```
-/data/scannet/scans/scene9009_00/             # _00 zed, _01 metashape, _02 rtabmap, _03 isaac,
-│   scene9009_00.sens/.txt/_vh_clean*.ply/    #   _04 open3d, _05 bundlefusion
-│   _vh_clean_2.0.010000.segs.json
-└── recon/                                    # non-ScanNet extras: frames (symlink), qc.yaml,
-    ├── engine_native.ply mesh_aligned.ply    #   cmdline.txt, svo_path.txt, final_poses.npy
-    └── logs/                                 #   per-task logs
-/data/scannet/derived/reconstruction/frames/<scene>/   # shared per-scene extraction (once per SVO)
-/data/scannet/custom/raw/scene900X.svo2                # symlinks to recordings (9004-9007, 9009)
+/data/scannet/scans/scene9004_40/            # tens=engine (0 zed … 4 open3d … 5 bundlefusion),
+│   *.sens/.txt/_vh_clean*.ply/.segs.json    # units=run 0-9; scene9004 keeps ten slots/engine
+└── recon/
+    ├── frames -> derived/.../scene9004/frames   # symlink to shared pool
+    ├── geometry_score.yaml + cad_comparison.png # scene9004 only
+    ├── engine_native.ply mesh_aligned.ply final_poses.npy
+    └── cmdline.txt svo_path.txt
 ```
 
 ### Scenes (20 official val scenes, ~2.5GB each)
@@ -156,7 +158,7 @@ Zed/open3d are local-pose baselines; multiroom drift and density remain tracked 
 3. **Prediction output**: official ScanNet submission layout, one directory per (benchmark, run, model): `/data/scannet/predictions/<Benchmark>/<run-id>/<model>/` with `<scene>.txt` + `predicted_masks/<scene>_NNN.txt`. Directly zippable as a benchmark submission; runs never overwrite each other (#16).
 4. **Label ids**: real NYU40 ids (ScanNet20) resp. raw `id`-column ids (ScanNet200, 198 classes = 200 minus wall/floor) from ScanNet's own constants, derived in `benchmark.py` as the single source of truth; unknown class names raise (see #1, #12).
 5. **Benchmark protocol**: `settings.yaml` selects the default backend (ScanNet20 = official evaluator ported in place to Python 3; ScanNet200 = port of the benchmark author's evaluator, since ScanNet/ScanNet publishes no ScanNet200 instance evaluator). `--benchmark` overrides; `--classes` is for custom (non-benchmark) prediction only.
-6. **GPU scheduling (automatic)**: `settings.yaml gpu_pool` (`[1,2,3,4]`) is the only managed GPU list; `utils/gpu.py` leases a pool GPU via persistent `flock` lock files under `<scannet_root>/derived/locks/gpus/`, held for the whole task (descriptor forwarded to GPU children with `pass_fds`, kernel-released on crash). **Physical GPU 0 is user-reserved — Spellbook never locks, selects, or initializes it.** No manual `--gpu` exists anywhere; Open3D's legacy TSDF is CPU-only and takes no lease. ZED is disabled because its SDK default-device path would use GPU 0 (#18, #29).
+6. **GPU scheduling (automatic)**: `settings.yaml gpu_pool` (`[1,2,3,4]`) is the only managed GPU list; `utils/gpu.py` leases a pool GPU via persistent `flock` lock files under `<scannet_root>/derived/locks/gpus/`, held for the whole task (descriptor forwarded to GPU children with `pass_fds`, kernel-released on crash). **Physical GPU 0 is user-reserved — Spellbook never locks, selects, or initializes it.** No manual `--gpu` exists anywhere; Open3D's legacy TSDF is CPU-only and takes no lease. Frame extraction uses the same pool via `--extract-frames`. The ZED reconstruction engine remains blocked until remapping is validated (#29).
 7. **Adapter metadata**: each engine adapter declares `GPU_POLICY` (`managed`/`cpu`/`blocked`), `SERIAL`, `preflight()` (runtime presence check) and `gpu_check()` (native distribution probe); `batch.py` and `--gpu-check` consume these instead of duplicated constants.
 8. **Evaluation**: flat per-vertex GT encoding via `evaluate.py export-gt` (ScanNet's own export tool is inconsistent with its evaluator, see #8); evaluators ported to Python 3 with edge-case fix (#8); `evaluate.py evaluate` dispatches per benchmark with pre-flight validation (#11).
 9. **Custom scan ids**: `scene90NN_MM` (9000-range unused by ScanNet v2); tens digit = engine, units digit = run 0-9 (scene9004 keeps ten slots per engine with lowest-score eviction; other scenes replace run 0). SVO discovery by filename (`custom/raw/scene<NNNN>.svo2`).
