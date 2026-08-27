@@ -7,7 +7,9 @@ MLIB_EXCEPTION("unkown sensor id") for any s_sensorIdx != 1, so the
 SensorDataReader (.sens) path is dead code in this build and CANNOT be fed.
 
 Configs are ScanNet's authoritative files, patched minimally:
-  s_SDFVoxelSize 0.010f -> 0.004f   (the plan's single fidelity deviation)
+  s_SDFVoxelSize stays canonical 0.010f (ScanNet's public BundleFusion stage;
+  the follow-up proprietary 4 mm VoxelHashing improve stage is not available
+  on Linux, so this is the full publicly reproducible pipeline)
   s_sensorIdx 8 -> 1                (fork requires PrimeSense; .sens unreachable)
   s_cameraIntrinsicFx/Fy/Cx/Cy appended (ScanNet's file lacks them; the fork's
   PrimeSenseSensor reads them and would default them to 0.0, making the
@@ -104,9 +106,9 @@ def _png_size(path):
 
 
 def _patch_app_config(text, fx, fy, cx, cy):
-    patched = re.sub(r"s_SDFVoxelSize\s*=\s*0\.010f;", "s_SDFVoxelSize = 0.004f;", text)
-    if "s_SDFVoxelSize = 0.004f" not in patched:
-        raise RuntimeError("s_SDFVoxelSize patch did not apply")
+    if "s_SDFVoxelSize = 0.010f;" not in text:
+        raise RuntimeError("canonical config lost s_SDFVoxelSize = 0.010f")
+    patched = text
     patched = re.sub(r"s_sensorIdx\s*=\s*8;", "s_sensorIdx = 1;", patched)
     if "s_sensorIdx = 1;" not in patched:
         raise RuntimeError("s_sensorIdx patch did not apply")
@@ -220,11 +222,16 @@ def reconstruct(work, root, gpu=None, lease_fd=None):
             f.write(app_cfg)
         shutil.copy2(_BUNDLE_CFG_SRC, os.path.join(bf_in, "zParametersBundlingScanNet.txt"))
 
+        log_dir = os.path.join(work, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "zParametersScanNet.effective.txt"), "w") as f:
+            f.write(app_cfg)
+        shutil.copy2(_BUNDLE_CFG_SRC,
+                     os.path.join(log_dir, "zParametersBundlingScanNet.effective.txt"))
+
         print(f"[bundlefusion] {len(names)} frames, K@640x480 = "
               f"{fx * sx:.3f}/{fy * sy:.3f} f, {cx * sx:.1f}/{cy * sy:.1f} c, gpu={gpu}")
         res = _run_docker(bf_in, bf_out, gpu, lease_fd)
-        log_dir = os.path.join(work, "logs")
-        os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "bundlefusion.log")
         with open(log_path, "w") as f:
             f.write(res.stdout or "")
