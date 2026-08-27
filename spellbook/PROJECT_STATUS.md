@@ -66,7 +66,7 @@ spellbook/reconstruct/
     ├── metashape.py          # Metashape Pro (managed GPU, serial, license)
     ├── rtabmap.py            # RTAB-Map in podman (managed GPU, reprocess + loop closures)
     ├── isaac.py              # cuVSLAM + Nvblox in podman (managed GPU, serial) — see #22
-    └── bundlefusion.py       # ScanNet's reference engine in docker (managed GPU, 4 mm)
+    └── bundlefusion.py       # ScanNet's reference engine in docker (managed GPU, canonical 10 mm)
 ```
 
 ### Worktrees (parallel engine debugging + prediction layout)
@@ -145,7 +145,7 @@ Per-model integration issues: #2 (openyolo3d intrinsics), #3 (open3dis rescale),
 |---|---|---|---|
 | zed | ZED SDK `.area` two-pass tracking | shared Open3D TSDF, 2 cm voxel (deviation) | **blocked** — SDK default-device path would use user-reserved GPU 0 (#29) |
 | open3d | Stage A ZED tracking poses | shared Open3D TSDF, 2 cm voxel (deviation) | pyzed 5.4 |
-| bundlefusion | BundleFusion global BA (docker) | BundleFusion 4 mm TSDF | docker `bundlefusion:latest` |
+| bundlefusion | BundleFusion global BA (docker) | BundleFusion 10 mm TSDF (canonical public stage; proprietary 4 mm improve stage unavailable) | docker `bundlefusion:latest` |
 | metashape | Metashape SfM + BA (keyframe priors) | Metashape depth maps | `/data/zed-metashape` (node-locked, serialized) |
 | rtabmap | RTAB-Map graph-optimized | RTAB-Map textured mesh | podman `localhost/zed-rtabmap:jazzy` |
 | isaac | cuVSLAM | Nvblox 4 mm TSDF | podman `zed-isaac-nvblox:spellbook` (see #22) |
@@ -227,7 +227,7 @@ Class lists: derived in `spellbook/evaluation/benchmark.py` from `BenchmarkScrip
 1. Investigate OpenIns3D's ScanNet200 collapse / anomaly scenes — #13.
 2. Hardening: atomic/resumable prediction outputs #16, batch supervision #17, Open3DIS tracker race #15, env reproducibility #14.
 3. Optional: extend from 20 to the full 312-scene val split once hardening is in place.
-4. Engine debugging (manual, per engine): worktrees consume shared frames from main; score scene9004 via `geometry_score`. Verify never-run engines (bundlefusion, metashape, rtabmap, isaac #22) against #25. Frames for 9004/9009 are in the shared pool.
+4. Engine debugging (manual, per engine): worktrees consume shared frames from main; score scene9004 via `geometry_score`. Verify remaining engines (metashape, rtabmap, isaac #22) against #25; bundlefusion verified 2026-08-27 — untuned canonical 10 mm baseline is mechanically valid, quality gaps tracked in #25. Frames for 9004/9009 are in the shared pool.
 5. ZED engine still blocked (#29); frame extraction multi-GPU path is live via `--extract-frames`. Validate remapping for the zed reconstruction engine itself.
 6. Isaac: build `zed-isaac-nvblox:spellbook` from public Isaac debs (no NGC credentials) and switch off the broken CDI flag — #22.
 7. Optional: 4 mm re-integration needs a working CUDA Open3D build (tensor VoxelBlockGrid broken in the installed 0.19; legacy volume at 4 mm hits ~185 GB RSS) — #31.
