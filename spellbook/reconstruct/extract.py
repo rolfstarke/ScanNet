@@ -43,13 +43,13 @@ def write_sens(path, camera_to_world, color_bytes, depth_bytes, color_ts, depth_
         f.write(struct.pack("<I", 4))
         f.write(struct.pack("<Q", len(name)) + name)
         for m in (_m4(K), np.eye(4), _m4(K), np.eye(4)):
-            f.write(struct.pack("<16f", *m.T.ravel()))
+            f.write(struct.pack("<16f", *m.ravel()))
         f.write(struct.pack("<ii", _COLOR_JPEG, _DEPTH_ZLIB))
         f.write(struct.pack("<IIII", width, height, width, height))
         f.write(struct.pack("<f", _DEPTH_SHIFT))
         f.write(struct.pack("<Q", n))
         for ctw, ct, dt, cb, db in zip(camera_to_world, color_ts, depth_ts, color_bytes, depth_bytes):
-            f.write(struct.pack("<16f", *ctw.T.ravel()))
+            f.write(struct.pack("<16f", *ctw.ravel()))
             f.write(struct.pack("<QQ", int(ct), int(dt)))
             f.write(struct.pack("<QQ", len(cb), len(db)))
             f.write(cb)
