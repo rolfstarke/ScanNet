@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import sys
@@ -12,7 +13,8 @@ sys.path.insert(0, _SPELLBOOK)
 
 from evaluation.benchmark import BENCHMARKS  # noqa: E402
 from evaluation.evaluate import (  # noqa: E402
-    load_score_sidecar, score_and_write_sidecar, score_sidecar_path, write_score_sidecar)
+    load_score_sidecar, scene_submission_status, score_and_write_sidecar, score_sidecar_path,
+    score_sidecars_cli, write_score_sidecar)
 from evaluation.scannet200_evaluator import Evaluator, scene_instance_summary  # noqa: E402
 
 sys.path.insert(0, _SPELLBOOK)
@@ -179,6 +181,22 @@ class SidecarTests(unittest.TestCase):
             self.assertFalse(os.path.isfile(
                 score_sidecar_path(spec, "run-a", "mosaic3d", "scene0568_00", scannet_root=root)))
 
+    def test_score_sidecars_missing_only_skips_existing(self):
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            path = score_sidecar_path(spec, "run-a", "mosaic3d", "scene0568_00", scannet_root=root)
+            write_score_sidecar(path, {
+                "schema": 1, "metric": "scannet_instance_ap50", "iou_threshold": 0.5,
+                "min_region_size": 100, "scene_id": "scene0568_00", "label_set": "ScanNet20",
+                "run_id": "run-a", "model": "mosaic3d", "tp": 1, "gt": 1, "verdicts": {},
+            })
+            with mock.patch("evaluation.evaluate.score_and_write_sidecar") as scored:
+                score_sidecars_cli([
+                    "--benchmark", "ScanNet20", "--run-id", "run-a", "--models", "mosaic3d",
+                    "--scenes", "0568_00", "--scannet-root", root, "--missing-only",
+                ])
+            scored.assert_not_called()
+
 
 class RunnerFinalizeTests(unittest.TestCase):
     def test_success_appends_tasks_after_scoring(self):
@@ -248,6 +266,121 @@ class CleanupTests(unittest.TestCase):
                 purge_scan_predictions("scene0568_00", scannet_root=root)
             self.assertFalse(os.path.isfile(sidecar))
             self.assertFalse(os.path.isfile(os.path.join(pred, "scene0568_00.txt")))
+
+
+def _load_common():
+    path = os.path.join(_SPELLBOOK, "predict", "models", "common.py")
+    spec = importlib.util.spec_from_file_location("spellbook_predict_common", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_ply(path, n):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(
+            "ply\nformat ascii 1.0\nelement vertex %d\n"
+            "property float x\nproperty float y\nproperty float z\nend_header\n" % n)
+        f.write("0 0 0\n" * n)
+
+
+class CommonContractTests(unittest.TestCase):
+    def test_decimate_rejects_nonpositive(self):
+        common = _load_common()
+        with self.assertRaises(ValueError):
+            common.decimate(np.zeros((4, 3)), 0)
+
+    def test_load_overrides_rejects_point_limit(self):
+        common = _load_common()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.json")
+            with open(path, "w") as f:
+                json.dump({"point_limit": 0}, f)
+            with self.assertRaises(ValueError):
+                common.load_overrides(path, {"point_limit"})
+
+    def test_validate_run_id_rejects_paths(self):
+        common = _load_common()
+        with self.assertRaises(ValueError):
+            common.validate_run_id("../x")
+        with self.assertRaises(ValueError):
+            common.validate_run_id("a/b")
+        self.assertEqual(common.validate_run_id("adhoc"), "adhoc")
+
+
+class SubmissionTests(unittest.TestCase):
+    def test_rerun_does_not_mix_generations(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(_SPELLBOOK), "BenchmarkScripts"))
+        import util_3d
+        common = _load_common()
+        spec = _spec20()
+        label = spec.class_labels[0]
+        with tempfile.TemporaryDirectory() as root:
+            mask1 = np.zeros(4, dtype=bool)
+            mask1[:2] = True
+            common.write_scannet_submission(
+                root, "scene0568_01", [label], [(mask1, label, 0.9)], 1, spec)
+            idx = os.path.join(root, "scene0568_01.txt")
+            with open(idx) as f:
+                gen1_refs = {line.split()[0] for line in f if line.strip()}
+            mask_dir = os.path.join(root, "predicted_masks")
+            np.savetxt(os.path.join(mask_dir, "scene0568_01_deadbeef_000.txt"),
+                       np.ones(4, dtype=int), fmt="%d")
+            instances = util_3d.read_instance_prediction_file(idx, root)
+            data = util_3d.load_ids(list(instances.keys())[0])
+            self.assertEqual(int(data[:2].sum()), 2)
+            self.assertEqual(int(data[2:].sum()), 0)
+            mask2 = np.ones(4, dtype=bool)
+            common.write_scannet_submission(
+                root, "scene0568_01", [label], [(mask2, label, 0.95)], 1, spec)
+            with open(idx) as f:
+                gen2_refs = {line.split()[0] for line in f if line.strip()}
+            self.assertTrue(gen1_refs.isdisjoint(gen2_refs))
+            kept = [name for name in os.listdir(mask_dir) if name.startswith("scene0568_01_")]
+            self.assertEqual(len(kept), 1)
+
+
+class CompletionTests(unittest.TestCase):
+    def test_malformed_index_is_missing(self):
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            _write_ply(os.path.join(root, "scans", "scene0568_01",
+                                    "scene0568_01_vh_clean_2.ply"), 4)
+            pred = os.path.join(root, "pred")
+            os.makedirs(pred)
+            with open(os.path.join(pred, "scene0568_01.txt"), "w") as f:
+                f.write("predicted_masks/scene0568_01_000.txt 3\n")
+            status = scene_submission_status(
+                pred, "scene0568_01", spec, "run-a", "mosaic3d", scannet_root=root)
+            self.assertEqual(status, "missing")
+
+    def test_mask_length_mismatch_is_missing(self):
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            _write_ply(os.path.join(root, "scans", "scene0568_01",
+                                    "scene0568_01_vh_clean_2.ply"), 4)
+            pred = os.path.join(root, "pred")
+            os.makedirs(os.path.join(pred, "predicted_masks"))
+            with open(os.path.join(pred, "scene0568_01.txt"), "w") as f:
+                f.write("predicted_masks/scene0568_01_000.txt 3 0.9\n")
+            with open(os.path.join(pred, "predicted_masks", "scene0568_01_000.txt"), "w") as f:
+                f.write("1\n1\n1\n")
+            status = scene_submission_status(
+                pred, "scene0568_01", spec, "run-a", "mosaic3d", scannet_root=root)
+            self.assertEqual(status, "missing")
+
+
+class OpenMaskOverrideTests(unittest.TestCase):
+    def test_classify_uses_min_mask_points_argument(self):
+        path = os.path.join(_SPELLBOOK, "predict", "models", "_openmask3d_run.py")
+        with open(path) as f:
+            text = f.read()
+        self.assertIn(
+            "def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS):",
+            text)
+        self.assertIn("_classify(masks, feats, args.classes, device, min_mask_points)", text)
+        self.assertNotIn("if sel.sum() < MIN_MASK_POINTS:", text)
 
 
 if __name__ == "__main__":

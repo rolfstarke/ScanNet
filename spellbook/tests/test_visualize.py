@@ -158,6 +158,21 @@ class TreeTests(unittest.TestCase):
         self.assertEqual(best_prediction(leaves, tied)["run_id"], "new")
         self.assertEqual(best_prediction(leaves, {})["run_id"], "old")
 
+    def test_best_prediction_prefers_comparable(self):
+        leaves = [
+            {"model": "mosaic3d", "run_id": "smoke", "label_set": "ScanNet200", "mtime": 9},
+            {"model": "mosaic3d", "run_id": "full", "label_set": "ScanNet200", "mtime": 1},
+        ]
+        metrics = {
+            ("ScanNet200", "smoke", "mosaic3d"): {
+                "ap": 0.90, "ap50": 0.95, "comparable": False,
+            },
+            ("ScanNet200", "full", "mosaic3d"): {
+                "ap": 0.10, "ap50": 0.20, "comparable": True,
+            },
+        }
+        self.assertEqual(best_prediction(leaves, metrics)["run_id"], "full")
+
 
 class NavigationTests(unittest.TestCase):
     def setUp(self):

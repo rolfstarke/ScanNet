@@ -17,7 +17,7 @@ import util  # noqa: E402
 import util_3d  # noqa: E402
 from evaluation.benchmark import BENCHMARKS, artifact_paths, resolve_benchmark, submission_dir  # noqa: E402
 from evaluation.evaluate import load_score_sidecar, score_sidecar_path  # noqa: E402
-from evaluation.runs import read_evaluator_csv  # noqa: E402
+from evaluation.runs import _is_comparable, load_manifest, read_evaluator_csv  # noqa: E402
 from utils import hud  # noqa: E402
 
 DEFAULT_SCANNET_DIR = "/data/scannet/scans"
@@ -388,7 +388,15 @@ def collect_run_metrics(scannet_root, pred_index):
                 continue
             try:
                 metrics = read_evaluator_csv(csv_path)
-                out[key] = {"ap": metrics["ap"], "ap50": metrics["ap50"]}
+                comparable = False
+                try:
+                    comparable = _is_comparable(
+                        load_manifest(manifest, spec=spec, run_id=p["run_id"]))
+                except (OSError, ValueError):
+                    pass
+                out[key] = {
+                    "ap": metrics["ap"], "ap50": metrics["ap50"], "comparable": comparable,
+                }
             except (OSError, ValueError, KeyError):
                 out[key] = None
     return out
@@ -438,9 +446,9 @@ def best_prediction(leaves, metrics=None):
     def key(pred):
         value = metrics.get((pred["label_set"], pred["run_id"], pred["model"]))
         if not value:
-            return (1, 0.0, 0.0, -pred.get("mtime", 0.0), pred["run_id"], pred["label_set"])
-        return (0, -value["ap"], -value["ap50"], -pred.get("mtime", 0.0),
-                pred["run_id"], pred["label_set"])
+            return (1, 1, 0.0, 0.0, -pred.get("mtime", 0.0), pred["run_id"], pred["label_set"])
+        return (0, 0 if value.get("comparable") else 1, -value["ap"], -value["ap50"],
+                -pred.get("mtime", 0.0), pred["run_id"], pred["label_set"])
 
     return min(leaves, key=key)
 

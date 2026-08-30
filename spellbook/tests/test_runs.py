@@ -143,6 +143,19 @@ class RankingTests(unittest.TestCase):
                 dumped = list(csv.DictReader(f))
             self.assertEqual([row["run_id"] for row in dumped], ["run-b", "run-a"])
 
+    def test_equal_ap_orders_by_ap50(self):
+        with tempfile.TemporaryDirectory() as root:
+            spec = self._layout(root, "run-b", "mosaic3d", ["scene0568_01"],
+                                _csv_rows("0.5", "0.9", "0.1"))
+            self._layout(root, "run-a", "mosaic3d", ["scene0568_01"],
+                         _csv_rows("0.5", "0.2", "0.9"))
+            rows, path = rank_runs(spec, scannet_root=root)
+            with open(path, newline="") as f:
+                dumped = list(csv.DictReader(f))
+            self.assertEqual([row["run_id"] for row in dumped], ["run-b", "run-a"])
+            by_id = {row["run_id"]: row for row in rows}
+            self.assertGreater(by_id["run-b"]["ap50"], by_id["run-a"]["ap50"])
+
     def test_groups_do_not_cross_method_or_scenes(self):
         with tempfile.TemporaryDirectory() as root:
             spec = self._layout(root, "run-a", "mosaic3d", ["scene0568_01"],

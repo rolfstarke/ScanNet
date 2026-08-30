@@ -99,7 +99,7 @@ def _run_feature_computation(scene_ply, masks_path, frames, out_dir, frequency):
     return os.path.join(out_dir, f"{scene_name}_openmask3d_features.npy")
 
 
-def _classify(masks, feats, classes, device):
+def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS):
     model, _ = clip.load("ViT-L/14@336px", device=device)
     with torch.no_grad():
         text_ft = model.encode_text(clip.tokenize([f"a photo of a {c}." for c in classes]).to(device))
@@ -108,7 +108,7 @@ def _classify(masks, feats, classes, device):
     instances = []
     for mi in tqdm(range(masks.shape[1]), desc="classifying masks", unit="mask"):
         sel = masks[:, mi] > 0.5
-        if sel.sum() < MIN_MASK_POINTS:
+        if sel.sum() < min_mask_points:
             continue
         norm = np.linalg.norm(feats[mi])
         if norm < 1e-6:
@@ -190,7 +190,7 @@ def main():
     masks = np.asarray(torch.load(masks_path))
     feats = np.load(features_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    instances = _classify(masks, feats, args.classes, device)
+    instances = _classify(masks, feats, args.classes, device, min_mask_points)
     deduped = _dedup_instances(instances, iou_threshold=dedup_iou)
 
     def _instances():

@@ -384,7 +384,7 @@ def _assign_ranks(rows):
                 row[f"rank_{metric}"] = lookup[row["run_id"]]
         ranked.extend(members)
     ranked.sort(key=lambda row: (row["method"], ";".join(row["scenes"]),
-                                 row["rank_ap"], row["rank_ap50"], row["run_id"]))
+                                 -row["ap"], -row["ap50"], row["run_id"]))
     return ranked
 
 

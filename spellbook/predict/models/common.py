@@ -11,11 +11,24 @@ per mesh vertex), which is the shape ScanNet's own evaluator
 import json
 import os
 import pathlib
+import secrets
 import sys
 
 import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
+
+
+_INT_BOUNDS = {
+    "point_limit": (1, None),
+    "min_mask_points": (1, None),
+    "decimate_limit": (1, None),
+    "final_instance_top_k": (1, None),
+}
+_FLOAT_BOUNDS = {
+    "dedup_iou": (0.0, 1.0),
+    "grid_size": (0.0, None),
+}
 
 
 def _benchmark_spec(benchmark_name):
@@ -38,10 +51,37 @@ def scene_id_from_pointcloud(pointcloud_path):
     return pathlib.Path(pointcloud_path).parent.name
 
 
+def validate_run_id(run_id):
+    if not isinstance(run_id, str) or not run_id or run_id.strip() != run_id:
+        raise ValueError(f"invalid run_id {run_id!r}")
+    if os.sep in run_id or (os.altsep and os.altsep in run_id) or run_id in (".", ".."):
+        raise ValueError(f"invalid run_id {run_id!r}")
+    return run_id
+
+
+def _as_number(value, kind, key):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number, got {value!r}")
+    if kind is int:
+        if int(value) != value:
+            raise ValueError(f"{key} must be an integer, got {value!r}")
+        return int(value)
+    return float(value)
+
+
+def _check_bounds(key, value, lo, hi):
+    if value < lo or (hi is not None and value > hi):
+        bound = f">= {lo}" if hi is None else f"in [{lo}, {hi}]"
+        raise ValueError(f"{key} must be {bound}, got {value!r}")
+    return value
+
+
 def decimate(pts, limit):
     """Voxel-downsample until under `limit` points; returns (kept_points, nn_idx) where
     nn_idx[i] is the index into kept_points nearest to the ORIGINAL points[i] -- used to
     propagate per-instance masks back onto every original point."""
+    if limit <= 0:
+        raise ValueError("point_limit must be positive")
     if len(pts) <= limit:
         return pts, np.arange(len(pts))
 
@@ -57,7 +97,7 @@ def decimate(pts, limit):
 
 
 def add_run_args(parser):
-    parser.add_argument("--run-id", default="adhoc")
+    parser.add_argument("--run-id", default="adhoc", type=validate_run_id)
     parser.add_argument("--parameters-json", default=None)
 
 
@@ -71,7 +111,14 @@ def load_overrides(path, allowed):
     extra = [key for key in data if key not in allowed]
     if extra:
         raise ValueError(f"unknown parameter(s): {extra}")
-    return data
+    out = {}
+    for key, value in data.items():
+        if key in _INT_BOUNDS:
+            value = _check_bounds(key, _as_number(value, int, key), *_INT_BOUNDS[key])
+        elif key in _FLOAT_BOUNDS:
+            value = _check_bounds(key, _as_number(value, float, key), *_FLOAT_BOUNDS[key])
+        out[key] = value
+    return out
 
 
 def write_scannet_submission(submission_root, scene_id, classes, instances, min_mask_points, spec):
@@ -94,16 +141,19 @@ def write_scannet_submission(submission_root, scene_id, classes, instances, min_
     os.makedirs(mask_dir, exist_ok=True)
     index_path = os.path.join(submission_root, f"{scene_id}.txt")
     tmp_index = index_path + ".tmp"
+    gen = secrets.token_hex(4)
     written = []
     n_written = 0
     with open(tmp_index, "w") as scene_f:
         for mask, class_name, confidence in instances:
             if mask.sum() < min_mask_points:
                 continue
-            mask_name = f"{scene_id}_{n_written:03d}.txt"
+            mask_name = f"{scene_id}_{gen}_{n_written:03d}.txt"
             final_mask = os.path.join(mask_dir, mask_name)
             tmp_mask = final_mask + ".tmp"
             np.savetxt(tmp_mask, mask.astype(int), fmt="%d")
+            with open(tmp_mask, "rb") as mask_f:
+                os.fsync(mask_f.fileno())
             os.replace(tmp_mask, final_mask)
             written.append(mask_name)
             scene_f.write(f"predicted_masks/{mask_name} {label_ids[class_name]} {confidence:.4f}\n")

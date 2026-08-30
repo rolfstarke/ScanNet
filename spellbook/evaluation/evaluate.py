@@ -4,6 +4,7 @@
   _vh_clean_2.ply vertex) filtered to the benchmark's valid class ids.
 - evaluate: dispatches a benchmark run's submission root to the official
   ScanNet20 evaluator or the ScanNet200 evaluator; writes a per-class CSV.
+- score-sidecars: writes per-scene AP50 TP/GT sidecars for existing predictions.
 """
 import argparse
 import json
@@ -131,7 +132,10 @@ def load_pred_instances(submission_root, scene_id):
     scene_file = os.path.join(submission_root, scene_id + ".txt")
     if not os.path.isfile(scene_file):
         return None
-    instances = util_3d.read_instance_prediction_file(scene_file, submission_root)
+    try:
+        instances = util_3d.read_instance_prediction_file(scene_file, submission_root)
+    except (Exception, SystemExit) as exc:
+        raise ValueError(f"malformed instance prediction file: {scene_file}") from exc
     for mask_file, prediction in list(instances.items()):
         prediction["pred_mask"] = util_3d.load_ids(mask_file) > 0
     return instances
@@ -219,19 +223,46 @@ def score_and_write_sidecar(submission_root, scene_id, spec, run_id, model, scan
     return payload
 
 
+def _ply_vertex_count(path):
+    with open(path, "rb") as f:
+        for raw in f:
+            if raw.startswith(b"element vertex"):
+                return int(raw.split()[2])
+            if raw.startswith(b"end_header"):
+                break
+    raise ValueError(f"no vertex count in {path}")
+
+
 def scene_submission_status(submission_root, scene_id, spec, run_id, model, scannet_root=None):
     scene_file = os.path.join(submission_root, scene_id + ".txt")
     if not os.path.isfile(scene_file):
         return "missing"
     try:
         instances = load_pred_instances(submission_root, scene_id)
-    except Exception:
+    except (Exception, SystemExit):
         return "missing"
     if instances is None:
         return "missing"
+    n_verts = None
+    root = scannet_root
+    if root is None:
+        try:
+            root = load_settings()["scannet_root"]
+        except (OSError, KeyError, TypeError, ValueError):
+            root = None
+    if root:
+        ply = os.path.join(root, "scans", scene_id, f"{scene_id}_vh_clean_2.ply")
+        if not os.path.isfile(ply):
+            return "missing"
+        try:
+            n_verts = _ply_vertex_count(ply)
+        except (OSError, ValueError, IndexError):
+            return "missing"
     for mask_file, prediction in instances.items():
         mask = prediction.get("pred_mask")
         if mask is None or mask.size == 0:
+            return "missing"
+        if n_verts is not None and mask.size != n_verts:
             return "missing"
         label_id = prediction.get("label_id")
         if label_id not in spec.valid_ids and label_id not in spec.id_to_label:
@@ -266,7 +297,9 @@ def _stage_eval_dirs(pred_dir, gt_dir, scenes):
         src_gt = os.path.join(gt_dir, scene + ".txt")
         os.symlink(os.path.abspath(src_pred), os.path.join(pred_stage, scene + ".txt"))
         os.symlink(os.path.abspath(src_gt), os.path.join(gt_stage, scene + ".txt"))
-        instances = util_3d.read_instance_prediction_file(src_pred, pred_dir)
+        instances = load_pred_instances(pred_dir, scene)
+        if instances is None:
+            raise ValueError(f"malformed or missing prediction index: {src_pred}")
         for mask_file in instances:
             name = os.path.basename(mask_file)
             os.symlink(os.path.abspath(mask_file), os.path.join(mask_stage, name))
@@ -301,6 +334,39 @@ def export_gt_cli(argv=None):
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     export_gt(scan_path, out_file, spec, scannet_root=root)
     print(f"GT -> {out_file}")
+
+
+def score_sidecars_cli(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Write per-scene AP50 TP/GT sidecars for existing predictions")
+    ap.add_argument("--run-id", required=True)
+    ap.add_argument("--models", required=True, help="comma-separated model names")
+    ap.add_argument("--scenes", required=True,
+                    help="comma-separated scene ids (0568_00 or scene0568_00)")
+    ap.add_argument("--benchmark", default=None, help="ScanNet20 | ScanNet200 (default: settings)")
+    ap.add_argument("--scannet-root", default=None)
+    ap.add_argument("--missing-only", action="store_true")
+    args = ap.parse_args(argv)
+    spec = resolve_benchmark(args.benchmark)
+    root = _ensure_settings(args.scannet_root)
+    models = [m.strip() for m in args.models.split(",")]
+    for model in models:
+        if not model:
+            raise ValueError(f"empty entry in --models {args.models!r} (trailing comma?)")
+    scenes = _parse_list(args.scenes)
+    for model in models:
+        pred_dir = submission_dir(spec, args.run_id, model, scannet_root=root)
+        for scene in scenes:
+            path = score_sidecar_path(spec, args.run_id, model, scene, scannet_root=root)
+            if args.missing_only and os.path.isfile(path):
+                print(f"[skip] {scene} {model}")
+                continue
+            payload = score_and_write_sidecar(
+                pred_dir, scene, spec, args.run_id, model, scannet_root=root)
+            if payload is None:
+                print(f"[miss] {scene} {model}")
+            else:
+                print(f"[ok] {scene} {model} TP/GT {payload['tp']}/{payload['gt']}")
 
 
 def evaluate_cli(argv=None):
@@ -379,8 +445,10 @@ if __name__ == "__main__":
     sub_cmds = {
         "export-gt": export_gt_cli,
         "evaluate": evaluate_cli,
+        "score-sidecars": score_sidecars_cli,
     }
     if len(sys.argv) < 2 or sys.argv[1] not in sub_cmds:
-        print("usage: python spellbook/evaluation/evaluate.py {export-gt,evaluate} [options]")
+        print("usage: python spellbook/evaluation/evaluate.py "
+              "{export-gt,evaluate,score-sidecars} [options]")
         sys.exit(2)
     sub_cmds[sys.argv[1]](sys.argv[2:])
