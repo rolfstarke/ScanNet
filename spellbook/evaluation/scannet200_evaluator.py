@@ -317,6 +317,76 @@ class Evaluator:
         return avgs
 
 
+def scene_instance_summary(gt_ids, pred_instances, spec, scene_id, overlap_th=0.5):
+    """Per-scene AP50 verdicts using Evaluator.assign_instances_for_scan.
+
+    Returns {"verdicts": {relative_or_raw_key: "tp"|"fp"|"ignored"}, "tp": int, "gt": int}.
+    Keys are evaluator filenames with the ``scene_id/`` prefix stripped. Eligible GT
+    counts valid-class instances with instance_id >= 1000 and vert_count >= 100.
+    IoU must be strictly greater than overlap_th (official AP50 uses 0.5).
+    """
+    evaluator = Evaluator(spec.class_labels, spec.valid_ids)
+    evaluator.add_gt(gt_ids, scene_id)
+    evaluator.add_prediction(pred_instances, scene_id)
+    gt2pred, pred2gt = evaluator.assign_instances_for_scan(scene_id)
+    min_region_size = int(evaluator.min_region_sizes[0])
+    prefix = str(scene_id) + "/"
+
+    def _key(filename):
+        if filename.startswith(prefix):
+            return filename[len(prefix):]
+        return filename
+
+    verdicts = {}
+    pred_visited = set()
+    eligible_gt = 0
+    for label in spec.class_labels:
+        gt_instances = [g for g in gt2pred[label]
+                        if g["instance_id"] >= 1000 and g["vert_count"] >= min_region_size]
+        eligible_gt += len(gt_instances)
+        cur_match = [False] * len(gt_instances)
+        cur_score = [-float("inf")] * len(gt_instances)
+        tp_keys = [None] * len(gt_instances)
+        for gti, gt in enumerate(gt_instances):
+            for pred in gt["matched_pred"]:
+                if pred["filename"] in pred_visited:
+                    continue
+                overlap = float(pred["intersection"]) / (
+                    gt["vert_count"] + pred["vert_count"] - pred["intersection"])
+                if overlap > overlap_th:
+                    if cur_match[gti]:
+                        cur_score[gti] = max(cur_score[gti], pred["confidence"])
+                        verdicts[_key(pred["filename"])] = "fp"
+                    else:
+                        cur_match[gti] = True
+                        cur_score[gti] = pred["confidence"]
+                        tp_keys[gti] = _key(pred["filename"])
+                        pred_visited.add(pred["filename"])
+        for gti, matched in enumerate(cur_match):
+            if matched:
+                verdicts[tp_keys[gti]] = "tp"
+        for pred in pred2gt[label]:
+            found_gt = any(
+                float(gt["intersection"]) / (
+                    gt["vert_count"] + pred["vert_count"] - gt["intersection"]) > overlap_th
+                for gt in pred["matched_gt"])
+            if found_gt:
+                continue
+            num_ignore = pred["void_intersection"]
+            for gt in pred["matched_gt"]:
+                if gt["instance_id"] < 1000:
+                    num_ignore += gt["intersection"]
+                if gt["vert_count"] < min_region_size:
+                    num_ignore += gt["intersection"]
+            key = _key(pred["filename"])
+            if float(num_ignore) / pred["vert_count"] <= overlap_th:
+                verdicts[key] = "fp"
+            else:
+                verdicts[key] = "ignored"
+    tp = sum(1 for value in verdicts.values() if value == "tp")
+    return {"verdicts": verdicts, "tp": int(tp), "gt": int(eligible_gt)}
+
+
 def write_result_file(evaluator, avgs, filename):
     _SPLITTER = ','
     with open(filename, 'w') as f:

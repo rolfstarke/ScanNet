@@ -18,7 +18,10 @@ import torch
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import _benchmark_spec, decimate, scene_id_from_pointcloud, write_scannet_submission  # noqa: E402
+from common import (  # noqa: E402
+    _benchmark_spec, add_run_args, decimate, load_overrides,
+    scene_id_from_pointcloud, write_scannet_submission,
+)
 
 OPENINS3D_REPO = "/home/rolf/GIT/OpenIns3D"
 SCRATCH_ROOT = "/data/openins3d/scratch"  # bulky, transient synthetic renders -- kept off /home
@@ -59,18 +62,30 @@ def main():
                     help="benchmark backend (default ScanNet20)")
     ap.add_argument("--detector", default="odise", choices=["odise", "yoloworld"],
                     help="2D open-vocab detector for the Lookup stage (default odise -- the "
-                         "detector OpenIns3D's paper numbers use; yoloworld is the repo demo default)")
+                          "detector OpenIns3D's paper numbers use; yoloworld is the repo demo default)")
+    add_run_args(ap)
     args = ap.parse_args()
     spec = _benchmark_spec(args.benchmark)
+    params = load_overrides(args.parameters_json, {
+        "detector", "mask_confidence_threshold", "lookup_threshold",
+        "point_limit", "min_mask_points"})
+    detector = str(params.get("detector", args.detector))
+    mask_confidence_threshold = float(params.get(
+        "mask_confidence_threshold", MASK_CONFIDENCE_THRESHOLD))
+    lookup_threshold = float(params.get("lookup_threshold", LOOKUP_THRESHOLD))
+    point_limit = int(params.get("point_limit", POINT_LIMIT))
+    min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
 
     os.makedirs(args.out, exist_ok=True)
     scene_id = scene_id_from_pointcloud(args.pointcloud)
+    print(f"[INFO] {scene_id} run_id={args.run_id} detector={detector} "
+          f"mask_conf={mask_confidence_threshold} lookup={lookup_threshold}")
 
     pcd = o3d.io.read_point_cloud(args.pointcloud)
     full_pts = _ensure_z_up(np.asarray(pcd.points))
     full_cols = np.asarray(pcd.colors)
 
-    working_pts, nn_idx = decimate(full_pts, POINT_LIMIT)
+    working_pts, nn_idx = decimate(full_pts, point_limit)
     if len(working_pts) < len(full_pts):
         working_cols = full_cols[cKDTree(full_pts).query(working_pts, k=1, workers=-1)[1]]
     else:
@@ -88,19 +103,19 @@ def main():
     data, features, _, inverse_map = prepare_data(pcd_rgb, device)
     with torch.no_grad():
         mask_list = map_output_to_pointcloud(model(data, raw_coordinates=features), inverse_map,
-                                              confidence_threshold=MASK_CONFIDENCE_THRESHOLD)
+                                               confidence_threshold=mask_confidence_threshold)
 
-    snap_folder = os.path.join(SCRATCH_ROOT, scene_id)
+    snap_folder = os.path.join(SCRATCH_ROOT, args.run_id, scene_id)
     snap = Snap(IMAGE_SIZE, ADJUST_CAMERA, snap_folder)
     lookup = Lookup(IMAGE_SIZE, ADJUST_CAMERA[2], snap_folder, text_input=args.classes,
-                    results_folder=os.path.join(SCRATCH_ROOT, f"{scene_id}_results"))
-    if args.detector == "odise":
+                    results_folder=os.path.join(SCRATCH_ROOT, args.run_id, f"{scene_id}_results"))
+    if detector == "odise":
         lookup.call_ODISE()
     else:
         lookup.call_YOLOWORLD()
 
     snap.scene_image_rendering(args.pointcloud, scene_id, mode=["global", "wide", "corner"])
-    mask_cls, score = lookup.lookup_pipelie(pcd_rgb, mask_list, scene_id, threshold=LOOKUP_THRESHOLD)
+    mask_cls, score = lookup.lookup_pipelie(pcd_rgb, mask_list, scene_id, threshold=lookup_threshold)
 
     masks_np = mask_list.cpu().numpy().astype(bool)
 
@@ -111,7 +126,7 @@ def main():
             yield masks_np[:, i][nn_idx], args.classes[cls], float(score[i])
 
     n_written = write_scannet_submission(args.out, scene_id, args.classes, _instances(),
-                                         MIN_MASK_POINTS, spec)
+                                          min_mask_points, spec)
     print(f"[INFO] Wrote {n_written} instances to {args.out} "
           f"({mask_list.shape[1]} raw masks, {len(working_pts)}/{len(full_pts)} points used)")
 

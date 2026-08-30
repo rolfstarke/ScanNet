@@ -29,7 +29,10 @@ import yaml
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import _benchmark_spec, scene_id_from_pointcloud, write_scannet_submission  # noqa: E402
+from common import (  # noqa: E402
+    _benchmark_spec, add_run_args, load_overrides, scene_id_from_pointcloud,
+    write_scannet_submission,
+)
 
 OPEN3DIS_REPO = "/home/rolf/GIT/Open3DIS"
 OPEN3DIS_PY = "/data/open3dis/conda/envs/open3dis/bin/python"
@@ -157,28 +160,35 @@ def main():
     ap.add_argument("--out", required=True, help="predictions output dir")
     ap.add_argument("--benchmark", default="ScanNet20",
                     choices=["ScanNet20", "ScanNet200"])
+    add_run_args(ap)
     args = ap.parse_args()
     spec = _benchmark_spec(args.benchmark)
+    params = load_overrides(args.parameters_json, {
+        "min_mask_points", "decimate_limit", "final_instance_top_k"})
+    min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
+    decimate_limit = int(params.get("decimate_limit", DECIMATE_LIMIT))
+    final_instance_top_k = int(params.get("final_instance_top_k", FINAL_INSTANCE_TOP_K))
 
     os.makedirs(args.out, exist_ok=True)
     scene_id = scene_id_from_pointcloud(args.pointcloud)
+    print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params}")
 
     scene_2d_dir = os.path.join(OPEN3DIS_REPO, "data", "ov3dis_scene", "ov3dis_scene_2d", scene_id)
     working_ply = os.path.join(OPEN3DIS_REPO, "data", "ov3dis_scene", "original_ply", f"{scene_id}.ply")
     _link_frames(args.frames, scene_2d_dir)
-    decimated = _ensure_working_ply(args.pointcloud, working_ply, DECIMATE_LIMIT)
+    decimated = _ensure_working_ply(args.pointcloud, working_ply, decimate_limit)
 
-    split_path = os.path.join(SCRATCH_ROOT, scene_id, "open3dis_split.txt")
+    split_path = os.path.join(SCRATCH_ROOT, args.run_id, scene_id, "open3dis_split.txt")
     os.makedirs(os.path.dirname(split_path), exist_ok=True)
     with open(split_path, "w") as f:
         f.write(scene_id + "\n")
 
     img_dim, rgb_img_dim = _frame_img_dim(args.frames)
-    exp_name = f"{scene_id}_ov3discomp"
+    exp_name = f"{args.run_id}_{scene_id}_ov3discomp"
     run_config = _make_run_config(
         GENERIC_TEMPLATE_CONFIG,
         dict(split_path=split_path, img_dim=img_dim, rgb_img_dim=rgb_img_dim),
-        exp_name, args.classes, os.path.join(SCRATCH_ROOT, scene_id),
+        exp_name, args.classes, os.path.join(SCRATCH_ROOT, args.run_id, scene_id),
     )
     exp_dir = os.path.join(OPEN3DIS_REPO, "exp", exp_name)
 
@@ -219,9 +229,9 @@ def main():
                 sel = sel[nn_idx]
             yield sel, args.classes[best_idx[i]], confidence[i]
 
-    candidates = sorted(_instances(), key=lambda t: -t[2])[:FINAL_INSTANCE_TOP_K]
+    candidates = sorted(_instances(), key=lambda t: -t[2])[:final_instance_top_k]
     n_written = write_scannet_submission(args.out, scene_id, args.classes, candidates,
-                                         MIN_MASK_POINTS, spec)
+                                         min_mask_points, spec)
     print(f"[INFO] Wrote {n_written} instances to {args.out}")
 
 

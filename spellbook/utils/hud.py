@@ -1,29 +1,101 @@
 import os
-import queue
 import subprocess
-import time
 
 
-WIDTH = 680
+LEFT_WIDTH = 440
+RIGHT_WIDTH = 680
+VIEWER_TITLE = "ScanNet visualizer"
+ROW_H = 20
+ELLIPSIS = "..."
 
 
-def _window_geometry(parent_pid, scene_id):
-    result = subprocess.run(
-        ["xdotool", "search", "--pid", str(parent_pid), "--name", f"^ScanNet - {scene_id}"],
-        capture_output=True, text=True)
-    if result.returncode:
-        return None
-    window_id = result.stdout.splitlines()[-1]
-    result = subprocess.run(["xdotool", "getwindowgeometry", "--shell", window_id],
-                            capture_output=True, text=True)
-    if result.returncode:
-        return None
-    values = {}
-    for line in result.stdout.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            values[key] = int(value)
-    return values["X"], values["Y"], values["WIDTH"], values["HEIGHT"]
+def width_for(side):
+    return LEFT_WIDTH if side == "left" else RIGHT_WIDTH
+
+
+def ellipsize(text, max_width, measure):
+    if measure(text) <= max_width:
+        return text
+    if measure(ELLIPSIS) >= max_width:
+        return ELLIPSIS
+    kept = text
+    while kept and measure(kept + ELLIPSIS) > max_width:
+        kept = kept[:-1]
+    return kept + ELLIPSIS
+
+
+def _u32(imgui, r, g, b, a=1.0):
+    return imgui.get_color_u32_rgba(r, g, b, a)
+
+
+def _draw_tree_row(imgui, row, width):
+    draw = imgui.get_window_draw_list()
+    x, y = imgui.get_cursor_screen_pos()
+    indent = 12 * row.get("depth", 0)
+    marker = ""
+    if row.get("folder"):
+        marker = "[-] " if row.get("expanded") else "[+] "
+    measure = lambda s: imgui.calc_text_size(s).x
+    suffix = row.get("suffix") or ""
+    suffix_w = measure(suffix) + 8 if suffix else 0
+    avail = max(40.0, width - 20 - indent - suffix_w)
+    label = ellipsize(marker + row["label"], avail, measure)
+    imgui.set_cursor_screen_pos((x + indent, y))
+    active = bool(row.get("path_level"))
+    if active:
+        imgui.text(label)
+    else:
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.55, 0.55, 0.55, 1.0)
+        imgui.text(label)
+        imgui.pop_style_color()
+    if suffix:
+        imgui.same_line()
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.55, 0.55, 0.55, 1.0)
+        imgui.text(suffix)
+        imgui.pop_style_color()
+    if row.get("cursor"):
+        draw.add_rect(x - 4, y - 2, x + width - 8, y + ROW_H - 2,
+                      _u32(imgui, 0.08, 0.08, 0.08, 1.0))
+    imgui.dummy(0, 2)
+
+
+def _draw_left(imgui, payload, height, width, view_start):
+    flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
+             imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE |
+             imgui.WINDOW_NO_SAVED_SETTINGS | imgui.WINDOW_NO_INPUTS)
+    imgui.set_next_window_position(0, 0)
+    imgui.set_next_window_size(width, height)
+    imgui.begin("##scannet_left", flags=flags)
+    imgui.text("Scenes")
+    imgui.separator()
+    rows = payload.get("tree") or []
+    cursor = next((i for i, row in enumerate(rows) if row.get("cursor")), 0)
+    max_rows = max(3, int((height - 36) // ROW_H))
+    start, end = 0, len(rows)
+    lead = trail = False
+    if len(rows) > max_rows:
+        body = max(1, max_rows - 2)
+        start = view_start[0]
+        if cursor < start:
+            start = cursor
+        elif cursor >= start + body:
+            start = cursor - body + 1
+        start = min(max(0, start), len(rows) - body)
+        end = start + body
+        view_start[0] = start
+        lead = start > 0
+        trail = end < len(rows)
+    if lead:
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.55, 0.55, 0.55, 1.0)
+        imgui.text(ELLIPSIS)
+        imgui.pop_style_color()
+    for row in rows[start:end]:
+        _draw_tree_row(imgui, row, width)
+    if trail:
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.55, 0.55, 0.55, 1.0)
+        imgui.text(ELLIPSIS)
+        imgui.pop_style_color()
+    imgui.end()
 
 
 def _draw_class_row(imgui, name, color):
@@ -31,65 +103,137 @@ def _draw_class_row(imgui, name, color):
     x, y = imgui.get_cursor_screen_pos()
     text = imgui.get_color_u32_rgba(0.08, 0.08, 0.08, 1.0)
     swatch = imgui.get_color_u32_rgba(*color, 1.0)
-
     draw.add_rect_filled(x, y + 2, x + 11, y + 13, swatch, 2)
     draw.add_text(x + 17, y, text, name)
     imgui.dummy(315, 17)
 
 
-def _draw_setting_row(imgui, row):
+def _draw_setting_row(imgui, row, width, settings_focus):
     draw = imgui.get_window_draw_list()
     x, y = imgui.get_cursor_screen_pos()
-    if row["selected"]:
-        draw.add_rect_filled(x - 6, y - 3, x + WIDTH - 6, y + 17,
-                             imgui.get_color_u32_rgba(0.82, 0.88, 1.0, 1.0))
-    marker = "> " if row["selected"] else "  "
-    imgui.text(f"{marker}{row['name']}: {row['value']}")
+    focused = bool(row.get("focused") and settings_focus)
+    imgui.text(f"{row['name']}:")
+    first = True
+    max_x = x + width - 12
+    for opt in row.get("options") or []:
+        token = opt["text"] if first else f" | {opt['text']}"
+        tw = imgui.calc_text_size(token).x
+        cx, cy = imgui.get_cursor_screen_pos()
+        wrap = (not first) and cx + tw > max_x
+        if wrap:
+            imgui.new_line()
+            token = opt["text"]
+            tw = imgui.calc_text_size(token).x
+            cx, cy = imgui.get_cursor_screen_pos()
+        else:
+            imgui.same_line()
+            cx, cy = imgui.get_cursor_screen_pos()
+        first = False
+        if opt.get("sel") and focused:
+            draw.add_rect(cx - 3, cy - 2, cx + tw + 3, cy + 16,
+                          imgui.get_color_u32_rgba(0.08, 0.08, 0.08, 1.0))
+        active = opt.get("kind") in ("applied", "pending")
+        if active:
+            imgui.text(token)
+        else:
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.55, 0.55, 0.55, 1.0)
+            imgui.text(token)
+            imgui.pop_style_color()
     imgui.dummy(0, 4)
 
 
-def _draw(imgui, payload, height):
-    imgui.set_next_window_position(0, 0)
-    imgui.set_next_window_size(WIDTH, height)
+def _draw_right(imgui, payload, height, width, overlay=None):
     flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
              imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE |
              imgui.WINDOW_NO_SAVED_SETTINGS | imgui.WINDOW_NO_INPUTS)
+    imgui.set_next_window_position(0, 0)
+    imgui.set_next_window_size(width, height)
     imgui.begin("##scannet_hud", flags=flags)
 
-    # Block 1: Information
-    imgui.text("ScanNet")
-    imgui.separator()
-    imgui.text(f"Scene: {payload['scene']}")
-    imgui.text(f"Source: {payload['source']}")
-    imgui.text(f"Instances: {payload['visible_count']}")
-    if payload["tp"] is not None:
-        imgui.text(f"TP: {payload['tp']}   FP: {payload['fp']}")
-    if payload["status"]:
+    if overlay and overlay.get("id") and payload.get("cad_overlay"):
+        iw, ih = overlay["wh"]
+        scale = min(width / max(iw, 1), height / max(ih, 1))
+        dw, dh = iw * scale, ih * scale
+        imgui.set_cursor_pos(((width - dw) * 0.5, (height - dh) * 0.5))
+        imgui.image(overlay["id"], dw, dh)
+        imgui.end()
+        return
+
+    if payload.get("status"):
         imgui.text(payload["status"])
-    imgui.text(payload["help"])
-    imgui.separator()
+        imgui.separator()
 
-    # Block 2: Settings
     imgui.text("Settings")
-    for row in payload["settings"]:
-        _draw_setting_row(imgui, row)
+    settings_focus = payload.get("focus") == "settings"
+    for row in payload.get("settings") or []:
+        _draw_setting_row(imgui, row, width, settings_focus)
     imgui.separator()
 
-    # Block 3: Classes
     imgui.text("Classes")
-    imgui.columns(2, "class_columns", border=False)
-    for name in payload["classes"]:
-        _draw_class_row(imgui, name, payload["colors"][name])
-        imgui.next_column()
-    imgui.columns(1)
+    classes = payload.get("classes") or []
+    if classes:
+        imgui.columns(2, "class_columns", border=False)
+        for name in classes:
+            _draw_class_row(imgui, name, payload["colors"][name])
+            imgui.next_column()
+        imgui.columns(1)
     imgui.end()
 
 
-def run(updates, parent_pid, scene_id):
+def _draw(imgui, payload, height, side, width, overlay=None, view_start=None):
+    if side == "left":
+        _draw_left(imgui, payload, height, width, view_start or [0])
+    else:
+        _draw_right(imgui, payload, height, width, overlay)
+
+
+def _display_size():
+    try:
+        result = subprocess.run(["xdotool", "getdisplaygeometry"],
+                                capture_output=True, text=True, timeout=1)
+        if result.returncode:
+            return 1920, 1080
+        w, h = result.stdout.split()
+        return int(w), int(h)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 1920, 1080
+
+
+def _load_overlay_rgba(path, max_w, max_h):
+    import numpy as np
+    from PIL import Image
+    with Image.open(path) as im:
+        im = im.convert("RGBA")
+        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+        im.thumbnail((max(1, max_w), max(1, max_h)), resample)
+        arr = np.asarray(im, dtype=np.uint8)
+    return np.ascontiguousarray(arr)
+
+
+def _upload_overlay_texture(gl, rgba):
+    h, w = rgba.shape[:2]
+    tex = int(gl.glGenTextures(1))
+    gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, w, h, 0, gl.GL_RGBA,
+                    gl.GL_UNSIGNED_BYTE, rgba)
+    return tex, w, h
+
+
+def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
     import glfw
     import imgui
     from imgui.integrations.glfw import GlfwRenderer
     from OpenGL.GL import GL_COLOR_BUFFER_BIT, glClear, glClearColor
+    import OpenGL.GL as gl
+
+    dock_w = width_for(side)
+    vx, vy, vw, vh = viewer_rect or (LEFT_WIDTH, 0, 800, 800)
+    if side == "left":
+        dock_x, dock_y, dock_w, dock_h = vx - dock_w, vy, dock_w, vh
+    else:
+        dock_x, dock_y, dock_w, dock_h = vx + vw, vy, dock_w, vh
 
     if not glfw.init():
         return
@@ -97,12 +241,15 @@ def run(updates, parent_pid, scene_id):
     glfw.window_hint(glfw.FOCUSED, False)
     glfw.window_hint(glfw.FOCUS_ON_SHOW, False)
     glfw.window_hint(glfw.RESIZABLE, False)
-    window = glfw.create_window(WIDTH, 300, "ScanNet legend", None, None)
+    glfw.window_hint(glfw.FLOATING, True)
+    window = glfw.create_window(dock_w, dock_h, f"ScanNet {side}", None, None)
     if not window:
         glfw.terminate()
         return
     glfw.make_context_current(window)
-    glfw.swap_interval(1)
+    glfw.swap_interval(0)
+    glfw.set_window_pos(window, max(0, dock_x), max(0, dock_y))
+    glfw.show_window(window)
 
     imgui.create_context()
     style = imgui.get_style()
@@ -112,20 +259,77 @@ def run(updates, parent_pid, scene_id):
     style.colors[imgui.COLOR_TEXT] = (0.08, 0.08, 0.08, 1.0)
     style.colors[imgui.COLOR_BORDER] = (0.30, 0.30, 0.30, 1.0)
     renderer = GlfwRenderer(window, attach_callbacks=False)
-    glfw.hide_window(window)
 
-    payload = None
-    height = 300
-    next_position_update = 0.0
+    def _on_key(_win, key, _scancode, action, _mods):
+        if keys_out is None or action != glfw.PRESS:
+            return
+        try:
+            keys_out.send(key)
+        except Exception:
+            pass
+
+    glfw.set_key_callback(window, _on_key)
+    fb_w, fb_h = glfw.get_framebuffer_size(window)
+    imgui.get_io().display_size = (float(max(fb_w, 1)), float(max(fb_h, 1)))
+
+    empty = {"tree": [], "settings": [], "classes": [], "colors": {},
+             "status": "", "focus": "tree", "cad_overlay": None}
+    payload = empty
+    width, height = dock_w, dock_h
+    dirty = True
+    overlay = {"id": None, "path": None, "wh": None}
+    fullscreen = False
+    view_start = [0]
+
+    def _clear_overlay():
+        if overlay["id"] is not None:
+            try:
+                gl.glDeleteTextures(1, [overlay["id"]])
+            except Exception:
+                pass
+        overlay["id"] = None
+        overlay["path"] = None
+        overlay["wh"] = None
+
+    def _sync_overlay(path):
+        if path == overlay["path"]:
+            return
+        if not path:
+            _clear_overlay()
+            return
+        dw, dh = _display_size()
+        try:
+            rgba = _load_overlay_rgba(path, dw, dh)
+            tex, iw, ih = _upload_overlay_texture(gl, rgba)
+        except Exception:
+            _clear_overlay()
+            return
+        _clear_overlay()
+        overlay["id"] = tex
+        overlay["path"] = path
+        overlay["wh"] = (iw, ih)
+
+    def _dock():
+        nonlocal width, height, fullscreen
+        width, height = dock_w, dock_h
+        glfw.set_window_size(window, dock_w, dock_h)
+        glfw.set_window_pos(window, max(0, dock_x), max(0, dock_y))
+        glfw.show_window(window)
+        fullscreen = False
+
     while not glfw.window_should_close(window):
         try:
-            while True:
-                value = updates.get_nowait()
-                if value is None:
-                    raise KeyboardInterrupt
-                payload = value
-        except queue.Empty:
-            pass
+            if updates.poll(0.05):
+                while True:
+                    value = updates.recv()
+                    if value is None:
+                        raise KeyboardInterrupt
+                    payload = value
+                    dirty = True
+                    if not updates.poll():
+                        break
+        except EOFError:
+            break
         except KeyboardInterrupt:
             break
 
@@ -134,31 +338,40 @@ def run(updates, parent_pid, scene_id):
         except OSError:
             break
 
-        now = time.monotonic()
-        if now >= next_position_update:
-            geometry = _window_geometry(parent_pid, scene_id)
-            if geometry:
-                x, y, width, viewer_height = geometry
-                if viewer_height != height:
-                    height = viewer_height
-                    glfw.set_window_size(window, WIDTH, height)
-                glfw.set_window_pos(window, x + width, y)
+        cad = payload.get("cad_overlay") if payload else None
+        if cad:
+            dw, dh = _display_size()
+            if not fullscreen or height != dh:
+                glfw.set_window_pos(window, 0, 0)
+                glfw.set_window_size(window, dw, dh)
                 glfw.show_window(window)
-            next_position_update = now + 0.25
+                width, height = dw, dh
+                fullscreen = True
+                dirty = True
+        elif fullscreen:
+            _dock()
+            dirty = True
 
-        if payload:
-            glfw.poll_events()
+        glfw.poll_events()
+        fb_w, fb_h = glfw.get_framebuffer_size(window)
+        if fb_w < 8 or fb_h < 8:
+            continue
+        if payload and dirty:
+            glfw.make_context_current(window)
+            if side == "right":
+                _sync_overlay(cad)
+            imgui.get_io().display_size = (float(fb_w), float(fb_h))
             renderer.process_inputs()
             imgui.new_frame()
-            _draw(imgui, payload, height)
+            _draw(imgui, payload, height, side, width, overlay, view_start)
             glClearColor(1.0, 1.0, 1.0, 1.0)
             glClear(GL_COLOR_BUFFER_BIT)
             imgui.render()
             renderer.render(imgui.get_draw_data())
             glfw.swap_buffers(window)
-        else:
-            time.sleep(0.05)
+            dirty = False
 
+    _clear_overlay()
     renderer.shutdown()
     glfw.destroy_window(window)
     glfw.terminate()

@@ -11,6 +11,7 @@ settings.yaml (spellbook/settings.yaml):
 """
 import importlib.util
 import os
+import re
 
 _EVAL_DIR = os.path.dirname(os.path.abspath(__file__))
 _SPELLBOOK = os.path.dirname(_EVAL_DIR)
@@ -18,6 +19,28 @@ _REPO_ROOT = os.path.dirname(_SPELLBOOK)
 _SETTINGS_FILE = os.path.join(_SPELLBOOK, "settings.yaml")
 _SCANNET200_CONSTANTS = os.path.join(
     _REPO_ROOT, "BenchmarkScripts", "ScanNet200", "scannet200_constants.py")
+_VAL_FILE = os.path.join(_REPO_ROOT, "Tasks", "Benchmark", "scannetv2_val.txt")
+_SCENE_RE = re.compile(r"^scene\d{4}_\d{2}$")
+
+PREDICTION_EVALUATION_SCENES = (
+    "scene0019_01",
+    "scene0217_00",
+    "scene0304_00",
+    "scene0412_00",
+    "scene0414_00",
+    "scene0426_02",
+    "scene0488_00",
+    "scene0549_00",
+    "scene0568_01",
+    "scene0575_00",
+)
+PREDICTION_METHODS = (
+    "mosaic3d",
+    "openins3d",
+    "openyolo3d",
+    "open3dis",
+    "openmask3d",
+)
 
 
 def _load_module(name, path):
@@ -70,6 +93,81 @@ def _build_specs():
 BENCHMARKS = _build_specs()
 
 
+def official_val_scenes():
+    if not os.path.isfile(_VAL_FILE):
+        raise FileNotFoundError(f"official validation list missing: {_VAL_FILE}")
+    scenes = []
+    with open(_VAL_FILE) as f:
+        for line in f:
+            scene = line.strip()
+            if scene:
+                scenes.append(scene)
+    return frozenset(scenes)
+
+
+def normalize_scene_id(scene):
+    if not isinstance(scene, str) or not scene.strip():
+        raise ValueError(f"invalid scene id {scene!r}")
+    scene = scene.strip()
+    if scene.startswith("scene"):
+        scene = scene[5:]
+    return "scene" + scene
+
+
+def validate_prediction_scenes(scenes, require_complete=False):
+    if not isinstance(scenes, (list, tuple)) or not scenes:
+        raise ValueError("scenes must be a non-empty list")
+    allowed = set(PREDICTION_EVALUATION_SCENES)
+    out = []
+    seen = set()
+    for scene in scenes:
+        scene = normalize_scene_id(scene)
+        if not _SCENE_RE.match(scene):
+            raise ValueError(f"invalid scene id {scene!r}")
+        if scene not in allowed:
+            raise ValueError(f"scene {scene!r} is outside the fixed prediction evaluation set")
+        if scene in seen:
+            raise ValueError(f"duplicate scene id {scene!r}")
+        seen.add(scene)
+        out.append(scene)
+    if require_complete:
+        missing = [scene for scene in PREDICTION_EVALUATION_SCENES if scene not in seen]
+        extra = [scene for scene in out if scene not in set(PREDICTION_EVALUATION_SCENES)]
+        if missing or extra or len(out) != len(PREDICTION_EVALUATION_SCENES):
+            raise ValueError("comparable prediction runs require the exact 10-scene protocol set")
+        return list(PREDICTION_EVALUATION_SCENES)
+    return out
+
+
+def validate_prediction_methods(methods):
+    if not isinstance(methods, (list, tuple)) or not methods:
+        raise ValueError("methods must be a non-empty list")
+    allowed = set(PREDICTION_METHODS)
+    out = []
+    seen = set()
+    for method in methods:
+        if not isinstance(method, str) or method not in allowed:
+            raise ValueError(f"unknown method {method!r} (expected one of {list(PREDICTION_METHODS)})")
+        if method in seen:
+            raise ValueError(f"duplicate method {method!r}")
+        seen.add(method)
+        out.append(method)
+    return out
+
+
+def _validate_prediction_protocol():
+    official = official_val_scenes()
+    assert PREDICTION_METHODS == (
+        "mosaic3d", "openins3d", "openyolo3d", "open3dis", "openmask3d")
+    assert len(PREDICTION_EVALUATION_SCENES) == 10
+    assert len(set(PREDICTION_EVALUATION_SCENES)) == 10
+    bases = [scene.rsplit("_", 1)[0] for scene in PREDICTION_EVALUATION_SCENES]
+    assert len(set(bases)) == 10, "prediction evaluation scenes must be unique physical scenes"
+    for scene in PREDICTION_EVALUATION_SCENES:
+        assert _SCENE_RE.match(scene), scene
+        assert scene in official, scene
+
+
 def _validate():
     for name, spec in BENCHMARKS.items():
         assert len(spec.class_labels) == len(spec.valid_ids), name
@@ -79,6 +177,7 @@ def _validate():
     assert len(BENCHMARKS["ScanNet200"].class_labels) == 198, "ScanNet200 must have 198 classes"
     assert 1 not in BENCHMARKS["ScanNet200"].valid_ids and 3 not in BENCHMARKS["ScanNet200"].valid_ids
     assert 1 not in BENCHMARKS["ScanNet20"].valid_ids and 2 not in BENCHMARKS["ScanNet20"].valid_ids
+    _validate_prediction_protocol()
 
 
 _validate()

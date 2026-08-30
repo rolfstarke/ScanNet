@@ -19,7 +19,10 @@ import torch
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import _benchmark_spec, decimate, scene_id_from_pointcloud, write_scannet_submission  # noqa: E402
+from common import (  # noqa: E402
+    _benchmark_spec, add_run_args, decimate, load_overrides,
+    scene_id_from_pointcloud, write_scannet_submission,
+)
 
 MOSAIC3D_REPO = "/home/rolf/GIT/Mosaic3D"
 CHECKPOINT = "/data/mosaic3d/ckpts/spunet34c.ckpt"
@@ -53,9 +56,17 @@ def main():
     ap.add_argument("--out", required=True, help="predictions output dir")
     ap.add_argument("--benchmark", default="ScanNet20",
                     choices=["ScanNet20", "ScanNet200"])
+    add_run_args(ap)
     args = ap.parse_args()
     spec = _benchmark_spec(args.benchmark)
     scene_id = scene_id_from_pointcloud(args.pointcloud)
+    params = load_overrides(args.parameters_json, {
+        "grid_size", "point_limit", "min_mask_points", "condition"})
+    grid_size = float(params.get("grid_size", GRID_SIZE))
+    point_limit = int(params.get("point_limit", POINT_LIMIT))
+    min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
+    condition = str(params.get("condition", CONDITION))
+    print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -66,10 +77,10 @@ def main():
     full_cols = np.asarray(pcd.colors)
     up_axis = _detect_up_axis(full_pts)
 
-    working_pts, nn_idx = decimate(full_pts, POINT_LIMIT)
+    working_pts, nn_idx = decimate(full_pts, point_limit)
     if len(working_pts) < len(full_pts):
         working_cols = full_cols[cKDTree(full_pts).query(working_pts, k=1, workers=-1)[1]]
-        working_ply = os.path.join(SCRATCH_ROOT, scene_id, "working_scene.ply")
+        working_ply = os.path.join(SCRATCH_ROOT, args.run_id, scene_id, "working_scene.ply")
         os.makedirs(os.path.dirname(working_ply), exist_ok=True)
         working_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(working_pts))
         working_pcd.colors = o3d.utility.Vector3dVector(working_cols)
@@ -83,7 +94,7 @@ def main():
     from scripts.run_custom_scene import run_inference
 
     objects, _, _ = run_inference(
-        scene_ply, args.classes, CHECKPOINT, device, condition=CONDITION, grid_size=GRID_SIZE, up_axis=up_axis,
+        scene_ply, args.classes, CHECKPOINT, device, condition=condition, grid_size=grid_size, up_axis=up_axis,
         class_profiles=STRUCTURAL_CLASS_PROFILES,
     )
 
@@ -94,7 +105,7 @@ def main():
             yield sel_working[nn_idx], obj["class_name"], obj["score"]
 
     n_written = write_scannet_submission(args.out, scene_id, args.classes, _instances(),
-                                         MIN_MASK_POINTS, spec)
+                                          min_mask_points, spec)
     print(f"[INFO] Wrote {n_written} instances to {args.out} ({len(working_pts)}/{len(full_pts)} points used)")
 
 

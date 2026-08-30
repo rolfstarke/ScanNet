@@ -17,7 +17,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import _benchmark_spec, write_scannet_submission  # noqa: E402
+from common import _benchmark_spec, add_run_args, load_overrides, write_scannet_submission  # noqa: E402
 
 OPENYOLO3D_REPO = "/home/rolf/GIT/OpenYOLO3D"
 SCRATCH_ROOT = "/data/openyolo3D/scratch"
@@ -25,12 +25,12 @@ CONFIG_TEMPLATE = os.path.join(OPENYOLO3D_REPO, "pretrained", "config_scannet200
 MIN_MASK_POINTS = 20
 
 
-def _build_scratch_scene(frames_dir, pointcloud, scene_id):
+def _build_scratch_scene(frames_dir, pointcloud, scene_id, run_id):
     """Symlink frames/ + mesh into OpenYOLO3D's expected scene layout: poses/ (plural), a single
     intrinsics.txt (from frames_dir/intrinsic_COLOR.txt -- OpenYOLO3D's adjust_intrinsic expects
     color-resolution intrinsics and rescales to depth internally, see WORLD_2_CAM), color/,
     depth/, and one *.ply at the root."""
-    scratch = os.path.join(SCRATCH_ROOT, scene_id)
+    scratch = os.path.join(SCRATCH_ROOT, run_id, scene_id)
     if os.path.islink(scratch) or os.path.exists(scratch):
         shutil.rmtree(scratch)
     os.makedirs(scratch)
@@ -56,13 +56,17 @@ def main():
     ap.add_argument("--benchmark", default="ScanNet20",
                     choices=["ScanNet20", "ScanNet200"],
                     help="benchmark backend (default ScanNet20)")
+    add_run_args(ap)
     args = ap.parse_args()
     spec = _benchmark_spec(args.benchmark)
+    params = load_overrides(args.parameters_json, {"min_mask_points"})
+    min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
 
     os.makedirs(args.out, exist_ok=True)
     scene_id = os.path.basename(os.path.dirname(args.pointcloud))
+    print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params}")
 
-    scratch = _build_scratch_scene(args.frames, args.pointcloud, scene_id)
+    scratch = _build_scratch_scene(args.frames, args.pointcloud, scene_id, args.run_id)
 
     # Per-run config: reuse the repo's scannet200 template but with exactly the requested
     # classes as text prompts.
@@ -71,7 +75,7 @@ def main():
         cfg = yaml.safe_load(f)
     cfg["network2d"]["text_prompts"] = list(args.classes)
     cfg["network3d"]["is_gt"] = False
-    cfg_path = os.path.join(SCRATCH_ROOT, scene_id, "openyolo3d_config.yaml")
+    cfg_path = os.path.join(scratch, "openyolo3d_config.yaml")
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
 
@@ -97,7 +101,7 @@ def main():
             yield masks_np[:, i], args.classes[classes_np[i]], float(scores_np[i])
 
     n_written = write_scannet_submission(args.out, scene_id, args.classes, _instances(),
-                                         MIN_MASK_POINTS, spec)
+                                          min_mask_points, spec)
     print(f"[INFO] Wrote {n_written} instances to {args.out} "
           f"({masks_np.shape[1]} raw masks, {masks_np.shape[0]} points)")
 

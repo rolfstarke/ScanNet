@@ -8,6 +8,7 @@ Prediction output follows ScanNet's official benchmark submission layout (scan-n
 per mesh vertex), which is the shape ScanNet's own evaluator
 (BenchmarkScripts/3d_evaluation/evaluate_semantic_instance.py) reads directly.
 """
+import json
 import os
 import pathlib
 import sys
@@ -55,6 +56,24 @@ def decimate(pts, limit):
     return down, nn_idx
 
 
+def add_run_args(parser):
+    parser.add_argument("--run-id", default="adhoc")
+    parser.add_argument("--parameters-json", default=None)
+
+
+def load_overrides(path, allowed):
+    if not path:
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    if type(data) is not dict:
+        raise ValueError(f"parameters JSON must be an object: {path}")
+    extra = [key for key in data if key not in allowed]
+    if extra:
+        raise ValueError(f"unknown parameter(s): {extra}")
+    return data
+
+
 def write_scannet_submission(submission_root, scene_id, classes, instances, min_mask_points, spec):
     """Writes <scene_id>.txt + predicted_masks/<scene_id>_NNN.txt in ScanNet's official
     benchmark submission layout (scan-net.org): one line per instance
@@ -67,20 +86,35 @@ def write_scannet_submission(submission_root, scene_id, classes, instances, min_
     if unknown:
         raise ValueError(
             f"write_scannet_submission: class(es) {unknown} are not in benchmark {spec.name} "
-            f"({len(spec.class_labels)} classes) — cannot assign a scoreable label id. Use only "
+            f"({len(spec.class_labels)} classes) - cannot assign a scoreable label id. Use only "
             f"the official benchmark class names."
         )
     label_ids = {c: spec.label_to_id[c] for c in classes}
     mask_dir = os.path.join(submission_root, "predicted_masks")
     os.makedirs(mask_dir, exist_ok=True)
-
+    index_path = os.path.join(submission_root, f"{scene_id}.txt")
+    tmp_index = index_path + ".tmp"
+    written = []
     n_written = 0
-    with open(os.path.join(submission_root, f"{scene_id}.txt"), "w") as scene_f:
+    with open(tmp_index, "w") as scene_f:
         for mask, class_name, confidence in instances:
             if mask.sum() < min_mask_points:
                 continue
             mask_name = f"{scene_id}_{n_written:03d}.txt"
-            np.savetxt(os.path.join(mask_dir, mask_name), mask.astype(int), fmt="%d")
+            final_mask = os.path.join(mask_dir, mask_name)
+            tmp_mask = final_mask + ".tmp"
+            np.savetxt(tmp_mask, mask.astype(int), fmt="%d")
+            os.replace(tmp_mask, final_mask)
+            written.append(mask_name)
             scene_f.write(f"predicted_masks/{mask_name} {label_ids[class_name]} {confidence:.4f}\n")
             n_written += 1
+        scene_f.flush()
+        os.fsync(scene_f.fileno())
+    os.replace(tmp_index, index_path)
+    keep = set(written)
+    prefix = scene_id + "_"
+    if os.path.isdir(mask_dir):
+        for name in os.listdir(mask_dir):
+            if name.startswith(prefix) and name.endswith(".txt") and name not in keep:
+                os.remove(os.path.join(mask_dir, name))
     return n_written
