@@ -26,7 +26,7 @@ from common import (  # noqa: E402
 )
 
 MOSAIC3D_REPO = "/home/rolf/GIT/Mosaic3D"
-CHECKPOINT = "/data/mosaic3d/ckpts/spunet34c.ckpt"
+CHECKPOINT = "/data/mosaic3d/ckpts/sc.ckpt"
 CONDITION = "ScanNet"
 GRID_SIZE = 0.02
 INSTANCE_HEAD = "mask3d"
@@ -45,7 +45,7 @@ STRUCTURAL_CLASS_PROFILES = {
 
 
 def _mask3d_masks(pointcloud, run_id, scene_id, confidence):
-    out = os.path.join(SCRATCH_ROOT, run_id, scene_id, "mask3d_masks.npz")
+    out = os.path.join(SCRATCH_ROOT, "mask3d_proposals", scene_id, "mask3d_masks.npz")
     if os.path.isfile(out):
         return np.load(out)["masks"]
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -81,14 +81,15 @@ def main():
     scene_id = scene_id_from_pointcloud(args.pointcloud)
     params = load_overrides(args.parameters_json, {
         "grid_size", "point_limit", "min_mask_points", "condition",
-        "instance_head", "mask3d_confidence"})
+        "instance_head", "mask3d_confidence", "checkpoint"})
     grid_size = float(params.get("grid_size", GRID_SIZE))
     point_limit = int(params.get("point_limit", POINT_LIMIT))
     min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
     condition = str(params.get("condition", CONDITION))
     instance_head = str(params.get("instance_head", INSTANCE_HEAD))
     mask3d_confidence = float(params.get("mask3d_confidence", MASK3D_CONFIDENCE))
-    print(f"[INFO] {scene_id} run_id={args.run_id} head={instance_head} overrides={params}")
+    checkpoint = str(params.get("checkpoint", CHECKPOINT))
+    print(f"[INFO] {scene_id} run_id={args.run_id} head={instance_head} ckpt={checkpoint} overrides={params}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -119,7 +120,7 @@ def main():
         if masks.shape[0] != len(full_pts):
             raise RuntimeError(f"Mask3D N={masks.shape[0]} != mesh N={len(full_pts)}")
         objects, _ = classify_mask3d_proposals(
-            args.pointcloud, args.classes, CHECKPOINT, device, masks,
+            args.pointcloud, args.classes, checkpoint, device, masks,
             condition=condition, grid_size=grid_size, up_axis=up_axis,
             min_mask_points=min_mask_points)
         nn_idx = np.arange(len(full_pts))
@@ -127,7 +128,7 @@ def main():
     else:
         from scripts.run_custom_scene import run_inference
         objects, _, _ = run_inference(
-            scene_ply, args.classes, CHECKPOINT, device, condition=condition,
+            scene_ply, args.classes, checkpoint, device, condition=condition,
             grid_size=grid_size, up_axis=up_axis,
             class_profiles=STRUCTURAL_CLASS_PROFILES,
         )
