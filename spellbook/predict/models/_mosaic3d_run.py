@@ -26,7 +26,7 @@ from common import (  # noqa: E402
 
 MOSAIC3D_REPO = "/home/rolf/GIT/Mosaic3D"
 CHECKPOINT = "/data/mosaic3d/ckpts/spunet34c.ckpt"
-CONDITION = "ARKitScenes"  # handheld mobile LiDAR domain -- closest match to a handheld ZED scan
+CONDITION = "ScanNet"
 GRID_SIZE = 0.02
 
 POINT_LIMIT = 1_500_000  # SpUNet's per-point feature gather OOMs on a 16GB card above ~2M points
