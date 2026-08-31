@@ -119,10 +119,11 @@ def main():
         masks = _mask3d_masks(args.pointcloud, args.run_id, scene_id, mask3d_confidence)
         if masks.shape[0] != len(full_pts):
             raise RuntimeError(f"Mask3D N={masks.shape[0]} != mesh N={len(full_pts)}")
+        ppt_conditions = ["ScanNet"] if checkpoint.rstrip("/").endswith("sc.ckpt") else None
         objects, _ = classify_mask3d_proposals(
             args.pointcloud, args.classes, checkpoint, device, masks,
             condition=condition, grid_size=grid_size, up_axis=up_axis,
-            min_mask_points=min_mask_points)
+            min_mask_points=min_mask_points, ppt_conditions=ppt_conditions)
         nn_idx = np.arange(len(full_pts))
         working_pts = full_pts
     else:
