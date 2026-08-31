@@ -103,6 +103,19 @@ def _run_feature_computation(scene_ply, masks_path, frames, out_dir, frequency):
     return os.path.join(out_dir, f"{scene_name}_openmask3d_features.npy")
 
 
+def _clip_vocab(spec):
+    if spec.name != "ScanNet200":
+        return list(spec.class_labels)
+    import importlib.util
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))
+    path = os.path.join(repo, "BenchmarkScripts", "ScanNet200", "scannet200_constants.py")
+    spec_mod = importlib.util.spec_from_file_location("scannet200_constants", path)
+    module = importlib.util.module_from_spec(spec_mod)
+    spec_mod.loader.exec_module(module)
+    return list(module.CLASS_LABELS_200)
+
+
 def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS,
               clip_prompt=CLIP_PROMPT):
     model, _ = clip.load("ViT-L/14@336px", device=device)
@@ -112,6 +125,7 @@ def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS,
         text_ft = (text_ft / text_ft.norm(dim=-1, keepdim=True)).cpu().numpy()
 
     instances = []
+    skipped = 0
     for mi in tqdm(range(masks.shape[1]), desc="classifying masks", unit="mask"):
         sel = masks[:, mi] > 0.5
         if sel.sum() < min_mask_points:
@@ -121,7 +135,12 @@ def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS,
             continue
         sims = (feats[mi] / norm) @ text_ft.T
         best = int(np.argmax(sims))
-        instances.append((sel, classes[best], 1.0))
+        name = classes[best]
+        if name in ("wall", "floor"):
+            skipped += 1
+            continue
+        instances.append((sel, name, 1.0))
+    print(f"[INFO] skipped {skipped} wall/floor CLIP assignments")
     return instances
 
 
@@ -175,7 +194,8 @@ def main():
     masks = np.asarray(torch.load(masks_path))
     feats = np.load(features_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    instances = _classify(masks, feats, args.classes, device, min_mask_points, clip_prompt)
+    clip_classes = _clip_vocab(spec)
+    instances = _classify(masks, feats, clip_classes, device, min_mask_points, clip_prompt)
 
     def _instances():
         for sel_decimated, class_name, confidence in instances:
