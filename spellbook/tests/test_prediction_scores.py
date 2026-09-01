@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import os
@@ -11,7 +12,7 @@ import numpy as np
 _SPELLBOOK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _SPELLBOOK)
 
-from evaluation.benchmark import BENCHMARKS  # noqa: E402
+from evaluation.benchmark import BENCHMARKS, submission_dir  # noqa: E402
 from evaluation.evaluate import (  # noqa: E402
     load_score_sidecar, scene_submission_status, score_and_write_sidecar, score_sidecar_path,
     score_sidecars_cli, write_score_sidecar)
@@ -36,6 +37,33 @@ def _gt_ids(n, instance_id):
 
 def _pred(mask, label_id, conf=0.9, key="mask"):
     return {key: {"label_id": label_id, "conf": conf, "pred_mask": np.asarray(mask, dtype=np.int32)}}
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        digest.update(f.read())
+    return digest.hexdigest()
+
+
+def _sidecar_doc(**overrides):
+    doc = {
+        "schema": 2,
+        "metric": "scannet_instance_ap50",
+        "iou_threshold": 0.5,
+        "min_region_size": 100,
+        "scene_id": "scene0568_00",
+        "label_set": "ScanNet20",
+        "run_id": "run-a",
+        "model": "mosaic3d",
+        "index_sha256": "a" * 64,
+        "gt_sha256": "b" * 64,
+        "tp": 3,
+        "gt": 57,
+        "verdicts": {"predicted_masks/scene0568_00_000.txt": "tp"},
+    }
+    doc.update(overrides)
+    return doc
 
 
 class Ap50SummaryTests(unittest.TestCase):
@@ -135,24 +163,15 @@ class SidecarTests(unittest.TestCase):
         spec = _spec20()
         with tempfile.TemporaryDirectory() as root:
             path = score_sidecar_path(spec, "run-a", "mosaic3d", "scene0568_00", scannet_root=root)
-            payload = {
-                "schema": 1,
-                "metric": "scannet_instance_ap50",
-                "iou_threshold": 0.5,
-                "min_region_size": 100,
-                "scene_id": "scene0568_00",
-                "label_set": "ScanNet20",
-                "run_id": "run-a",
-                "model": "mosaic3d",
-                "tp": 3,
-                "gt": 57,
-                "verdicts": {"predicted_masks/scene0568_00_000.txt": "tp"},
-            }
+            payload = _sidecar_doc()
             write_score_sidecar(path, payload)
             self.assertFalse(os.path.isfile(path + ".tmp"))
             loaded = load_score_sidecar(path, "scene0568_00", "ScanNet20", "run-a", "mosaic3d")
             self.assertEqual(loaded["tp"], 3)
             self.assertEqual(loaded["gt"], 57)
+            self.assertIsNone(load_score_sidecar(
+                path, "scene0568_00", "ScanNet20", "run-a", "mosaic3d",
+                index_sha256="c" * 64))
             payload["tp"] = 4
             write_score_sidecar(path, payload)
             loaded = load_score_sidecar(path, "scene0568_00", "ScanNet20", "run-a", "mosaic3d")
@@ -184,18 +203,32 @@ class SidecarTests(unittest.TestCase):
     def test_score_sidecars_missing_only_skips_existing(self):
         spec = _spec20()
         with tempfile.TemporaryDirectory() as root:
+            pred, index = _write_valid_pred(root, spec, "scene0568_00")
             path = score_sidecar_path(spec, "run-a", "mosaic3d", "scene0568_00", scannet_root=root)
-            write_score_sidecar(path, {
-                "schema": 1, "metric": "scannet_instance_ap50", "iou_threshold": 0.5,
-                "min_region_size": 100, "scene_id": "scene0568_00", "label_set": "ScanNet20",
-                "run_id": "run-a", "model": "mosaic3d", "tp": 1, "gt": 1, "verdicts": {},
-            })
+            write_score_sidecar(path, _sidecar_doc(
+                index_sha256=_file_sha256(index), tp=1, gt=1, verdicts={}))
             with mock.patch("evaluation.evaluate.score_and_write_sidecar") as scored:
                 score_sidecars_cli([
                     "--benchmark", "ScanNet20", "--run-id", "run-a", "--models", "mosaic3d",
                     "--scenes", "0568_00", "--scannet-root", root, "--missing-only",
                 ])
             scored.assert_not_called()
+            self.assertEqual(pred, os.path.join(
+                root, "predictions", "ScanNet20", "run-a", "mosaic3d"))
+
+    def test_score_sidecars_missing_only_rescores_stale(self):
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            _write_valid_pred(root, spec, "scene0568_00")
+            path = score_sidecar_path(spec, "run-a", "mosaic3d", "scene0568_00", scannet_root=root)
+            write_score_sidecar(path, _sidecar_doc(tp=1, gt=1, verdicts={}))
+            with mock.patch("evaluation.evaluate.score_and_write_sidecar") as scored:
+                scored.return_value = {"tp": 1, "gt": 1}
+                score_sidecars_cli([
+                    "--benchmark", "ScanNet20", "--run-id", "run-a", "--models", "mosaic3d",
+                    "--scenes", "0568_00", "--scannet-root", root, "--missing-only",
+                ])
+            scored.assert_called_once()
 
 
 class RunnerFinalizeTests(unittest.TestCase):
@@ -207,6 +240,16 @@ class RunnerFinalizeTests(unittest.TestCase):
             with mock.patch("evaluation.evaluate.score_and_write_sidecar", return_value={"tp": 1}):
                 runner._finalize_prediction(
                     "mosaic3d", "scene0568_01", tmp, "ScanNet20", "run-a", tasks_log)
+            with open(tasks_log) as f:
+                self.assertEqual(f.read(), "scene0568_01\n")
+
+    def test_ensure_task_repairs_missing_marker(self):
+        from predict import runner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_log = os.path.join(tmp, "mosaic3d.tasks")
+            runner._ensure_task(tasks_log, "scene0568_01", scannet_root=tmp)
+            runner._ensure_task(tasks_log, "scene0568_01", scannet_root=tmp)
             with open(tasks_log) as f:
                 self.assertEqual(f.read(), "scene0568_01\n")
 
@@ -253,11 +296,10 @@ class CleanupTests(unittest.TestCase):
                 f.write("1\n")
             sidecar = score_sidecar_path(spec, "run-a", "mosaic3d", "scene0568_00", scannet_root=root)
             os.makedirs(os.path.dirname(sidecar))
-            write_score_sidecar(sidecar, {
-                "schema": 1, "metric": "scannet_instance_ap50", "iou_threshold": 0.5,
-                "min_region_size": 100, "scene_id": "scene0568_00", "label_set": "ScanNet20",
-                "run_id": "run-a", "model": "mosaic3d", "tp": 1, "gt": 1, "verdicts": {},
-            })
+            timing = os.path.join(os.path.dirname(sidecar), "scene0568_00.timing.json")
+            with open(timing, "w") as f:
+                f.write("{}\n")
+            write_score_sidecar(sidecar, _sidecar_doc(tp=1, gt=1, verdicts={}))
             eval_dir = os.path.join(root, "derived", "evaluations", "ScanNet20", "run-a")
             os.makedirs(eval_dir, exist_ok=True)
             with open(os.path.join(eval_dir, "mosaic3d.tasks"), "w") as f:
@@ -265,6 +307,7 @@ class CleanupTests(unittest.TestCase):
             with mock.patch("reconstruct.cleanup.load_settings", return_value={"scannet_root": root}):
                 purge_scan_predictions("scene0568_00", scannet_root=root)
             self.assertFalse(os.path.isfile(sidecar))
+            self.assertFalse(os.path.isfile(timing))
             self.assertFalse(os.path.isfile(os.path.join(pred, "scene0568_00.txt")))
 
 
@@ -274,6 +317,18 @@ def _load_common():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _write_valid_pred(root, spec, scene_id, run_id="run-a", model="mosaic3d", n=4):
+    _write_ply(os.path.join(root, "scans", scene_id, f"{scene_id}_vh_clean_2.ply"), n)
+    pred = submission_dir(spec, run_id, model, scannet_root=root)
+    os.makedirs(os.path.join(pred, "predicted_masks"))
+    with open(os.path.join(pred, "predicted_masks", f"{scene_id}_000.txt"), "w") as f:
+        f.write("1\n" * 2 + "0\n" * (n - 2))
+    index = os.path.join(pred, scene_id + ".txt")
+    with open(index, "w") as f:
+        f.write(f"predicted_masks/{scene_id}_000.txt {spec.valid_ids[0]} 0.9\n")
+    return pred, index
 
 
 def _write_ply(path, n):
@@ -299,6 +354,25 @@ class CommonContractTests(unittest.TestCase):
                 json.dump({"point_limit": 0}, f)
             with self.assertRaises(ValueError):
                 common.load_overrides(path, {"point_limit"})
+
+    def test_load_overrides_rejects_nan_inf_zero_grid_and_enums(self):
+        common = _load_common()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.json")
+            cases = (
+                ({"grid_size": 0}, {"grid_size"}),
+                ({"grid_size": float("nan")}, {"grid_size"}),
+                ({"grid_size": float("inf")}, {"grid_size"}),
+                ({"point_limit": float("inf")}, {"point_limit"}),
+                ({"detector": "nope"}, {"detector"}),
+                ({"condition": "S3DIS"}, {"condition"}),
+                ({"mask_confidence_threshold": 1.5}, {"mask_confidence_threshold"}),
+            )
+            for payload, allowed in cases:
+                with open(path, "w") as f:
+                    json.dump(payload, f)
+                with self.assertRaises(ValueError):
+                    common.load_overrides(path, allowed)
 
     def test_validate_run_id_rejects_paths(self):
         common = _load_common()
@@ -369,6 +443,45 @@ class CompletionTests(unittest.TestCase):
             status = scene_submission_status(
                 pred, "scene0568_01", spec, "run-a", "mosaic3d", scannet_root=root)
             self.assertEqual(status, "missing")
+
+    def test_stale_sidecar_needs_score(self):
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            pred, index = _write_valid_pred(root, spec, "scene0568_01")
+            path = score_sidecar_path(spec, "run-a", "mosaic3d", "scene0568_01", scannet_root=root)
+            write_score_sidecar(path, _sidecar_doc(
+                scene_id="scene0568_01", index_sha256=_file_sha256(index),
+                tp=0, gt=1, verdicts={}))
+            self.assertEqual(
+                scene_submission_status(
+                    pred, "scene0568_01", spec, "run-a", "mosaic3d", scannet_root=root),
+                "complete")
+            with open(index, "w") as f:
+                f.write(f"predicted_masks/scene0568_01_000.txt {spec.valid_ids[0]} 0.8\n")
+            self.assertEqual(
+                scene_submission_status(
+                    pred, "scene0568_01", spec, "run-a", "mosaic3d", scannet_root=root),
+                "needs_score")
+
+
+class EvaluateCliTests(unittest.TestCase):
+    def test_refuses_existing_csv(self):
+        from evaluation.evaluate import evaluate_cli
+        from evaluation.runs import write_run_manifest
+
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            write_run_manifest(spec, "run-a", ["scene0568_01"], ["mosaic3d"], scannet_root=root)
+            csv_path = os.path.join(
+                root, "derived", "evaluations", "ScanNet20", "run-a", "mosaic3d.csv")
+            os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+            with open(csv_path, "w") as f:
+                f.write("class,class id,ap,ap50,ap25\nchair,5,0.1,0.2,0.3\n")
+            with self.assertRaises(ValueError):
+                evaluate_cli([
+                    "--benchmark", "ScanNet20", "--run-id", "run-a",
+                    "--models", "mosaic3d", "--scannet-root", root,
+                ])
 
 
 class OpenMaskOverrideTests(unittest.TestCase):

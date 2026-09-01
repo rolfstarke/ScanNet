@@ -11,14 +11,19 @@ _SPELLBOOK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _SPELLBOOK)
 
 from evaluation.evaluate import write_score_sidecar  # noqa: E402
-from utils.hud import ellipsize  # noqa: E402
+from utils.hud import _draw_right, ellipsize, format_metric  # noqa: E402
 from utils.visualize import (  # noqa: E402
-    FOCUS_SETTINGS, FOCUS_TREE, KEY_DOWN, KEY_ENTER, KEY_LEFT, KEY_RIGHT, KEY_TAB,
-    KEY_UP, KIND_METHOD, KIND_RUN, KIND_SCAN, SOURCE_GT, apply_prediction_labels,
-    best_prediction,     cad_report_png, clamp_cursor, clear_tracked, collect_tp_scores,
-    discover_reconstructions, flatten_tree, group_scenes, handle_navigation,
-    index_predictions, load_cad_accuracy, method_node_id, prediction_artifact_mtime,
-    require_scene, run_node_id, scan_node_id, scene_node_id, settings_payload,
+    COLOR_CLASS, COLOR_TPGT, FOCUS_SETTINGS, FOCUS_TREE, KEY_DOWN, KEY_ENTER,
+    KEY_LEFT, KEY_RIGHT, KEY_TAB, KEY_UP, KIND_METHOD, KIND_RUN, KIND_SCAN,
+    SETTING_ROWS, SOURCE_GT, SOURCE_PRED, SOURCE_SCENE, apply_prediction_labels,
+    best_prediction, cad_report_png, camera_label_update, capped_geometry,
+    clamp_cursor, clear_tracked, collect_tp_scores, discover_reconstructions,
+    flatten_tree, group_scenes, handle_navigation, index_predictions,
+    collect_prediction_times, collect_reconstruction_times, information_payload,
+    load_cad_accuracy, merge_tp_gt_overlay, method_node_id,
+    object_bounds, prediction_artifact_mtime, render_object_fields,
+    require_scene, reset_camera_label_state, run_node_id, scan_node_id,
+    scene_node_id, settings_payload,
 )
 
 
@@ -36,9 +41,9 @@ def _nav_state(**extra):
         "expanded": set(),
         "cursor_id": None,
         "benchmark": "ScanNet200",
-        "run_id": None,
-        "model": SOURCE_GT,
-        "color_mode": "class",
+        "source_mode": SOURCE_SCENE,
+        "selected_pred": None,
+        "color_mode": COLOR_CLASS,
         "geometry": "mesh",
         "boxes": True,
         "ceiling_hidden": False,
@@ -185,11 +190,22 @@ class NavigationTests(unittest.TestCase):
         self.state = _nav_state(
             expanded=self.expanded, cursor_id=scene_node_id("scene0568"))
         self.options = {
-            "benchmark": ["ScanNet20", "ScanNet200"],
-            "mode": ["scene", "class", "instance", "tp_fp"],
-            "geometry": ["mesh", "pointcloud"],
-            "boxes": [True, False],
-            "ceiling": [False, True],
+            "benchmark": [{"value": "ScanNet20"}, {"value": "ScanNet200"}],
+            "mode": [
+                {"value": SOURCE_GT}, {"value": SOURCE_SCENE},
+                {"value": SOURCE_PRED, "enabled": False},
+            ],
+            "color": [
+                {"value": COLOR_CLASS}, {"value": "instance"},
+                {"value": COLOR_TPGT, "enabled": False},
+            ],
+            "geometry": [{"value": "mesh"}, {"value": "pointcloud"}],
+            "boxes": [{"value": True}, {"value": False}],
+            "ceiling": [{"value": False}, {"value": True}],
+            "cad": [
+                {"value": False, "enabled": False},
+                {"value": True, "enabled": False},
+            ],
         }
 
     def test_enter_toggles_folder_without_activation(self):
@@ -230,7 +246,7 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(self.state["cursor_id"], scene_node_id("scene0568"))
         handle_navigation(self.state, KEY_TAB, self.rows, self.options)
         self.assertEqual(self.state["focus"], FOCUS_SETTINGS)
-        self.assertEqual(self.state["model"], SOURCE_GT)
+        self.assertEqual(self.state["source_mode"], SOURCE_SCENE)
 
     def test_left_right_only_toggle_expand(self):
         groups = group_scenes(["scene0568_00", "scene0568_01"])
@@ -266,21 +282,23 @@ class NavigationTests(unittest.TestCase):
     def test_settings_candidate_then_enter(self):
         self.state["focus"] = FOCUS_SETTINGS
         handle_navigation(self.state, KEY_RIGHT, self.rows, self.options)
-        self.assertEqual(self.state["candidate"], "ScanNet20")
+        self.assertIsNone(self.state["candidate"])
+        handle_navigation(self.state, KEY_LEFT, self.rows, self.options)
+        self.assertEqual(self.state["candidate"], ("benchmark", "ScanNet20"))
         action = handle_navigation(self.state, KEY_ENTER, self.rows, self.options)
         self.assertEqual(action["apply"], ("benchmark", "ScanNet20"))
         self.state["focus"] = FOCUS_SETTINGS
-        self.state["candidate"] = "ScanNet20"
+        self.state["candidate"] = ("benchmark", "ScanNet20")
         handle_navigation(self.state, KEY_DOWN, self.rows, self.options)
         self.assertIsNone(self.state["candidate"])
-        self.state["candidate"] = "ScanNet200"
+        self.state["candidate"] = ("mode", SOURCE_GT)
         handle_navigation(self.state, KEY_TAB, self.rows, self.options)
         self.assertIsNone(self.state["candidate"])
         self.assertEqual(self.state["focus"], FOCUS_TREE)
 
     def test_settings_option_kinds(self):
         self.state["focus"] = FOCUS_SETTINGS
-        self.state["candidate"] = "ScanNet20"
+        self.state["candidate"] = ("benchmark", "ScanNet20")
         rows = settings_payload(self.state, self.options, lambda _r, v: str(v))
         kinds = {o["text"]: o["kind"] for o in rows[0]["options"]}
         self.assertEqual(kinds["ScanNet200"], "applied")
@@ -288,21 +306,24 @@ class NavigationTests(unittest.TestCase):
         self.assertTrue(next(o["sel"] for o in rows[0]["options"] if o["text"] == "ScanNet20"))
         self.assertEqual(rows[0]["name"], "Label set")
 
-    def test_cad_enter_toggles(self):
+    def test_cad_candidate_then_enter(self):
         options = dict(self.options)
-        options["cad"] = [False, True]
+        options["cad"] = [{"value": False}, {"value": True}]
         self.state["focus"] = FOCUS_SETTINGS
-        self.state["setting_index"] = 5
+        self.state["setting_index"] = SETTING_ROWS.index("cad")
+        handle_navigation(self.state, KEY_RIGHT, self.rows, options)
         action = handle_navigation(self.state, KEY_ENTER, self.rows, options)
         self.assertEqual(action["apply"], ("cad", True))
         self.state["cad_open"] = True
-        self.state["candidate"] = None
+        handle_navigation(self.state, KEY_LEFT, self.rows, options)
         action = handle_navigation(self.state, KEY_ENTER, self.rows, options)
         self.assertEqual(action["apply"], ("cad", False))
 
-    def test_cad_row_absent_without_png(self):
+    def test_cad_row_disabled_without_png(self):
         rows = settings_payload(self.state, self.options, lambda _r, v: str(v))
-        self.assertFalse(any(r["key"] == "cad" for r in rows))
+        cad = next(row for row in rows if row["key"] == "cad")
+        self.assertTrue(cad["options"])
+        self.assertTrue(all(option["kind"] == "disabled" for option in cad["options"]))
 
 
 class CadPngTests(unittest.TestCase):
@@ -390,9 +411,10 @@ class SidecarTreeTests(unittest.TestCase):
             path = os.path.join(root, "derived", "evaluations", "ScanNet20",
                                 "run-a", "mosaic3d", "scene0568_00.tp50.json")
             write_score_sidecar(path, {
-                "schema": 1, "metric": "scannet_instance_ap50", "iou_threshold": 0.5,
+                "schema": 2, "metric": "scannet_instance_ap50", "iou_threshold": 0.5,
                 "min_region_size": 100, "scene_id": "scene0568_00", "label_set": "ScanNet20",
                 "run_id": "run-a", "model": "mosaic3d", "tp": 3, "gt": 57, "verdicts": {},
+                "index_sha256": "a" * 64, "gt_sha256": "b" * 64,
             })
             scores = collect_tp_scores(root, {"scene0568_00": [pred]})
             self.assertEqual(scores[run_node_id("scene0568_00", pred)]["tp"], 3)
@@ -402,6 +424,134 @@ class HudHelperTests(unittest.TestCase):
     def test_ellipsize(self):
         self.assertEqual(ellipsize("abcdefghij", 5, len), "ab...")
         self.assertEqual(ellipsize("ok", 10, len), "ok")
+
+    def test_metric_format(self):
+        self.assertEqual(format_metric(0.4863713529), "0.486")
+        self.assertEqual(format_metric(None), "-")
+        self.assertEqual(format_metric(float("nan")), "-")
+
+    def test_right_information_metrics_render(self):
+        class FakeImgui:
+            WINDOW_NO_TITLE_BAR = 1
+            WINDOW_NO_RESIZE = 2
+            WINDOW_NO_MOVE = 4
+            WINDOW_NO_COLLAPSE = 8
+            WINDOW_NO_SAVED_SETTINGS = 16
+            WINDOW_NO_INPUTS = 32
+
+            def __init__(self):
+                self.texts = []
+
+            def text(self, value):
+                self.texts.append(value)
+
+            def __getattr__(self, _name):
+                return lambda *args, **kwargs: None
+
+        imgui = FakeImgui()
+        _draw_right(imgui, {"info": {
+            "scene": "scene0568_01",
+            "method": "openyolo3d",
+            "run": "baseline-openyolo3d",
+            "ap": 0.3699671793,
+            "ap50": 0.4863713529,
+            "ap25": 0.5384671658,
+            "tp": 15,
+            "gt": 25,
+            "fp": 293,
+            "reconstruction_s": 1575.8,
+            "prediction_s": 825.0,
+        }}, 1080, 680)
+        self.assertIn("openyolo3d / baseline-openyolo3d", imgui.texts)
+        self.assertIn("Reconstruction 26m 16s", imgui.texts)
+        self.assertIn("Prediction 13m 45s", imgui.texts)
+        self.assertIn("AP 0.370 · AP50 0.486 · AP25 0.538", imgui.texts)
+        self.assertIn("TP/GT 15/25 · FP 293", imgui.texts)
+
+
+class InformationTests(unittest.TestCase):
+    def test_information_payload_and_tp_overlay(self):
+        pred = {
+            "label_set": "ScanNet200",
+            "run_id": "baseline-openyolo3d",
+            "model": "openyolo3d",
+        }
+        score = {"tp": 1, "gt": 2, "verdicts": {"a": "fp", "b": "tp"}}
+        metrics = {("ScanNet200", "baseline-openyolo3d", "openyolo3d"): {
+            "ap": 0.3, "ap50": 0.4, "ap25": 0.5,
+        }}
+        run_key = run_node_id("scene0568_01", pred)
+        info = information_payload(
+            "scene0568_01", pred, {run_key: score}, metrics,
+            recon_times={"scene0568_01": 88.0}, pred_times={run_key: 12.4})
+        self.assertEqual((info["tp"], info["gt"], info["fp"]), (1, 2, 1))
+        self.assertEqual((info["ap"], info["ap50"], info["ap25"]), (0.3, 0.4, 0.5))
+        self.assertEqual(info["reconstruction_s"], 88.0)
+        self.assertEqual(info["prediction_s"], 12.4)
+        hidden = information_payload("scene0568_01", None, {}, {})
+        self.assertIsNone(hidden["reconstruction_s"])
+        self.assertIsNone(hidden["prediction_s"])
+
+        points = np.arange(12, dtype=float).reshape(4, 3)
+        objects = [
+            {"verdict": "fp", "sel": [True, True, False, False]},
+            {"verdict": "tp", "sel": [False, True, True, False]},
+        ]
+        kept, colors = merge_tp_gt_overlay(points, objects)
+        np.testing.assert_array_equal(kept, points[:3])
+        np.testing.assert_array_equal(colors[0], [0.90, 0.15, 0.15])
+        np.testing.assert_array_equal(colors[1:], [[0.10, 0.80, 0.20]] * 2)
+
+
+class LazyHelperTests(unittest.TestCase):
+    def test_object_bounds_and_lazy_fields(self):
+        points = np.array([[0.0, 1.0, 2.0], [4.0, 1.0, 8.0]])
+        bounds = object_bounds(points, 1)
+        np.testing.assert_array_equal(bounds["min"], [0.0, 1.0, 2.0])
+        np.testing.assert_array_equal(bounds["max"], [4.0, 1.0, 8.0])
+        np.testing.assert_array_equal(bounds["anchor"], [2.0, 1.05, 5.0])
+        self.assertIsNone(object_bounds(np.zeros((0, 3)), 2))
+        stub = render_object_fields(
+            {"class_name": "chair", "points": points, "sel": [True, False]},
+            "predicted_masks/a.txt", 1)
+        self.assertIsNone(stub["box"])
+        self.assertIsNone(stub["label"])
+        self.assertEqual(stub["key"], "predicted_masks/a.txt")
+
+    def test_camera_label_throttle_and_final(self):
+        state = reset_camera_label_state()
+        extrinsic = np.eye(4)
+        self.assertTrue(camera_label_update(state, extrinsic, 800.0, 10.0, interval=0.1))
+        self.assertFalse(camera_label_update(state, extrinsic, 800.0, 10.05, interval=0.1))
+        moved = np.eye(4)
+        moved[0, 3] = 1.0
+        self.assertFalse(camera_label_update(state, moved, 800.0, 10.05, interval=0.1))
+        self.assertTrue(state["pending"])
+        self.assertTrue(camera_label_update(state, moved, 800.0, 10.2, interval=0.1))
+        self.assertFalse(state["pending"])
+        self.assertFalse(camera_label_update(state, moved, 800.0, 10.25, interval=0.1))
+
+    def test_capped_geometry_created_once(self):
+        session = {
+            "mesh": "mesh",
+            "pointcloud": "pcd",
+            "mesh_capped": None,
+            "pointcloud_capped": None,
+            "up_axis": 2,
+            "ceiling_val": 1.5,
+        }
+        calls = []
+
+        def cropper(src, up_axis, ceiling_val):
+            calls.append((src, up_axis, ceiling_val))
+            return f"capped-{src}"
+
+        first = capped_geometry(session, "mesh", cropper)
+        second = capped_geometry(session, "mesh", cropper)
+        self.assertEqual(first, "capped-mesh")
+        self.assertIs(second, first)
+        self.assertEqual(calls, [("mesh", 2, 1.5)])
+        self.assertIsNone(session["pointcloud_capped"])
 
 
 if __name__ == "__main__":

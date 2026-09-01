@@ -155,6 +155,8 @@ class RankingTests(unittest.TestCase):
             self.assertEqual([row["run_id"] for row in dumped], ["run-b", "run-a"])
             by_id = {row["run_id"]: row for row in rows}
             self.assertGreater(by_id["run-b"]["ap50"], by_id["run-a"]["ap50"])
+            self.assertEqual(by_id["run-b"]["rank_ap"], 1)
+            self.assertEqual(by_id["run-a"]["rank_ap"], 2)
 
     def test_groups_do_not_cross_method_or_scenes(self):
         with tempfile.TemporaryDirectory() as root:
@@ -287,6 +289,10 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(kwargs["run_parameters"], {"mosaic3d": {"x": 1}})
             self.assertEqual(kwargs["issue"], 7)
             self.assertEqual(kwargs["scannet_root"], root)
+            timing = os.path.join(
+                root, "derived", "evaluations", "ScanNet20", "run-a", "mosaic3d",
+                "scene0568_01.timing.json")
+            self.assertTrue(os.path.isfile(timing))
 
     def test_manifest_conflict_skips_models(self):
         spec = _spec20()

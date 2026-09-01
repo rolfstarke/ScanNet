@@ -46,9 +46,17 @@ _EXTERNAL_REPOS = {
     "openmask3d": "/home/rolf/GIT/openmask3d",
 }
 _REQUIRED_EXTERNAL = {
-    "mosaic3d": ("/home/rolf/GIT/Mosaic3D/scripts/run_custom_scene.py",),
+    "mosaic3d": (
+        "/home/rolf/GIT/Mosaic3D/scripts/run_custom_scene.py",
+        "/data/mosaic3d/ckpts/spunet34c.ckpt",
+    ),
     "openins3d": ("/home/rolf/GIT/OpenIns3D/third_party/scannet200_val.ckpt",),
-    "openyolo3d": ("/home/rolf/GIT/OpenYOLO3D/pretrained/config_scannet200.yaml",),
+    "openyolo3d": (
+        "/home/rolf/GIT/OpenYOLO3D/pretrained/config_scannet200.yaml",
+        "/home/rolf/GIT/OpenYOLO3D/pretrained/checkpoints/scannet200_val.ckpt",
+        "/home/rolf/GIT/OpenYOLO3D/pretrained/checkpoints/"
+        "yolo_world_v2_x_obj365v1_goldg_cc3mlite_pretrain_1280ft-14996a36.pth",
+    ),
     "open3dis": (
         "/home/rolf/GIT/Open3DIS/configs/ov3dis_scene4.yaml",
         "/home/rolf/GIT/Open3DIS/open3dis/dataset/ov3dis_loader.py",
@@ -222,7 +230,7 @@ def validate_manifest(doc, spec=None, run_id=None):
     if extra:
         raise ValueError(f"manifest has unknown key(s): {extra}")
     if type(doc.get("schema")) is not int or doc.get("schema") != MANIFEST_SCHEMA:
-        raise ValueError("manifest schema must be 1")
+        raise ValueError(f"manifest schema must be {MANIFEST_SCHEMA}")
     resolved = resolve_benchmark(doc.get("benchmark"))
     if spec is not None and resolved.name != spec.name:
         raise ValueError(f"manifest benchmark {resolved.name!r} does not match {spec.name!r}")
@@ -378,7 +386,10 @@ def _assign_ranks(rows):
     for key in sorted(groups):
         members = groups[key]
         for metric in METRICS:
-            ordered = sorted(members, key=lambda row: (-row[metric], row["run_id"]))
+            if metric == "ap":
+                ordered = sorted(members, key=lambda row: (-row["ap"], -row["ap50"], row["run_id"]))
+            else:
+                ordered = sorted(members, key=lambda row: (-row[metric], row["run_id"]))
             lookup = {row["run_id"]: index for index, row in enumerate(ordered, start=1)}
             for row in members:
                 row[f"rank_{metric}"] = lookup[row["run_id"]]

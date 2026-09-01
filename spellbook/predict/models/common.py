@@ -9,6 +9,7 @@ per mesh vertex), which is the shape ScanNet's own evaluator
 (BenchmarkScripts/3d_evaluation/evaluate_semantic_instance.py) reads directly.
 """
 import json
+import math
 import os
 import pathlib
 import secrets
@@ -28,6 +29,13 @@ _INT_BOUNDS = {
 _FLOAT_BOUNDS = {
     "dedup_iou": (0.0, 1.0),
     "grid_size": (0.0, None),
+    "mask_confidence_threshold": (0.0, 1.0),
+    "lookup_threshold": (0.0, 1.0),
+}
+_POSITIVE_FLOATS = frozenset({"grid_size"})
+_ENUMS = {
+    "condition": ("ScanNet", "ARKitScenes", "ScanNetPP"),
+    "detector": ("odise", "yoloworld"),
 }
 
 
@@ -62,6 +70,11 @@ def validate_run_id(run_id):
 def _as_number(value, kind, key):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{key} must be a number, got {value!r}")
+    try:
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{key} must be finite, got {value!r}")
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{key} must be finite, got {value!r}") from exc
     if kind is int:
         if int(value) != value:
             raise ValueError(f"{key} must be an integer, got {value!r}")
@@ -70,6 +83,11 @@ def _as_number(value, kind, key):
 
 
 def _check_bounds(key, value, lo, hi):
+    if key in _POSITIVE_FLOATS:
+        if value <= lo or (hi is not None and value > hi):
+            bound = f"> {lo}" if hi is None else f"in ({lo}, {hi}]"
+            raise ValueError(f"{key} must be {bound}, got {value!r}")
+        return value
     if value < lo or (hi is not None and value > hi):
         bound = f">= {lo}" if hi is None else f"in [{lo}, {hi}]"
         raise ValueError(f"{key} must be {bound}, got {value!r}")
@@ -117,6 +135,9 @@ def load_overrides(path, allowed):
             value = _check_bounds(key, _as_number(value, int, key), *_INT_BOUNDS[key])
         elif key in _FLOAT_BOUNDS:
             value = _check_bounds(key, _as_number(value, float, key), *_FLOAT_BOUNDS[key])
+        elif key in _ENUMS:
+            if value not in _ENUMS[key]:
+                raise ValueError(f"{key} must be one of {list(_ENUMS[key])}, got {value!r}")
         out[key] = value
     return out
 

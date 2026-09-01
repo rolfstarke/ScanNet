@@ -1,5 +1,8 @@
+import math
 import os
 import subprocess
+
+from utils.compute_time import format_elapsed
 
 
 LEFT_WIDTH = 440
@@ -22,6 +25,12 @@ def ellipsize(text, max_width, measure):
     while kept and measure(kept + ELLIPSIS) > max_width:
         kept = kept[:-1]
     return kept + ELLIPSIS
+
+
+def format_metric(value):
+    if value is None or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return "-"
+    return f"{value:.3f}"
 
 
 def _u32(imgui, r, g, b, a=1.0):
@@ -162,6 +171,30 @@ def _draw_right(imgui, payload, height, width, overlay=None):
     if payload.get("status"):
         imgui.text(payload["status"])
         imgui.separator()
+
+    imgui.text("Information")
+    info = payload.get("info") or {}
+    imgui.text(info.get("scene") or "")
+    reconstruction = format_elapsed(info.get("reconstruction_s"))
+    if reconstruction:
+        imgui.text(f"Reconstruction {reconstruction}")
+    method, run = info.get("method"), info.get("run")
+    if method and run:
+        imgui.text(f"{method} / {run}")
+        prediction = format_elapsed(info.get("prediction_s"))
+        if prediction:
+            imgui.text(f"Prediction {prediction}")
+        imgui.text(
+            f"AP {format_metric(info.get('ap'))} · "
+            f"AP50 {format_metric(info.get('ap50'))} · "
+            f"AP25 {format_metric(info.get('ap25'))}")
+        tp, gt, fp = info.get("tp"), info.get("gt"), info.get("fp")
+        if tp is None or gt is None:
+            imgui.text("TP/GT -")
+        else:
+            fp_text = "-" if fp is None else str(fp)
+            imgui.text(f"TP/GT {tp}/{gt} · FP {fp_text}")
+    imgui.separator()
 
     imgui.text("Settings")
     settings_focus = payload.get("focus") == "settings"

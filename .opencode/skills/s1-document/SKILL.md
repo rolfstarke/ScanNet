@@ -1,5 +1,5 @@
 ---
-name: document
+name: s1-document
 description: Use when externalizing project memory after build and before compaction.
 ---
 
@@ -10,4 +10,4 @@ description: Use when externalizing project memory after build and before compac
 - Put concise problem reasoning and successful or unsuccessful debugging attempts in GitHub Issues.
 - Close issues only after verified resolution.
 - Reference issues as `#N`.
-- move action pan and subagent reports to spellbook/archive to archive them
+- move action plan and subagent reports to spellbook/archive to archive them

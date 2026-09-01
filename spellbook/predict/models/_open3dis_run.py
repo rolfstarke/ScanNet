@@ -97,25 +97,37 @@ def _ensure_working_ply(pointcloud_path, working_ply, limit):
     a voxel-decimated copy. Returns whether decimation was applied."""
     os.makedirs(os.path.dirname(working_ply), exist_ok=True)
     pcd = o3d.io.read_point_cloud(pointcloud_path)
+    meta_path = working_ply + ".limit"
 
     if len(pcd.points) <= limit:
         if os.path.islink(working_ply) or os.path.exists(working_ply):
             os.remove(working_ply)
+        if os.path.isfile(meta_path):
+            os.remove(meta_path)
         os.symlink(os.path.abspath(pointcloud_path), working_ply)
         return False
 
     if (os.path.exists(working_ply) and not os.path.islink(working_ply)
-            and os.path.getmtime(working_ply) >= os.path.getmtime(pointcloud_path)):
-        return True
+            and os.path.getmtime(working_ply) >= os.path.getmtime(pointcloud_path)
+            and os.path.isfile(meta_path)):
+        try:
+            with open(meta_path) as f:
+                cached = int(f.read().strip())
+        except (OSError, ValueError):
+            cached = None
+        if cached == int(limit):
+            return True
 
     voxel_size = 0.01
     down = pcd
     while len(down.points) > limit:
         voxel_size *= 1.4
         down = pcd.voxel_down_sample(voxel_size)
-    if os.path.islink(working_ply):
+    if os.path.islink(working_ply) or os.path.exists(working_ply):
         os.remove(working_ply)
     o3d.io.write_point_cloud(working_ply, down)
+    with open(meta_path, "w") as f:
+        f.write(str(int(limit)) + "\n")
     return True
 
 

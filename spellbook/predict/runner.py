@@ -176,6 +176,15 @@ def _read_tasks(tasks_log):
         return [line.strip() for line in f if line.strip()]
 
 
+def _ensure_task(tasks_log, scene_id, scannet_root=None):
+    from utils.scan_lock import exclusive_lock, prediction_index_lock_path
+    with exclusive_lock(prediction_index_lock_path(scannet_root)):
+        scenes = _read_tasks(tasks_log)
+        if scene_id not in scenes:
+            scenes.append(scene_id)
+            _atomic_write_tasks(tasks_log, scenes)
+
+
 def _finalize_prediction(model, scene_id, out_dir, benchmark, run_id, tasks_log,
                          scannet_root=None):
     from utils.scan_lock import exclusive_lock, prediction_index_lock_path
@@ -316,6 +325,7 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
                 status = scene_submission_status(
                     out_dir, scene_id, spec, run_id, model, scannet_root=scannet_root)
                 if status == "complete":
+                    _ensure_task(tasks_log, scene_id, scannet_root=scannet_root)
                     skipped.append((model, scene_id, out_dir, 0.0, True))
                 elif status == "needs_score":
                     try:
@@ -351,6 +361,9 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
                         lease.index, out_dir, benchmark, tasks_log, lease,
                         run_id, param_paths[model], scannet_root)
                 if result[-1]:
+                    from utils.compute_time import write_prediction_timing
+                    write_prediction_timing(
+                        spec, run_id, model, scene_id, result[3], scannet_root=scannet_root)
                     try:
                         _finalize_prediction(
                             model, scene_id, result[2], benchmark, run_id, tasks_log,

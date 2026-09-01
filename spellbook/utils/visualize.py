@@ -19,6 +19,11 @@ from evaluation.benchmark import BENCHMARKS, artifact_paths, resolve_benchmark, 
 from evaluation.evaluate import load_score_sidecar, score_sidecar_path  # noqa: E402
 from evaluation.runs import _is_comparable, load_manifest, read_evaluator_csv  # noqa: E402
 from utils import hud  # noqa: E402
+from utils.compute_time import (  # noqa: E402
+    load_timing, prediction_timing_path, reconstruction_timing_path)
+from utils.prediction_masks import (  # noqa: E402
+    load_or_build_packed_masks, merge_packed_overlay, unpack_mask)
+
 
 DEFAULT_SCANNET_DIR = "/data/scannet/scans"
 LABEL_MAP_FILE = "/data/scannet/v2/scannetv2-labels.combined.tsv"
@@ -34,6 +39,10 @@ AP50_THRESHOLD = 0.5
 
 SOURCE_GT = "ground_truth"
 SOURCE_SCENE = "scene_only"
+SOURCE_PRED = "prediction"
+COLOR_CLASS = "class"
+COLOR_INSTANCE = "instance"
+COLOR_TPGT = "tp_gt"
 KIND_SCENE = "scene"
 KIND_SCAN = "scan"
 KIND_METHOD = "method"
@@ -47,12 +56,16 @@ KEY_RIGHT = 262
 KEY_LEFT = 263
 KEY_DOWN = 264
 KEY_UP = 265
+KEY_ESCAPE = 256
 KEY_PRESS = 1
+LABEL_UPDATE_INTERVAL = 0.1
+LABEL_CAMERA_ATOL = 1e-5
 
-SETTING_ROWS = ("benchmark", "mode", "geometry", "boxes", "ceiling", "cad")
+SETTING_ROWS = ("benchmark", "mode", "color", "geometry", "boxes", "ceiling", "cad")
 SETTING_NAMES = {
     "benchmark": "Label set",
     "mode": "Mode",
+    "color": "Color",
     "geometry": "Geometry",
     "boxes": "Boxes",
     "ceiling": "Ceiling",
@@ -140,13 +153,47 @@ def load_gt_instances(scene_dir, points=None, colors=None):
     return {"objects": objects, "scene_points": points, "scene_colors": colors}
 
 
-def load_predictions(submission_root, scene_id, points, colors, spec):
+def load_predictions(submission_root, scene_id, points, colors, spec,
+                     run_id=None, model=None, scannet_root=None, source_mtime=None):
     scene_file = os.path.join(submission_root, f"{scene_id}.txt")
     if not os.path.isfile(scene_file):
         return None
-    instances = util_3d.read_instance_prediction_file(scene_file, submission_root)
+    packed = None
+    if (run_id is not None and model is not None and scannet_root is not None
+            and source_mtime is not None):
+        try:
+            packed, _, _ = load_or_build_packed_masks(
+                submission_root, scene_id, len(points), spec, run_id, model,
+                source_mtime, scannet_root=scannet_root)
+        except (OSError, ValueError, KeyError):
+            packed = None
     objects = []
     pred_instances = {}
+    if packed is not None:
+        root = os.path.normpath(submission_root)
+        for key, label_id, conf, row in zip(
+                packed["keys"], packed["label_ids"], packed["confs"], packed["packed"]):
+            if int(label_id) not in spec.id_to_label:
+                continue
+            mask = unpack_mask(row, packed["vertex_count"])
+            abs_path = os.path.normpath(os.path.join(root, key))
+            objects.append({
+                "points": points[mask],
+                "colors": colors[mask],
+                "class_name": spec.id_to_label[int(label_id)],
+                "score": float(conf),
+                "sel": mask,
+                "key": key,
+                "packed": np.ascontiguousarray(row, dtype=np.uint8),
+            })
+            pred_instances[abs_path] = {
+                "label_id": int(label_id),
+                "conf": float(conf),
+                "pred_mask": mask,
+            }
+        return {"objects": objects, "scene_points": points, "scene_colors": colors,
+                "pred_instances": pred_instances, "submission_root": submission_root}
+    instances = util_3d.read_instance_prediction_file(scene_file, submission_root)
     for mask_file, prediction in instances.items():
         label_id = prediction["label_id"]
         if label_id not in spec.id_to_label:
@@ -360,12 +407,44 @@ def collect_cad_scores(scannet_dir, recon_ids, reference):
     return scores
 
 
+def collect_reconstruction_times(scannet_dir, recon_ids):
+    times = {}
+    for rid in recon_ids:
+        elapsed = load_timing(
+            reconstruction_timing_path(os.path.join(scannet_dir, rid)),
+            "reconstruction", scene_id=rid)
+        if elapsed is not None:
+            times[rid] = elapsed
+    return times
+
+
+def collect_prediction_times(scannet_root, pred_index):
+    times = {}
+    for rid, leaves in pred_index.items():
+        for pred in leaves:
+            spec = BENCHMARKS[pred["label_set"]]
+            elapsed = load_timing(
+                prediction_timing_path(
+                    spec, pred["run_id"], pred["model"], rid, scannet_root),
+                "prediction", scene_id=rid, run_id=pred["run_id"], model=pred["model"])
+            if elapsed is not None:
+                times[run_node_id(rid, pred)] = elapsed
+    return times
+
+
 def collect_tp_scores(scannet_root, pred_index):
     scores = {}
     for rid, leaves in pred_index.items():
         for p in leaves:
             spec = BENCHMARKS[p["label_set"]]
             path = score_sidecar_path(spec, p["run_id"], p["model"], rid, scannet_root)
+            pred_mtime = p.get("mtime")
+            if pred_mtime is not None:
+                try:
+                    if os.path.getmtime(path) < pred_mtime:
+                        continue
+                except OSError:
+                    continue
             loaded = load_score_sidecar(path, rid, p["label_set"], p["run_id"], p["model"])
             if loaded:
                 scores[run_node_id(rid, p)] = loaded
@@ -381,21 +460,19 @@ def collect_run_metrics(scannet_root, pred_index):
                 continue
             spec = BENCHMARKS[p["label_set"]]
             eval_root = artifact_paths(spec, scannet_root)["evaluations"]
-            manifest = os.path.join(eval_root, p["run_id"], "run.json")
             csv_path = os.path.join(eval_root, p["run_id"], f"{p['model']}.csv")
-            if not os.path.isfile(manifest):
-                out[key] = None
-                continue
             try:
                 metrics = read_evaluator_csv(csv_path)
                 comparable = False
                 try:
-                    comparable = _is_comparable(
-                        load_manifest(manifest, spec=spec, run_id=p["run_id"]))
+                    comparable = _is_comparable(load_manifest(
+                        os.path.join(eval_root, p["run_id"], "run.json"),
+                        spec=spec, run_id=p["run_id"]))
                 except (OSError, ValueError):
                     pass
                 out[key] = {
-                    "ap": metrics["ap"], "ap50": metrics["ap50"], "comparable": comparable,
+                    "ap": metrics["ap"], "ap50": metrics["ap50"], "ap25": metrics["ap25"],
+                    "comparable": comparable,
                 }
             except (OSError, ValueError, KeyError):
                 out[key] = None
@@ -445,12 +522,196 @@ def best_prediction(leaves, metrics=None):
 
     def key(pred):
         value = metrics.get((pred["label_set"], pred["run_id"], pred["model"]))
-        if not value:
+        if not isinstance(value, dict):
             return (1, 1, 0.0, 0.0, -pred.get("mtime", 0.0), pred["run_id"], pred["label_set"])
         return (0, 0 if value.get("comparable") else 1, -value["ap"], -value["ap50"],
                 -pred.get("mtime", 0.0), pred["run_id"], pred["label_set"])
 
     return min(leaves, key=key)
+
+
+def relative_mask_key(path, submission_root):
+    path = os.path.normpath(path)
+    root = os.path.normpath(submission_root)
+    if os.path.isabs(path):
+        try:
+            return os.path.relpath(path, root).replace("\\", "/")
+        except ValueError:
+            return os.path.basename(path)
+    return path.replace("\\", "/")
+
+
+def normalize_verdicts(verdicts, submission_root):
+    out = {}
+    for key, value in (verdicts or {}).items():
+        out[relative_mask_key(key, submission_root)] = value
+    return out
+
+
+def apply_verdicts(objects, verdicts):
+    bound_tp = 0
+    for obj in objects:
+        verdict = verdicts.get(obj["key"])
+        obj["verdict"] = verdict
+        if verdict == "tp":
+            bound_tp += 1
+    return bound_tp
+
+
+def merge_tp_gt_overlay(points, objects):
+    scored = [obj for obj in objects if obj.get("verdict") in ("tp", "fp")]
+    if scored and all(obj.get("packed") is not None for obj in scored):
+        return merge_packed_overlay(points, objects, FP_COLOR, TP_COLOR)
+    points = np.asarray(points)
+    n = len(points)
+    colors = np.zeros((n, 3), dtype=float)
+    keep = np.zeros(n, dtype=bool)
+    for obj in objects:
+        if obj.get("verdict") != "fp":
+            continue
+        sel = np.asarray(obj["sel"], dtype=bool)
+        colors[sel] = FP_COLOR
+        keep[sel] = True
+    for obj in objects:
+        if obj.get("verdict") != "tp":
+            continue
+        sel = np.asarray(obj["sel"], dtype=bool)
+        colors[sel] = TP_COLOR
+        keep[sel] = True
+    return points[keep], colors[keep]
+
+
+def object_bounds(points, up_axis):
+    pts = np.asarray(points)
+    if pts.size == 0:
+        return None
+    mins = pts.min(0)
+    maxs = pts.max(0)
+    center = (mins + maxs) * 0.5
+    anchor = np.array(center, dtype=float)
+    anchor[int(up_axis)] = float(maxs[int(up_axis)]) + 0.05
+    return {"min": mins, "max": maxs, "center": center, "anchor": anchor}
+
+
+def render_object_fields(src, key, up_axis):
+    return {
+        "class_name": src["class_name"],
+        "key": key,
+        "sel": src.get("sel"),
+        "packed": src.get("packed"),
+        "verdict": src.get("verdict"),
+        "bounds": object_bounds(src["points"], up_axis),
+        "box": None,
+        "label": None,
+    }
+
+
+def reset_camera_label_state():
+    return {"extrinsic": None, "fy": None, "t": 0.0, "pending": False}
+
+
+def camera_label_update(state, extrinsic, fy, now,
+                        interval=LABEL_UPDATE_INTERVAL, atol=LABEL_CAMERA_ATOL):
+    extrinsic = np.asarray(extrinsic)
+    prev = state.get("extrinsic")
+    changed = (
+        prev is None
+        or abs(float(fy) - float(state.get("fy") or 0.0)) > atol
+        or np.max(np.abs(extrinsic - prev)) > atol
+    )
+    if not changed and not state.get("pending"):
+        return False
+    last = float(state.get("t") or 0.0)
+    if now - last < interval:
+        state["pending"] = True
+        return False
+    state["extrinsic"] = np.array(extrinsic, copy=True)
+    state["fy"] = float(fy)
+    state["t"] = now
+    state["pending"] = False
+    return True
+
+
+def capped_geometry(session, kind, cropper):
+    key = "mesh_capped" if kind == "mesh" else "pointcloud_capped"
+    geom = session.get(key)
+    if geom is None:
+        src = session["mesh"] if kind == "mesh" else session["pointcloud"]
+        geom = cropper(src, session["up_axis"], session["ceiling_val"])
+        session[key] = geom
+    return geom
+
+
+def ensure_object_decorations(obj, color, label_x_dir, label_y_dir, up_axis):
+    if obj.get("box") is None:
+        box = obj["pcd"].get_axis_aligned_bounding_box()
+        box.color = color
+        obj["box"] = box
+    else:
+        obj["box"].color = color
+    if obj.get("label") is None:
+        bounds = obj.get("bounds")
+        if bounds is None:
+            label_pos = np.array(obj["box"].get_center())
+            label_pos[up_axis] = obj["box"].max_bound[up_axis] + 0.05
+        else:
+            label_pos = np.array(bounds["anchor"], dtype=float)
+        mesh, base = _label_base(obj["class_name"], color)
+        _place_label(mesh, base, label_pos, 0.06, label_x_dir, label_y_dir)
+        obj["label"] = {"mesh": mesh, "base": base, "anchor": label_pos}
+    else:
+        obj["label"]["mesh"].paint_uniform_color(color)
+    return obj
+
+
+def fp_count(score):
+    if not score:
+        return None
+    return sum(1 for value in (score.get("verdicts") or {}).values() if value == "fp")
+
+
+def format_metric(value):
+    if value is None or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return "-"
+    return f"{value:.3f}"
+
+
+def information_payload(scene_id, selected_pred, scores, run_metrics,
+                        recon_times=None, pred_times=None):
+    info = {
+        "scene": scene_id,
+        "method": None,
+        "run": None,
+        "ap": None,
+        "ap50": None,
+        "ap25": None,
+        "tp": None,
+        "gt": None,
+        "fp": None,
+        "reconstruction_s": None,
+        "prediction_s": None,
+    }
+    if scene_id:
+        info["reconstruction_s"] = (recon_times or {}).get(scene_id)
+    if not selected_pred:
+        return info
+    info["method"] = selected_pred["model"]
+    info["run"] = selected_pred["run_id"]
+    metrics = run_metrics.get(
+        (selected_pred["label_set"], selected_pred["run_id"], selected_pred["model"]))
+    if metrics:
+        info["ap"] = metrics.get("ap")
+        info["ap50"] = metrics.get("ap50")
+        info["ap25"] = metrics.get("ap25")
+    if scene_id:
+        run_key = run_node_id(scene_id, selected_pred)
+        score = scores.get(run_key)
+        if score:
+            info["tp"] = score["tp"]
+            info["gt"] = score["gt"]
+            info["fp"] = fp_count(score)
+        info["prediction_s"] = (pred_times or {}).get(run_key)
+    return info
 
 
 def flatten_tree(groups, predictions, expanded, cad, scores, benchmark=None, ap50=None):
@@ -594,48 +855,61 @@ def handle_tree(state, key, rows):
     return action
 
 
-def visible_setting_rows(option_lists):
-    return tuple(row for row in SETTING_ROWS if option_lists.get(row))
+def setting_values(specs):
+    return [spec["value"] for spec in specs]
+
+
+def enabled_values(specs):
+    return [spec["value"] for spec in specs if spec.get("enabled", True)]
+
+
+def clamp_setting_index(state):
+    n = len(SETTING_ROWS)
+    idx = state.get("setting_index", 0)
+    if n <= 0:
+        state["setting_index"] = 0
+        return 0
+    state["setting_index"] = min(max(0, idx), n - 1)
+    return state["setting_index"]
 
 
 def handle_settings(state, key, option_lists):
     action = {"apply": None}
-    rows = visible_setting_rows(option_lists)
-    if not rows:
-        return action
-    if state["setting_index"] >= len(rows):
-        state["setting_index"] = 0
-    n = len(rows)
+    idx = clamp_setting_index(state)
+    n = len(SETTING_ROWS)
     if key in (KEY_UP, KEY_DOWN):
         state["candidate"] = None
-        state["setting_index"] = (state["setting_index"] + (-1 if key == KEY_UP else 1)) % n
+        nxt = idx + (-1 if key == KEY_UP else 1)
+        if 0 <= nxt < n:
+            state["setting_index"] = nxt
         return action
-    row = rows[state["setting_index"]]
-    options = option_lists.get(row) or []
+    row = SETTING_ROWS[idx]
+    specs = option_lists.get(row) or []
+    enabled = enabled_values(specs)
     applied = state_value(state, row)
-    candidate = applied if state.get("candidate") is None else state["candidate"]
-    if key in (KEY_LEFT, KEY_RIGHT) and options:
-        idx = options.index(candidate) if candidate in options else 0
-        state["candidate"] = options[(idx + (-1 if key == KEY_LEFT else 1)) % len(options)]
+    cand = state.get("candidate")
+    current = cand[1] if cand is not None and cand[0] == row else applied
+    if key in (KEY_LEFT, KEY_RIGHT) and enabled:
+        if current in enabled:
+            pos = enabled.index(current)
+        else:
+            pos = 0 if key == KEY_RIGHT else len(enabled) - 1
+        nxt = pos + (-1 if key == KEY_LEFT else 1)
+        if 0 <= nxt < len(enabled):
+            state["candidate"] = (row, enabled[nxt])
         return action
     if key == KEY_ENTER:
+        value = current
         state["candidate"] = None
-        if row == "cad":
-            action["apply"] = (row, not bool(applied))
-            return action
-        value = applied if candidate is None else candidate
-        if value != applied:
+        if value != applied and value in enabled:
             action["apply"] = (row, value)
     return action
 
 
 def handle_navigation(state, key, rows, option_lists):
     if key == KEY_TAB:
-        if state["focus"] == FOCUS_TREE:
-            state["focus"] = FOCUS_SETTINGS
-        else:
-            state["candidate"] = None
-            state["focus"] = FOCUS_TREE
+        state["candidate"] = None
+        state["focus"] = (FOCUS_SETTINGS if state["focus"] == FOCUS_TREE else FOCUS_TREE)
         return {"activate": None, "apply": None}
     if state["focus"] == FOCUS_TREE:
         action = handle_tree(state, key, rows)
@@ -649,7 +923,8 @@ def handle_navigation(state, key, rows, option_lists):
 def state_value(state, row):
     return {
         "benchmark": state["benchmark"],
-        "mode": state["color_mode"],
+        "mode": state["source_mode"],
+        "color": state["color_mode"],
         "geometry": state["geometry"],
         "boxes": state["boxes"],
         "ceiling": state["ceiling_hidden"],
@@ -658,33 +933,40 @@ def state_value(state, row):
 
 
 def settings_payload(state, option_lists, display_value):
-    rows = visible_setting_rows(option_lists)
-    if state["setting_index"] >= len(rows):
-        state["setting_index"] = 0
     pending = state.get("candidate")
+    idx = state.get("setting_index", 0)
     out = []
-    for i, name in enumerate(rows):
+    for i, name in enumerate(SETTING_ROWS):
+        specs = option_lists.get(name) or []
         applied = state_value(state, name)
+        target = pending[1] if pending is not None and pending[0] == name else applied
         options = []
-        for opt in option_lists[name]:
-            if (i == state["setting_index"] and pending is not None
-                    and opt == pending and pending != applied):
+        for spec in specs:
+            value = spec["value"]
+            enabled = spec.get("enabled", True)
+            if not enabled:
+                kind = "disabled"
+            elif i == idx and pending is not None and pending[0] == name and value == pending[1] and value != applied:
                 kind = "pending"
-            elif opt == applied:
+            elif value == applied:
                 kind = "applied"
             else:
                 kind = "idle"
-            options.append({"text": display_value(name, opt), "kind": kind, "sel": False})
-        if i == state["setting_index"] and options:
-            target = pending if pending is not None else applied
-            for option, opt in zip(options, option_lists[name]):
-                if opt == target:
+            options.append({
+                "text": display_value(name, value),
+                "kind": kind,
+                "sel": False,
+                "enabled": enabled,
+            })
+        if i == idx:
+            for option, spec in zip(options, specs):
+                if spec["value"] == target and spec.get("enabled", True):
                     option["sel"] = True
                     break
         out.append({
             "key": name,
             "name": SETTING_NAMES[name],
-            "focused": i == state["setting_index"],
+            "focused": i == idx,
             "options": options,
         })
     return out
@@ -746,8 +1028,8 @@ def load_scene_bundle(scene_id, scannet_dir, ceiling_height, nyu40map, palette):
         "dir": scene_dir,
         "mesh": mesh,
         "pointcloud": pointcloud,
-        "mesh_capped": _below_height(mesh, up_axis, ceiling_val),
-        "pointcloud_capped": _below_height(pointcloud, up_axis, ceiling_val),
+        "mesh_capped": None,
+        "pointcloud_capped": None,
         "scene_pts": scene_pts,
         "scene_colors": scene_colors,
         "up_axis": up_axis,
@@ -848,7 +1130,9 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         reference = None
     cad = collect_cad_scores(scannet_dir, recon_ids, reference)
     scores = collect_tp_scores(scannet_root, pred_index)
-    ap50 = collect_run_metrics(scannet_root, pred_index)
+    run_metrics = collect_run_metrics(scannet_root, pred_index)
+    recon_times = collect_reconstruction_times(scannet_dir, recon_ids)
+    pred_times = collect_prediction_times(scannet_root, pred_index)
 
     nyu40map = load_label_map()
     palette = util.create_color_palette()
@@ -857,13 +1141,13 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
 
     state = {
         "benchmark": benchmark,
-        "run_id": run_id,
-        "model": SOURCE_GT,
+        "source_mode": SOURCE_SCENE,
+        "color_mode": COLOR_CLASS,
+        "selected_pred": None,
         "setting_index": 0,
         "geometry": "mesh",
         "boxes": False,
         "ceiling_hidden": False,
-        "color_mode": "scene",
         "status": "Enter a scan",
         "focus": FOCUS_TREE,
         "candidate": None,
@@ -886,6 +1170,8 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     current = {"scene": None, "placeholder": None}
     displayed = {"objs": set(), "boxes": set(), "labels": set()}
     objects = []
+    overlay = {"pcd": None}
+    label_cam = reset_camera_label_state()
 
     context = multiprocessing.get_context("spawn")
     left_recv, left_q = context.Pipe(duplex=False)
@@ -903,13 +1189,19 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     publish_left, stop_left = _start_publisher(left_q)
     publish_right, stop_right = _start_publisher(right_q)
 
-    def _spec():
-        return resolve_benchmark(state["benchmark"])
+    def _spec(name=None):
+        return resolve_benchmark(name or state["benchmark"])
+
+    def _pred():
+        return state.get("selected_pred")
 
     def _tp_available():
-        if session is None or state["model"] in (SOURCE_GT, SOURCE_SCENE):
+        pred = _pred()
+        scene_id = pred["scene_id"] if pred else (session["id"] if session else None)
+        if not pred or not scene_id:
             return False
-        gt_file = os.path.join(artifact_paths(_spec(), scannet_root)["gt"], session["id"] + ".txt")
+        gt_file = os.path.join(
+            artifact_paths(_spec(pred["label_set"]), scannet_root)["gt"], scene_id + ".txt")
         return os.path.isfile(gt_file)
 
     def _cad_png():
@@ -917,30 +1209,45 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             return None
         return cad_report_png(session["dir"])
 
+    def _opts(values, enabled=True):
+        if isinstance(enabled, dict):
+            return [{"value": value, "enabled": bool(enabled.get(value, True))} for value in values]
+        return [{"value": value, "enabled": bool(enabled)} for value in values]
+
     def _option_list(row):
         if row == "benchmark":
-            return list(BENCHMARKS)
+            return _opts(list(BENCHMARKS))
         if row == "mode":
-            return ["scene", "class", "instance"] + (["tp_fp"] if _tp_available() else [])
+            return _opts([SOURCE_GT, SOURCE_SCENE, SOURCE_PRED],
+                         {SOURCE_GT: True, SOURCE_SCENE: True, SOURCE_PRED: _pred() is not None})
+        if row == "color":
+            scene_only = state["source_mode"] == SOURCE_SCENE
+            return _opts(
+                [COLOR_CLASS, COLOR_INSTANCE, COLOR_TPGT],
+                {COLOR_CLASS: not scene_only, COLOR_INSTANCE: not scene_only,
+                 COLOR_TPGT: state["source_mode"] == SOURCE_PRED and _tp_available()})
         if row == "geometry":
-            return ["mesh", "pointcloud"]
+            return _opts(["mesh", "pointcloud"])
         if row == "boxes":
-            return [True, False]
+            return _opts([True, False])
         if row == "ceiling":
-            return [False, True]
+            return _opts([False, True])
         if row == "cad":
-            return [False, True] if _cad_png() else []
+            return _opts([False, True], bool(_cad_png()))
         return []
 
     def _option_lists():
-        return {row: opts for row in SETTING_ROWS if (opts := _option_list(row))}
+        return {row: _option_list(row) for row in SETTING_ROWS}
 
     def _display_value(row, value=None):
         if value is None:
             value = state_value(state, row)
         if row == "mode":
-            return {"scene": "Scene only", "class": "Classes",
-                    "instance": "Instances", "tp_fp": "TP/FP"}[value]
+            return {SOURCE_GT: "Ground truth", SOURCE_SCENE: "Scene only",
+                    SOURCE_PRED: "Prediction"}[value]
+        if row == "color":
+            return {COLOR_CLASS: "Classes", COLOR_INSTANCE: "Instances",
+                    COLOR_TPGT: "TP/GT"}[value]
         if row == "geometry":
             return {"mesh": "Mesh", "pointcloud": "Points"}[value]
         if row == "boxes":
@@ -953,48 +1260,75 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
 
     def _tree_rows():
         return flatten_tree(groups, pred_index, state["expanded"], cad, scores,
-                            benchmark=state["benchmark"], ap50=ap50)
+                            benchmark=state["benchmark"], ap50=run_metrics)
 
     def _make_objects(data, keys=None):
         import open3d as o3d
         made = []
+        up_axis = session["up_axis"]
         for idx, o in enumerate(data["objects"]):
-            color = _class_color(o["class_name"], nyu40map, palette)
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(o["points"])
             pcd.colors = o3d.utility.Vector3dVector(o["colors"])
-            box = pcd.get_axis_aligned_bounding_box()
-            box.color = color
-            label_pos = np.array(box.get_center())
-            label_pos[session["up_axis"]] = box.max_bound[session["up_axis"]] + 0.05
-            label_mesh, label_base = _label_base(o["class_name"], color)
-            _place_label(label_mesh, label_base, label_pos, 0.06,
-                         session["label_x_dir"], session["label_y_dir"])
-            made.append({
+            fields = render_object_fields(o, keys[idx] if keys else None, up_axis)
+            fields.update({
                 "pcd": pcd,
                 "rgb": o["colors"],
-                "class_name": o["class_name"],
-                "key": keys[idx] if keys else None,
                 "verdict": None,
-                "box": box,
-                "label": {"mesh": label_mesh, "base": label_base, "anchor": label_pos},
             })
+            made.append(fields)
         return made
 
+    def _score_predictions(data, root, pred):
+        run_key = run_node_id(session["id"], pred)
+        spec = _spec(pred["label_set"])
+        sidecar = scores.get(run_key)
+        verdicts = None
+        status = ""
+        if sidecar:
+            verdicts = normalize_verdicts(sidecar["verdicts"], root)
+            bound = apply_verdicts(objects, verdicts)
+            if bound == int(sidecar["tp"]):
+                return status
+            verdicts = None
+        gt_file = os.path.join(artifact_paths(spec, scannet_root)["gt"], session["id"] + ".txt")
+        if not os.path.isfile(gt_file):
+            apply_verdicts(objects, {})
+            return "TP/GT unavailable: no evaluation GT for this label set."
+        summary = classify_ap50(
+            util_3d.load_ids(gt_file), data["pred_instances"], spec, session["id"])
+        verdicts = normalize_verdicts(summary["verdicts"], root)
+        bound = apply_verdicts(objects, verdicts)
+        scores[run_key] = {
+            "tp": int(summary["tp"]), "gt": int(summary["gt"]), "verdicts": verdicts,
+        }
+        if bound != int(summary["tp"]):
+            return "TP/GT coloring mismatch: bound predictions disagree with the evaluator."
+        return status
+
     def _load_source():
-        nonlocal objects
+        nonlocal objects, label_cam
+        label_cam = reset_camera_label_state()
+        if overlay["pcd"] is not None:
+            if overlay["pcd"] in displayed["objs"]:
+                vis.remove_geometry(overlay["pcd"], reset_bounding_box=False)
+                displayed["objs"].discard(overlay["pcd"])
+            overlay["pcd"] = None
         if session is None:
             objects = []
             return
-        key = (state["benchmark"], state["run_id"], state["model"])
+        pred = _pred()
+        pred_key = None if pred is None else (
+            pred["label_set"], pred["run_id"], pred["model"], pred["scene_id"])
+        key = (state["source_mode"], pred_key)
         cache = session["source_cache"]
         if key in cache:
             objects, state["status"] = cache[key]
             return
-        if state["model"] == SOURCE_SCENE:
+        if state["source_mode"] == SOURCE_SCENE:
             objects = []
             state["status"] = ""
-        elif state["model"] == SOURCE_GT:
+        elif state["source_mode"] == SOURCE_GT:
             if session["gt"] is None:
                 objects = []
                 state["status"] = "No ground truth annotations for this scene."
@@ -1002,51 +1336,33 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                 objects = _make_objects(session["gt"])
                 state["status"] = ""
         else:
-            root = submission_dir(_spec(), state["run_id"], state["model"], scannet_root)
-            data = load_predictions(root, session["id"], session["scene_pts"],
-                                    session["scene_colors"], _spec())
-            if data is None:
+            if pred is None or pred["scene_id"] != session["id"]:
                 objects = []
-                state["status"] = f"No prediction for model {state['model']} in this scene."
+                state["status"] = "No prediction selected."
             else:
-                objects = _make_objects(data, keys=[o["key"] for o in data["objects"]])
-                run_key = run_node_id(session["id"], {
-                    "label_set": state["benchmark"], "run_id": state["run_id"],
-                    "model": state["model"]})
-                sidecar = scores.get(run_key)
-                if sidecar:
-                    verdicts = sidecar["verdicts"]
-                    state["status"] = ""
+                spec = _spec(pred["label_set"])
+                root = submission_dir(spec, pred["run_id"], pred["model"], scannet_root)
+                data = load_predictions(
+                    root, session["id"], session["scene_pts"],
+                    session["scene_colors"], spec,
+                    run_id=pred["run_id"], model=pred["model"],
+                    scannet_root=scannet_root,
+                    source_mtime=prediction_artifact_mtime(root, session["id"]))
+                if data is None:
+                    objects = []
+                    state["status"] = f"No prediction for model {pred['model']} in this scene."
                 else:
-                    gt_file = os.path.join(artifact_paths(_spec(), scannet_root)["gt"],
-                                           session["id"] + ".txt")
-                    if os.path.isfile(gt_file):
-                        summary = classify_ap50(
-                            util_3d.load_ids(gt_file), data["pred_instances"],
-                            _spec(), session["id"])
-                        verdicts = summary["verdicts"]
-                        rel = {}
-                        for k, v in verdicts.items():
-                            rel[os.path.relpath(os.path.normpath(k),
-                                                os.path.normpath(root)).replace("\\", "/")] = v
-                            rel[k] = v
-                        verdicts = rel
-                        scores[run_key] = {
-                            "tp": int(summary["tp"]), "gt": int(summary["gt"]),
-                            "verdicts": verdicts,
-                        }
-                        state["status"] = ""
-                    else:
-                        verdicts = {}
-                        state["status"] = "TP/FP unavailable: no evaluation GT for this label set."
-                for o in objects:
-                    o["verdict"] = verdicts.get(o["key"])
+                    objects = _make_objects(data, keys=[o["key"] for o in data["objects"]])
+                    for obj, src in zip(objects, data["objects"]):
+                        obj["sel"] = src["sel"]
+                    state["status"] = _score_predictions(data, root, pred)
         cache[key] = (objects, state["status"])
 
     def _variant():
-        if state["geometry"] == "mesh":
-            return session["mesh_capped"] if state["ceiling_hidden"] else session["mesh"]
-        return session["pointcloud_capped"] if state["ceiling_hidden"] else session["pointcloud"]
+        kind = "mesh" if state["geometry"] == "mesh" else "pointcloud"
+        if state["ceiling_hidden"]:
+            return capped_geometry(session, kind, _below_height)
+        return session[kind]
 
     def _swap_scene(reset_view=False):
         if current.get("placeholder") is not None:
@@ -1060,20 +1376,56 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         current["scene"] = _variant()
         vis.add_geometry(current["scene"], reset_bounding_box=reset_view)
 
+    def _ceiling_hidden(obj):
+        if session is None or not state["ceiling_hidden"]:
+            return False
+        bounds = obj.get("bounds")
+        if bounds is None:
+            return False
+        return bounds["max"][session["up_axis"]] > session["ceiling_val"]
+
+    def _rebuild_overlay():
+        if overlay["pcd"] is not None:
+            if overlay["pcd"] in displayed["objs"]:
+                vis.remove_geometry(overlay["pcd"], reset_bounding_box=False)
+                displayed["objs"].discard(overlay["pcd"])
+            overlay["pcd"] = None
+        if (session is None or state["source_mode"] != SOURCE_PRED
+                or state["color_mode"] != COLOR_TPGT or not objects):
+            return
+        kept = [obj for obj in objects if obj.get("sel") is not None and not _ceiling_hidden(obj)]
+        pts, cols = merge_tp_gt_overlay(session["scene_pts"], kept)
+        if len(pts) == 0:
+            return
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        pcd.colors = o3d.utility.Vector3dVector(cols)
+        overlay["pcd"] = pcd
+
     def _wanted():
-        if state["color_mode"] == "scene":
+        if state["source_mode"] == SOURCE_SCENE:
             return set(), set(), set()
         keep = []
-        for i, o in enumerate(objects):
-            if state["color_mode"] == "tp_fp" and o["verdict"] not in ("tp", "fp"):
+        for i, obj in enumerate(objects):
+            if state["color_mode"] == COLOR_TPGT and obj["verdict"] not in ("tp", "fp"):
                 continue
-            if (session is not None and state["ceiling_hidden"]
-                    and o["box"].max_bound[session["up_axis"]] > session["ceiling_val"]):
+            if _ceiling_hidden(obj):
                 continue
             keep.append(i)
-        want_objs = {objects[i]["pcd"] for i in keep}
-        want_boxes = {objects[i]["box"] for i in keep} if state["boxes"] else set()
-        want_labels = {objects[i]["label"]["mesh"] for i in keep} if state["boxes"] else set()
+        if state["color_mode"] == COLOR_TPGT:
+            want_objs = {overlay["pcd"]} if overlay["pcd"] is not None else set()
+        else:
+            want_objs = {objects[i]["pcd"] for i in keep}
+        want_boxes = set()
+        want_labels = set()
+        if state["boxes"]:
+            for i in keep:
+                obj = objects[i]
+                ensure_object_decorations(
+                    obj, _object_color(i, obj),
+                    session["label_x_dir"], session["label_y_dir"], session["up_axis"])
+                want_boxes.add(obj["box"])
+                want_labels.add(obj["label"]["mesh"])
         return want_objs, want_boxes, want_labels
 
     def _apply_diff(displayed_set, wanted_set):
@@ -1088,10 +1440,12 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         extrinsic = np.asarray(params.extrinsic)
         cam_pos = -extrinsic[:3, :3].T @ extrinsic[:3, 3]
         fy = params.intrinsic.get_focal_length()[1]
+        if not camera_label_update(label_cam, extrinsic, fy, time.monotonic()):
+            return False
         updated = False
         for o in objects:
-            lab = o["label"]
-            if lab["mesh"] not in displayed["labels"]:
+            lab = o.get("label")
+            if not lab or lab["mesh"] not in displayed["labels"]:
                 continue
             to_cam = cam_pos - lab["anchor"]
             to_cam[session["up_axis"]] = 0.0
@@ -1112,30 +1466,44 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         return updated
 
     def _sync():
+        nonlocal label_cam
+        prev_labels = displayed["labels"]
         want_objs, want_boxes, want_labels = _wanted()
         displayed["objs"] = _apply_diff(displayed["objs"], want_objs)
         displayed["boxes"] = _apply_diff(displayed["boxes"], want_boxes)
         displayed["labels"] = _apply_diff(displayed["labels"], want_labels)
+        if displayed["labels"] - prev_labels:
+            label_cam = reset_camera_label_state()
 
     def _object_color(idx, o):
-        if state["color_mode"] == "tp_fp":
+        if state["color_mode"] == COLOR_TPGT:
             return TP_COLOR if o["verdict"] == "tp" else FP_COLOR
-        if state["color_mode"] == "instance":
+        if state["color_mode"] == COLOR_INSTANCE:
             return colormaps["turbo"](idx / max(len(objects), 1))[:3]
         return _class_color(o["class_name"], nyu40map, palette)
 
     def _paint():
         clear_tracked(vis, displayed, "boxes")
+        _rebuild_overlay()
         for idx, o in enumerate(objects):
             color = _object_color(idx, o)
-            colors = np.tile(color, (len(o["pcd"].points), 1))
-            o["pcd"].colors = o3d.utility.Vector3dVector(colors)
-            vis.update_geometry(o["pcd"])
-            o["box"].color = color
-            o["label"]["mesh"].paint_uniform_color(color)
-            vis.update_geometry(o["label"]["mesh"])
+            if state["color_mode"] != COLOR_TPGT:
+                colors = np.tile(color, (len(o["pcd"].points), 1))
+                o["pcd"].colors = o3d.utility.Vector3dVector(colors)
+                if o["pcd"] in displayed["objs"]:
+                    vis.update_geometry(o["pcd"])
+            if o.get("box") is not None:
+                o["box"].color = color
+            lab = o.get("label")
+            if lab is not None:
+                lab["mesh"].paint_uniform_color(color)
+                if lab["mesh"] in displayed["labels"]:
+                    vis.update_geometry(lab["mesh"])
 
     def _detach_all():
+        nonlocal label_cam
+        label_cam = reset_camera_label_state()
+        overlay["pcd"] = None
         clear_tracked(vis, displayed, "objs")
         clear_tracked(vis, displayed, "boxes")
         clear_tracked(vis, displayed, "labels")
@@ -1151,9 +1519,13 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         gt_counts = session["gt_counts"] if session else Counter()
         classes = sorted(set(gt_counts) | set(counts))
         png = _cad_png()
+        pred = _pred()
         return {
             "status": state["status"],
             "settings": settings_payload(state, _option_lists(), _display_value),
+            "info": information_payload(
+                session["id"] if session else None, pred, scores, run_metrics,
+                recon_times, pred_times),
             "classes": classes,
             "colors": {name: tuple(_class_color(name, nyu40map, palette)) for name in classes},
             "focus": state["focus"],
@@ -1167,12 +1539,14 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         payload = _hud_payload()
         publish_left({"tree": payload["tree"]})
         publish_right({k: payload[k] for k in (
-            "settings", "classes", "colors", "status", "focus", "cad_overlay")})
+            "settings", "classes", "colors", "status", "focus", "cad_overlay", "info")})
 
-    def _normalize_mode():
-        if state["color_mode"] == "tp_fp" and (
-                state["model"] in (SOURCE_GT, SOURCE_SCENE) or not _tp_available()):
-            state["color_mode"] = "class"
+    def _normalize_color():
+        if state["source_mode"] == SOURCE_SCENE:
+            return
+        if state["color_mode"] == COLOR_TPGT and (
+                state["source_mode"] != SOURCE_PRED or not _tp_available()):
+            state["color_mode"] = COLOR_CLASS
 
     def _apply(row, value):
         need_reload = False
@@ -1180,13 +1554,23 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             if value == state["benchmark"]:
                 return
             state["benchmark"] = value
-            state["run_id"] = None
-            state["model"] = SOURCE_GT
-            state["active_pred"] = None
-            state["active_method"] = None
+            pred = _pred()
+            if pred and pred["label_set"] != value:
+                state["selected_pred"] = None
+                state["active_pred"] = None
+                state["active_method"] = None
+                if state["source_mode"] == SOURCE_PRED:
+                    state["source_mode"] = SOURCE_SCENE
             clamp_cursor(state, _tree_rows())
             need_reload = True
         elif row == "mode":
+            if value == state["source_mode"]:
+                return
+            if value == SOURCE_PRED and _pred() is None:
+                return
+            state["source_mode"] = value
+            need_reload = True
+        elif row == "color":
             if value == state["color_mode"]:
                 return
             state["color_mode"] = value
@@ -1207,7 +1591,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             state["cad_open"] = bool(value)
             _update_hud()
             return
-        _normalize_mode()
+        _normalize_color()
         if session is None:
             _update_hud()
             return
@@ -1240,19 +1624,20 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
 
     def _activate_scan(row):
         recon = row["recon_id"]
+        pred = _pred()
         already = (session is not None and session["id"] == recon
-                   and state["model"] == SOURCE_GT and state["run_id"] is None)
+                   and state["source_mode"] == SOURCE_SCENE)
         if already:
             return
         if not _bind_session(recon):
             return
-        state["run_id"] = None
-        state["model"] = SOURCE_GT
-        state["color_mode"] = "scene"
-        state["active_pred"] = None
-        state["active_method"] = None
+        if pred is not None and pred["scene_id"] != recon:
+            state["selected_pred"] = None
+            state["active_pred"] = None
+            state["active_method"] = None
+        state["source_mode"] = SOURCE_SCENE
         state["candidate"] = None
-        _normalize_mode()
+        _normalize_color()
         _load_source()
         _paint()
         _sync()
@@ -1268,14 +1653,17 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         if not _bind_session(recon):
             return
         state["benchmark"] = pred["label_set"]
-        state["run_id"] = pred["run_id"]
-        state["model"] = pred["model"]
+        state["selected_pred"] = {
+            "label_set": pred["label_set"],
+            "run_id": pred["run_id"],
+            "model": pred["model"],
+            "scene_id": recon,
+        }
+        state["source_mode"] = SOURCE_PRED
         state["candidate"] = None
         state["active_pred"] = run_node_id(recon, pred)
         state["active_method"] = method_node_id(recon, pred["model"])
-        if state["color_mode"] == "scene":
-            state["color_mode"] = "class"
-        _normalize_mode()
+        _normalize_color()
         _load_source()
         if need_view:
             _swap_scene(reset_view=True)
@@ -1286,14 +1674,10 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     def _activate_method(row):
         _activate_run(row)
 
-    last_key = {"k": None, "t": 0.0}
-
     def _dispatch(key):
-        now = time.monotonic()
-        if key == last_key["k"] and now - last_key["t"] < 0.04:
+        if key in (ord("Q"), KEY_ESCAPE):
+            vis.close()
             return
-        last_key["k"] = key
-        last_key["t"] = now
         action = handle_navigation(state, key, _tree_rows(), _option_lists())
         if action.get("activate"):
             row = action["activate"]
@@ -1349,7 +1733,8 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     _key_action(KEY_RIGHT, lambda: _dispatch(KEY_RIGHT))
     _key_action(KEY_ENTER, lambda: _dispatch(KEY_ENTER))
     _key_action(KEY_TAB, lambda: _dispatch(KEY_TAB))
-    _key_action(ord("Q"), lambda: vis.close())
+    _key_action(ord("Q"), lambda: _dispatch(ord("Q")))
+    _key_action(KEY_ESCAPE, lambda: _dispatch(KEY_ESCAPE))
     vis.register_animation_callback(_tick)
     print("Keys: Tab HUD, arrows, Enter, mouse view, Esc/Q quit")
     vis.run()

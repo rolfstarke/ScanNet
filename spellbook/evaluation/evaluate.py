@@ -7,6 +7,7 @@
 - score-sidecars: writes per-scene AP50 TP/GT sidecars for existing predictions.
 """
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -30,7 +31,7 @@ import util_3d  # noqa: E402
 PYTHON = "/home/rolf/anaconda3/envs/3disspellbook/bin/python"
 _LABEL_MAP_FALLBACK = "/data/scannet/v2/scannetv2-labels.combined.tsv"
 
-SIDECAR_SCHEMA = 1
+SIDECAR_SCHEMA = 2
 SIDECAR_METRIC = "scannet_instance_ap50"
 AP50_THRESHOLD = 0.5
 MIN_REGION_SIZE = 100
@@ -120,6 +121,14 @@ def score_sidecar_path(spec, run_id, model, scene_id, scannet_root=None):
                         run_id, model, scene_id + ".tp50.json")
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _relative_mask(path, submission_root):
     root = os.path.normpath(submission_root) + os.sep
     path = os.path.normpath(path)
@@ -152,7 +161,8 @@ def write_score_sidecar(path, payload):
     os.replace(tmp, path)
 
 
-def load_score_sidecar(path, scene_id, label_set, run_id, model):
+def load_score_sidecar(path, scene_id, label_set, run_id, model,
+                       index_sha256=None, gt_sha256=None):
     if not os.path.isfile(path):
         return None
     try:
@@ -173,6 +183,16 @@ def load_score_sidecar(path, scene_id, label_set, run_id, model):
         if doc.get("run_id") != run_id:
             return None
         if doc.get("model") != model:
+            return None
+        stored_index = doc.get("index_sha256")
+        stored_gt = doc.get("gt_sha256")
+        if not isinstance(stored_index, str) or len(stored_index) != 64:
+            return None
+        if not isinstance(stored_gt, str) or len(stored_gt) != 64:
+            return None
+        if index_sha256 is not None and stored_index != index_sha256:
+            return None
+        if gt_sha256 is not None and stored_gt != gt_sha256:
             return None
         tp = int(doc["tp"])
         gt = int(doc["gt"])
@@ -207,6 +227,8 @@ def score_prediction_scene(submission_root, scene_id, spec, run_id, model, scann
         "label_set": spec.name,
         "run_id": run_id,
         "model": model,
+        "index_sha256": _sha256_file(os.path.join(submission_root, scene_id + ".txt")),
+        "gt_sha256": _sha256_file(gt_file),
         "tp": int(summary["tp"]),
         "gt": int(summary["gt"]),
         "verdicts": verdicts,
@@ -277,9 +299,14 @@ def scene_submission_status(submission_root, scene_id, spec, run_id, model, scan
                 return "missing"
         except (TypeError, ValueError):
             return "missing"
+    gt_file = None
+    if root:
+        gt_file = os.path.join(artifact_paths(spec, root)["gt"], scene_id + ".txt")
     sidecar = load_score_sidecar(
         score_sidecar_path(spec, run_id, model, scene_id, scannet_root=scannet_root),
-        scene_id, spec.name, run_id, model)
+        scene_id, spec.name, run_id, model,
+        index_sha256=_sha256_file(scene_file),
+        gt_sha256=_sha256_file(gt_file) if gt_file and os.path.isfile(gt_file) else None)
     if sidecar is None:
         return "needs_score"
     return "complete"
@@ -357,8 +384,8 @@ def score_sidecars_cli(argv=None):
     for model in models:
         pred_dir = submission_dir(spec, args.run_id, model, scannet_root=root)
         for scene in scenes:
-            path = score_sidecar_path(spec, args.run_id, model, scene, scannet_root=root)
-            if args.missing_only and os.path.isfile(path):
+            if args.missing_only and scene_submission_status(
+                    pred_dir, scene, spec, args.run_id, model, scannet_root=root) == "complete":
                 print(f"[skip] {scene} {model}")
                 continue
             payload = score_and_write_sidecar(
@@ -406,6 +433,8 @@ def evaluate_cli(argv=None):
         out_dir = os.path.join(paths["evaluations"], args.run_id)
         os.makedirs(out_dir, exist_ok=True)
         out_file = os.path.join(out_dir, model + ".csv")
+        if os.path.isfile(out_file):
+            raise ValueError(f"run_id {args.run_id!r} already evaluated for {model}: {out_file}")
 
         missing = []
         if not os.path.isdir(pred_dir):
