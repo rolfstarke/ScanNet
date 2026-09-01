@@ -117,6 +117,17 @@ def decimate(pts, limit):
 def add_run_args(parser):
     parser.add_argument("--run-id", default="adhoc", type=validate_run_id)
     parser.add_argument("--parameters-json", default=None)
+    parser.add_argument("--features-out", default=None)
+
+
+def _query_module():
+    import importlib.util
+    spellbook_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    spec_path = os.path.join(spellbook_dir, "utils", "query.py")
+    spec = importlib.util.spec_from_file_location("spellbook_query", spec_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def load_overrides(path, allowed):
@@ -142,14 +153,14 @@ def load_overrides(path, allowed):
     return out
 
 
-def write_scannet_submission(submission_root, scene_id, classes, instances, min_mask_points, spec):
+def write_scannet_submission_rows(submission_root, scene_id, classes, instances, min_mask_points, spec):
     """Writes <scene_id>.txt + predicted_masks/<scene_id>_NNN.txt in ScanNet's official
     benchmark submission layout (scan-net.org): one line per instance
     "predicted_masks/<scene_id>_NNN.txt <label_id> <confidence>", each mask one int per mesh
     vertex. `instances` is an iterable of (mask_bool_over_full_cloud, class_name, confidence);
     masks with fewer than `min_mask_points` set points are skipped. `spec` is a
     benchmark.BenchmarkSpec; its label_to_id assigns the scoreable label ids, and any class not
-    in it raises ValueError. Returns the number of instances written."""
+    in it raises ValueError. Returns a dict with n_written, index_path, keys, and source_indices."""
     unknown = [c for c in classes if c not in spec.label_to_id]
     if unknown:
         raise ValueError(
@@ -164,9 +175,11 @@ def write_scannet_submission(submission_root, scene_id, classes, instances, min_
     tmp_index = index_path + ".tmp"
     gen = secrets.token_hex(4)
     written = []
+    keys = []
+    source_indices = []
     n_written = 0
     with open(tmp_index, "w") as scene_f:
-        for mask, class_name, confidence in instances:
+        for source_i, (mask, class_name, confidence) in enumerate(instances):
             if mask.sum() < min_mask_points:
                 continue
             mask_name = f"{scene_id}_{gen}_{n_written:03d}.txt"
@@ -177,7 +190,10 @@ def write_scannet_submission(submission_root, scene_id, classes, instances, min_
                 os.fsync(mask_f.fileno())
             os.replace(tmp_mask, final_mask)
             written.append(mask_name)
-            scene_f.write(f"predicted_masks/{mask_name} {label_ids[class_name]} {confidence:.4f}\n")
+            key = f"predicted_masks/{mask_name}"
+            keys.append(key)
+            source_indices.append(source_i)
+            scene_f.write(f"{key} {label_ids[class_name]} {confidence:.4f}\n")
             n_written += 1
         scene_f.flush()
         os.fsync(scene_f.fileno())
@@ -188,4 +204,25 @@ def write_scannet_submission(submission_root, scene_id, classes, instances, min_
         for name in os.listdir(mask_dir):
             if name.startswith(prefix) and name.endswith(".txt") and name not in keep:
                 os.remove(os.path.join(mask_dir, name))
-    return n_written
+    return {
+        "n_written": n_written,
+        "index_path": index_path,
+        "keys": keys,
+        "source_indices": source_indices,
+    }
+
+
+def write_scannet_submission(submission_root, scene_id, classes, instances, min_mask_points, spec):
+    return write_scannet_submission_rows(
+        submission_root, scene_id, classes, instances, min_mask_points, spec)["n_written"]
+
+
+def publish_clip_features(features_out, feature_rows, rows, spec, run_id, model, scene_id,
+                          encoder_family, encoder_name, feature_dim):
+    if not features_out:
+        return None
+    query = _query_module()
+    return query.write_aligned_features(
+        features_out, feature_rows, rows["source_indices"], rows["keys"], rows["index_path"],
+        scene_id=scene_id, benchmark=spec.name, run_id=run_id, model=model,
+        encoder_family=encoder_family, encoder_name=encoder_name, feature_dim=feature_dim)

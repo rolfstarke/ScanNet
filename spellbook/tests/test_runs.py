@@ -293,6 +293,10 @@ class RunnerTests(unittest.TestCase):
                 root, "derived", "evaluations", "ScanNet20", "run-a", "mosaic3d",
                 "scene0568_01.timing.json")
             self.assertTrue(os.path.isfile(timing))
+            run_kwargs = calls[1][2]
+            self.assertTrue(run_kwargs["features_out"].endswith(
+                "scene0568_01.clip.npz"))
+            self.assertIn("/derived/evaluations/", run_kwargs["features_out"].replace("\\", "/"))
 
     def test_manifest_conflict_skips_models(self):
         spec = _spec20()

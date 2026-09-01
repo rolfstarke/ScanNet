@@ -486,6 +486,15 @@ def prune_prediction_artifacts(spec, run_id, method, scannet_root=None, apply=Fa
         return {"apply": False, "target": pred_dir}
     if os.path.isdir(pred_dir):
         shutil.rmtree(pred_dir)
+    for scene in man["scenes"]:
+        clip_path = os.path.join(sidecar_dir, scene + ".clip.npz")
+        try:
+            os.unlink(clip_path)
+        except FileNotFoundError:
+            pass
+        if method == "openins3d":
+            from utils.query import openins_snap_root
+            shutil.rmtree(openins_snap_root(run_id, scene), ignore_errors=True)
     return {"apply": True, "target": pred_dir}
 
 

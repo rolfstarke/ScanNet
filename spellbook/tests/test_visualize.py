@@ -206,6 +206,8 @@ class NavigationTests(unittest.TestCase):
                 {"value": False, "enabled": False},
                 {"value": True, "enabled": False},
             ],
+            "query": [{"value": "off"}],
+            "camera": [{"value": "off"}],
         }
 
     def test_enter_toggles_folder_without_activation(self):

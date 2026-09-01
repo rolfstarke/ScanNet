@@ -30,8 +30,8 @@ from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (  # noqa: E402
-    _benchmark_spec, add_run_args, load_overrides, scene_id_from_pointcloud,
-    write_scannet_submission,
+    _benchmark_spec, add_run_args, load_overrides, publish_clip_features,
+    scene_id_from_pointcloud, write_scannet_submission_rows,
 )
 
 OPEN3DIS_REPO = "/home/rolf/GIT/Open3DIS"
@@ -234,17 +234,23 @@ def main():
 
     def _instances():
         for i, rle in enumerate(masks_rle):
-            if np.linalg.norm(inst_feat[i].numpy()) < 1e-6:
+            feat = inst_feat[i].numpy()
+            if np.linalg.norm(feat) < 1e-6:
                 continue
             sel = _rle_decode(rle).astype(bool)
             if nn_idx is not None:
                 sel = sel[nn_idx]
-            yield sel, args.classes[best_idx[i]], confidence[i]
+            yield sel, args.classes[best_idx[i]], confidence[i], feat
 
-    candidates = sorted(_instances(), key=lambda t: -t[2])[:final_instance_top_k]
-    n_written = write_scannet_submission(args.out, scene_id, args.classes, candidates,
-                                         min_mask_points, spec)
-    print(f"[INFO] Wrote {n_written} instances to {args.out}")
+    ranked = sorted(_instances(), key=lambda t: -t[2])[:final_instance_top_k]
+    candidates = [(sel, cls, conf) for sel, cls, conf, _feat in ranked]
+    feature_rows = [feat for _sel, _cls, _conf, feat in ranked]
+    rows = write_scannet_submission_rows(args.out, scene_id, args.classes, candidates,
+                                        min_mask_points, spec)
+    publish_clip_features(
+        args.features_out, feature_rows, rows, spec, args.run_id, "open3dis", scene_id,
+        "openai_clip", "ViT-L/14@336px", 768)
+    print(f"[INFO] Wrote {rows['n_written']} instances to {args.out}")
 
 
 if __name__ == "__main__":

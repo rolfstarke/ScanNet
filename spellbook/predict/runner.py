@@ -125,7 +125,7 @@ def _pointcloud_path(scene_id, scannet_root):
 
 
 def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, tasks_log, lease,
-             run_id, parameters_json, scannet_root):
+             run_id, parameters_json, scannet_root, features_out=None):
     """Run one (model, scene) task in a subprocess. Returns
     (model, scene_id, out_dir, elapsed, ok). Task markers and TP50 scoring happen after
     the GPU lease is released."""
@@ -142,6 +142,8 @@ def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, task
         if frames_dir is None:
             raise RuntimeError(f"{model} needs frames but extraction produced none for {scene_id}")
         args += ["--frames", frames_dir]
+    if features_out:
+        args += ["--features-out", features_out]
 
     env = child_env(lease, model)
     pass_fds = (lease.fileno(),)
@@ -356,10 +358,13 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
                 lock_ctx.__enter__()
             try:
                 with gpu_lease(gpu_pool, scannet_root) as lease:
+                    from utils.query import clip_features_path
                     result = _run_one(
                         model, scene_id, frames_dir_by_scene.get(scene_id), classes,
                         lease.index, out_dir, benchmark, tasks_log, lease,
-                        run_id, param_paths[model], scannet_root)
+                        run_id, param_paths[model], scannet_root,
+                        features_out=clip_features_path(
+                            spec, run_id, model, scene_id, scannet_root=scannet_root))
                 if result[-1]:
                     from utils.compute_time import write_prediction_timing
                     write_prediction_timing(
