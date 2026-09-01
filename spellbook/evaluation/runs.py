@@ -14,6 +14,7 @@ from evaluation.benchmark import (
     PREDICTION_EVALUATION_SCENES, PREDICTION_METHODS, artifact_paths,
     load_settings, normalize_scene_id, resolve_benchmark, submission_dir,
     validate_prediction_methods, validate_prediction_scenes,
+    validate_recorded_prediction_scenes,
 )
 from utils.scan_lock import exclusive_lock, prediction_index_lock_path
 
@@ -103,9 +104,10 @@ def normalize_run_id(run_id):
 
 
 def normalize_scenes(scenes, require_complete=False):
-    out = validate_prediction_scenes(scenes, require_complete=require_complete)
     if require_complete:
+        validate_prediction_scenes(scenes, require_complete=True)
         return list(PREDICTION_EVALUATION_SCENES)
+    out = validate_recorded_prediction_scenes(scenes)
     return sorted(out)
 
 

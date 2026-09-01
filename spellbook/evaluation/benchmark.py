@@ -23,16 +23,22 @@ _VAL_FILE = os.path.join(_REPO_ROOT, "Tasks", "Benchmark", "scannetv2_val.txt")
 _SCENE_RE = re.compile(r"^scene\d{4}_\d{2}$")
 
 PREDICTION_EVALUATION_SCENES = (
-    "scene0019_01",
-    "scene0217_00",
-    "scene0304_00",
-    "scene0412_00",
-    "scene0414_00",
-    "scene0426_02",
-    "scene0488_00",
-    "scene0549_00",
-    "scene0568_01",
-    "scene0575_00",
+    "scene0046_00",
+    "scene0084_01",
+    "scene0086_01",
+    "scene0100_02",
+    "scene0164_00",
+    "scene0207_02",
+    "scene0221_00",
+    "scene0251_00",
+    "scene0307_00",
+    "scene0334_00",
+    "scene0357_00",
+    "scene0535_00",
+    "scene0618_00",
+    "scene0644_00",
+    "scene0678_01",
+    "scene0699_00",
 )
 PREDICTION_METHODS = (
     "mosaic3d",
@@ -114,27 +120,39 @@ def normalize_scene_id(scene):
     return "scene" + scene
 
 
-def validate_prediction_scenes(scenes, require_complete=False):
+def validate_recorded_prediction_scenes(scenes):
+    """Validate official scenes stored in immutable run manifests.
+
+    Historical runs may use an older protocol tuple, but custom scans and malformed
+    scene lists must never enter the official prediction registry.
+    """
     if not isinstance(scenes, (list, tuple)) or not scenes:
         raise ValueError("scenes must be a non-empty list")
-    allowed = set(PREDICTION_EVALUATION_SCENES)
+    official = official_val_scenes()
     out = []
     seen = set()
     for scene in scenes:
         scene = normalize_scene_id(scene)
         if not _SCENE_RE.match(scene):
             raise ValueError(f"invalid scene id {scene!r}")
-        if scene not in allowed:
-            raise ValueError(f"scene {scene!r} is outside the fixed prediction evaluation set")
+        if scene not in official:
+            raise ValueError(f"scene {scene!r} is outside the official ScanNet v2 val split")
         if scene in seen:
             raise ValueError(f"duplicate scene id {scene!r}")
         seen.add(scene)
         out.append(scene)
+    return out
+
+
+def validate_prediction_scenes(scenes, require_complete=False):
+    out = validate_recorded_prediction_scenes(scenes)
+    allowed = set(PREDICTION_EVALUATION_SCENES)
+    for scene in out:
+        if scene not in allowed:
+            raise ValueError(f"scene {scene!r} is outside the fixed prediction evaluation set")
     if require_complete:
-        missing = [scene for scene in PREDICTION_EVALUATION_SCENES if scene not in seen]
-        extra = [scene for scene in out if scene not in set(PREDICTION_EVALUATION_SCENES)]
-        if missing or extra or len(out) != len(PREDICTION_EVALUATION_SCENES):
-            raise ValueError("comparable prediction runs require the exact 10-scene protocol set")
+        if len(out) != len(PREDICTION_EVALUATION_SCENES) or set(out) != allowed:
+            raise ValueError("comparable prediction runs require the exact 16-scene protocol set")
         return list(PREDICTION_EVALUATION_SCENES)
     return out
 
@@ -159,10 +177,10 @@ def _validate_prediction_protocol():
     official = official_val_scenes()
     assert PREDICTION_METHODS == (
         "mosaic3d", "openins3d", "openyolo3d", "open3dis", "openmask3d")
-    assert len(PREDICTION_EVALUATION_SCENES) == 10
-    assert len(set(PREDICTION_EVALUATION_SCENES)) == 10
+    assert len(PREDICTION_EVALUATION_SCENES) == 16
+    assert len(set(PREDICTION_EVALUATION_SCENES)) == 16
     bases = [scene.rsplit("_", 1)[0] for scene in PREDICTION_EVALUATION_SCENES]
-    assert len(set(bases)) == 10, "prediction evaluation scenes must be unique physical scenes"
+    assert len(set(bases)) == 16, "prediction evaluation scenes must be unique physical scenes"
     for scene in PREDICTION_EVALUATION_SCENES:
         assert _SCENE_RE.match(scene), scene
         assert scene in official, scene

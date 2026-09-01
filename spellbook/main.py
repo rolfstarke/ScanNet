@@ -43,7 +43,8 @@ def main():
     parser.add_argument("--replace", action="store_true",
                         help="re-extract frames even if a complete set exists")
     parser.add_argument("--scene", nargs="+",
-                        help="scene numbers (e.g., 0568_00 0304_00 or 9004 9009)")
+                        help="scene numbers (e.g., 0046_00 or 9004 9009); explicit "
+                             "prediction subsets are non-comparable")
     args = parser.parse_args()
 
     from evaluation.benchmark import (

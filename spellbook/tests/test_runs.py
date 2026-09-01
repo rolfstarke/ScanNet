@@ -239,7 +239,7 @@ def _lease(*args, **kwargs):
 class RunnerTests(unittest.TestCase):
     def _scene_root(self, root):
         scans = os.path.join(root, "scans")
-        ply = os.path.join(scans, "scene0568_01", "scene0568_01_vh_clean_2.ply")
+        ply = os.path.join(scans, "scene0046_00", "scene0046_00_vh_clean_2.ply")
         os.makedirs(os.path.dirname(ply))
         with open(ply, "w") as f:
             f.write("ply\n")
@@ -261,7 +261,7 @@ class RunnerTests(unittest.TestCase):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        return runner.predict(["scene0568_01"], ["mosaic3d"], None, "ScanNet20",
+        return runner.predict(["scene0046_00"], ["mosaic3d"], None, "ScanNet20",
                               "run-a", **predict_kwargs)
 
     def test_manifest_written_once_before_tasks(self):
@@ -275,7 +275,7 @@ class RunnerTests(unittest.TestCase):
 
             def run_one(*args, **kwargs):
                 calls.append(("run", args, kwargs))
-                return ("mosaic3d", "scene0568_01", "/tmp", 0.1, True)
+                return ("mosaic3d", "scene0046_00", "/tmp", 0.1, True)
 
             with mock.patch("evaluation.runs.write_run_manifest", side_effect=write), \
                     mock.patch("predict.runner._run_one", side_effect=run_one):
@@ -284,25 +284,25 @@ class RunnerTests(unittest.TestCase):
             _spec, run_id, scenes, methods = calls[0][1]
             kwargs = calls[0][2]
             self.assertEqual(run_id, "run-a")
-            self.assertEqual(scenes, ["scene0568_01"])
+            self.assertEqual(scenes, ["scene0046_00"])
             self.assertEqual(methods, ["mosaic3d"])
             self.assertEqual(kwargs["run_parameters"], {"mosaic3d": {"x": 1}})
             self.assertEqual(kwargs["issue"], 7)
             self.assertEqual(kwargs["scannet_root"], root)
             timing = os.path.join(
                 root, "derived", "evaluations", "ScanNet20", "run-a", "mosaic3d",
-                "scene0568_01.timing.json")
+                "scene0046_00.timing.json")
             self.assertTrue(os.path.isfile(timing))
             run_kwargs = calls[1][2]
             self.assertTrue(run_kwargs["features_out"].endswith(
-                "scene0568_01.clip.npz"))
+                "scene0046_00.clip.npz"))
             self.assertIn("/derived/evaluations/", run_kwargs["features_out"].replace("\\", "/"))
 
     def test_manifest_conflict_skips_models(self):
         spec = _spec20()
         with tempfile.TemporaryDirectory() as root:
             scans = self._scene_root(root)
-            write_run_manifest(spec, "run-a", ["scene0568_01"], ["mosaic3d"],
+            write_run_manifest(spec, "run-a", ["scene0046_00"], ["mosaic3d"],
                                issue=1, scannet_root=root)
             with mock.patch("predict.runner._run_one") as run_one:
                 with self.assertRaises(ValueError):
