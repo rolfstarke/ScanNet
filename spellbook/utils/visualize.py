@@ -21,8 +21,19 @@ from evaluation.runs import _is_comparable, load_manifest, read_evaluator_csv  #
 from utils import hud  # noqa: E402
 from utils.compute_time import (  # noqa: E402
     load_timing, prediction_timing_path, reconstruction_timing_path)
+from utils.camera_replay import (  # noqa: E402
+    CAMERA_OFF, CAMERA_PATH, CAMERA_REPLAY, REPLAY_FPS, advance_playback,
+    composite_overlay, discover_frames, frustum_corners, is_valid_pose,
+    load_calibration, load_color_rgb, load_depth_m, load_pose, owner_colors,
+    packed_visible, project_points, resize_rgb, rgb_to_rgba_bytes,
+    trajectory_polylines, update_seen_tp, zbuffer_colors)
 from utils.prediction_masks import (  # noqa: E402
     load_or_build_packed_masks, merge_packed_overlay, unpack_mask)
+from utils.query import (  # noqa: E402
+    ENCODERS, INSTANT_MODELS, NATIVE_LOOKUP_MODELS, QUERY_IMAGE, QUERY_OFF,
+    QUERY_RELABEL, QUERY_SEARCH, QueryClient, clip_features_path,
+    load_clip_features, method_python, openins_snap_complete, openins_snap_root,
+    query_modes_for, split_relabel_prompts)
 
 
 DEFAULT_SCANNET_DIR = "/data/scannet/scans"
@@ -43,6 +54,7 @@ SOURCE_PRED = "prediction"
 COLOR_CLASS = "class"
 COLOR_INSTANCE = "instance"
 COLOR_TPGT = "tp_gt"
+COLOR_QUERY = "query"
 KIND_SCENE = "scene"
 KIND_SCAN = "scan"
 KIND_METHOD = "method"
@@ -61,7 +73,8 @@ KEY_PRESS = 1
 LABEL_UPDATE_INTERVAL = 0.1
 LABEL_CAMERA_ATOL = 1e-5
 
-SETTING_ROWS = ("benchmark", "mode", "color", "geometry", "boxes", "ceiling", "cad")
+SETTING_ROWS = ("benchmark", "mode", "color", "geometry", "boxes", "ceiling", "cad",
+                "query", "camera")
 SETTING_NAMES = {
     "benchmark": "Label set",
     "mode": "Mode",
@@ -70,6 +83,8 @@ SETTING_NAMES = {
     "boxes": "Boxes",
     "ceiling": "Ceiling",
     "cad": "CAD report",
+    "query": "Query",
+    "camera": "Camera",
 }
 
 
@@ -656,7 +671,7 @@ def ensure_object_decorations(obj, color, label_x_dir, label_y_dir, up_axis):
             label_pos[up_axis] = obj["box"].max_bound[up_axis] + 0.05
         else:
             label_pos = np.array(bounds["anchor"], dtype=float)
-        mesh, base = _label_base(obj["class_name"], color)
+        mesh, base = _label_base(obj.get("query_label") or obj["class_name"], color)
         _place_label(mesh, base, label_pos, 0.06, label_x_dir, label_y_dir)
         obj["label"] = {"mesh": mesh, "base": base, "anchor": label_pos}
     else:
@@ -929,6 +944,8 @@ def state_value(state, row):
         "boxes": state["boxes"],
         "ceiling": state["ceiling_hidden"],
         "cad": state.get("cad_open", False),
+        "query": state.get("query_mode", QUERY_OFF),
+        "camera": state.get("camera_mode", CAMERA_OFF),
     }[row]
 
 
@@ -1110,9 +1127,26 @@ def _stop_hud(conn, process, stop_pub=None):
         pass
 
 
+def query_result_lines(mode, keys, scores, labels=None):
+    lines = []
+    if mode == QUERY_RELABEL:
+        counts = Counter(labels or [])
+        for name, count in counts.most_common(5):
+            if name:
+                lines.append(f"{name} x{count}")
+        return lines
+    for key, score in zip(keys or [], scores or []):
+        name = os.path.basename(key)
+        lines.append(f"{float(score):.3f}  {name}")
+        if len(lines) >= 5:
+            break
+    return lines
+
+
 def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet200", run_id=None,
               ceiling_height=2.0):
     import multiprocessing
+    import subprocess
     import glfw
     import open3d as o3d
 
@@ -1156,6 +1190,8 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         "active_pred": None,
         "active_method": None,
         "cad_open": False,
+        "query_mode": QUERY_OFF,
+        "camera_mode": CAMERA_OFF,
     }
 
     display_width, display_height = _display_size()
@@ -1168,10 +1204,22 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                       left=hud.LEFT_WIDTH, top=0)
 
     current = {"scene": None, "placeholder": None}
-    displayed = {"objs": set(), "boxes": set(), "labels": set()}
+    displayed = {"objs": set(), "boxes": set(), "labels": set(), "camera": set()}
     objects = []
     overlay = {"pcd": None}
     label_cam = reset_camera_label_state()
+    query_client = QueryClient()
+    query_rt = {
+        "request_id": 0, "status": "", "labels": {}, "scores": {}, "ranks": [],
+        "reset_id": 0, "pending": None, "features": None, "input": "",
+        "openins": None,
+    }
+    camera_rt = {
+        "sequence": None, "calib": None, "poses": {}, "frame": 0, "playing": False,
+        "last_tick": None, "seen_tp": set(), "owners": None, "colors": None,
+        "geoms": {"path": None, "frustum": None}, "video": None, "status": "",
+        "color_size": None,
+    }
 
     context = multiprocessing.get_context("spawn")
     left_recv, left_q = context.Pipe(duplex=False)
@@ -1209,6 +1257,345 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             return None
         return cad_report_png(session["dir"])
 
+    def _clear_query(status=""):
+        query_rt["request_id"] += 1
+        query_rt["status"] = status
+        query_rt["labels"] = {}
+        query_rt["scores"] = {}
+        query_rt["ranks"] = []
+        query_rt["pending"] = None
+        query_rt["input"] = ""
+        query_rt["reset_id"] += 1
+        proc = query_rt.get("openins")
+        query_rt["openins"] = None
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _load_query_features():
+        query_rt["features"] = None
+        pred = _pred()
+        if pred is None or session is None:
+            return
+        spec = _spec(pred["label_set"])
+        root = submission_dir(spec, pred["run_id"], pred["model"], scannet_root)
+        index_path = os.path.join(root, session["id"] + ".txt")
+        path = clip_features_path(spec, pred["run_id"], pred["model"], session["id"], scannet_root)
+        query_rt["features"] = load_clip_features(
+            path, spec, pred["run_id"], pred["model"], session["id"], index_path)
+
+    def _load_camera_sequence():
+        camera_rt["sequence"] = None
+        camera_rt["calib"] = None
+        camera_rt["poses"] = {}
+        camera_rt["color_size"] = None
+        camera_rt["status"] = ""
+        if session is None:
+            return
+        frames_dir = os.path.join(session["dir"], "frames")
+        discovered = discover_frames(frames_dir)
+        if not discovered["rgb_ids"]:
+            return
+        calib = load_calibration(frames_dir)
+        poses = {fid: load_pose(frames_dir, fid) for fid in discovered["rgb_ids"]}
+        camera_rt["sequence"] = discovered
+        camera_rt["calib"] = calib
+        camera_rt["poses"] = poses
+        first = os.path.join(frames_dir, "color", f"{discovered['rgb_ids'][0]}.jpg")
+        try:
+            rgb = load_color_rgb(first)
+            camera_rt["color_size"] = (rgb.shape[1], rgb.shape[0])
+        except Exception:
+            camera_rt["color_size"] = None
+
+    def _detach_camera():
+        clear_tracked(vis, displayed, "camera")
+        camera_rt["geoms"]["path"] = None
+        camera_rt["geoms"]["frustum"] = None
+        camera_rt["video"] = None
+        camera_rt["playing"] = False
+        camera_rt["last_tick"] = None
+        camera_rt["seen_tp"] = set()
+
+    def _rebuild_camera_path():
+        clear_tracked(vis, displayed, "camera")
+        camera_rt["geoms"]["path"] = None
+        camera_rt["geoms"]["frustum"] = None
+        if state["camera_mode"] == CAMERA_OFF or camera_rt["sequence"] is None:
+            return
+        poses = [camera_rt["poses"].get(fid) for fid in camera_rt["sequence"]["rgb_ids"]]
+        polylines = trajectory_polylines(poses)
+        if not polylines:
+            camera_rt["status"] = "tracking lost"
+            return
+        import open3d as o3d
+        points = []
+        lines = []
+        colors = []
+        offset = 0
+        total = sum(len(line) for line in polylines)
+        seen = 0
+        for line in polylines:
+            for i, pt in enumerate(line):
+                points.append(pt)
+                t = seen / max(total - 1, 1)
+                colors.append([0.1 + 0.8 * t, 0.4, 0.9 - 0.6 * t])
+                if i:
+                    lines.append([offset + i - 1, offset + i])
+                seen += 1
+            offset += len(line)
+        path = o3d.geometry.LineSet()
+        path.points = o3d.utility.Vector3dVector(np.asarray(points))
+        path.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
+        path.colors = o3d.utility.Vector3dVector(np.asarray(colors[:len(points)]))
+        camera_rt["geoms"]["path"] = path
+        vis.add_geometry(path, reset_bounding_box=False)
+        displayed["camera"].add(path)
+        if state["camera_mode"] == CAMERA_REPLAY:
+            _update_frustum()
+
+    def _update_frustum():
+        geom = camera_rt["geoms"].get("frustum")
+        seq = camera_rt["sequence"]
+        if seq is None or camera_rt["calib"] is None or camera_rt["color_size"] is None:
+            return
+        ids = seq["rgb_ids"]
+        if not ids:
+            return
+        fid = ids[int(camera_rt["frame"]) % len(ids)]
+        pose = camera_rt["poses"].get(fid)
+        if pose is None or not is_valid_pose(pose):
+            camera_rt["status"] = f"Frame {fid}: tracking lost"
+            return
+        origin, corners = frustum_corners(
+            pose, camera_rt["calib"]["K_color"], camera_rt["color_size"][0],
+            camera_rt["color_size"][1])
+        pts = np.vstack([origin, corners])
+        segs = np.array([[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [2, 3], [3, 4], [4, 1]], dtype=np.int32)
+        import open3d as o3d
+        if geom is None:
+            geom = o3d.geometry.LineSet()
+            camera_rt["geoms"]["frustum"] = geom
+            vis.add_geometry(geom, reset_bounding_box=False)
+            displayed["camera"].add(geom)
+        geom.points = o3d.utility.Vector3dVector(pts)
+        geom.lines = o3d.utility.Vector2iVector(segs)
+        geom.paint_uniform_color([1.0, 0.55, 0.1])
+        vis.update_geometry(geom)
+
+    def _rebuild_owners():
+        camera_rt["owners"] = None
+        camera_rt["colors"] = None
+        if session is None or not objects:
+            return
+        camera_rt["owners"], camera_rt["colors"] = owner_colors(
+            len(session["scene_pts"]), objects, _object_color)
+
+    def _render_replay_frame():
+        seq = camera_rt["sequence"]
+        camera_rt["video"] = None
+        if seq is None or state["camera_mode"] != CAMERA_REPLAY:
+            return False
+        ids = seq["rgb_ids"]
+        if not ids:
+            return False
+        fid = ids[int(camera_rt["frame"]) % len(ids)]
+        color_path = os.path.join(seq["dir"], "color", f"{fid}.jpg")
+        try:
+            rgb = load_color_rgb(color_path)
+        except Exception as exc:
+            camera_rt["status"] = f"Frame {fid}: {exc}"
+            return False
+        pose = camera_rt["poses"].get(fid)
+        overlay_rgb = None
+        mask = None
+        valid = None
+        if (pose is not None and is_valid_pose(pose) and camera_rt["calib"] is not None
+                and fid in seq["proj_ids"] and session is not None
+                and state["source_mode"] != SOURCE_SCENE):
+            depth = load_depth_m(os.path.join(seq["dir"], "depth", f"{fid}.png"))
+            if depth is not None:
+                if camera_rt["owners"] is None:
+                    _rebuild_owners()
+                uv, zc, valid = project_points(
+                    session["scene_pts"], pose, camera_rt["calib"], depth,
+                    (rgb.shape[1], rgb.shape[0]))
+                colors = camera_rt["colors"] if camera_rt["colors"] is not None else np.zeros_like(session["scene_pts"])
+                owned = valid & (camera_rt["owners"] >= 0) if camera_rt["owners"] is not None else valid
+                overlay_rgb, mask = zbuffer_colors(
+                    uv, zc, colors, owned, rgb.shape[0], rgb.shape[1])
+            else:
+                camera_rt["status"] = f"Frame {fid}: no depth"
+        elif pose is None or not is_valid_pose(pose):
+            camera_rt["status"] = f"Frame {fid}: tracking lost"
+        small = resize_rgb(rgb)
+        if overlay_rgb is not None and mask is not None and np.any(mask):
+            from PIL import Image
+            ov = (np.clip(overlay_rgb * 255.0, 0, 255).astype(np.uint8)
+                  if overlay_rgb.max() <= 1.0 else np.clip(overlay_rgb, 0, 255).astype(np.uint8))
+            ov_i = Image.fromarray(ov, mode="RGB").resize((small.shape[1], small.shape[0]), Image.NEAREST)
+            mk_i = Image.fromarray((mask.astype(np.uint8) * 255), mode="L").resize(
+                (small.shape[1], small.shape[0]), Image.NEAREST)
+            overlay_s = np.asarray(ov_i)
+            mask_s = np.asarray(mk_i) > 0
+            small = composite_overlay(small, overlay_s, mask_s)
+        camera_rt["video"] = {
+            "frame_id": int(fid),
+            "rgba": rgb_to_rgba_bytes(small),
+        }
+        if valid is not None and objects:
+            packed = packed_visible(valid, len(session["scene_pts"]))
+            camera_rt["seen_tp"], _ = update_seen_tp(camera_rt["seen_tp"], packed, objects)
+        _update_frustum()
+        return True
+
+    def _ensure_encoder():
+        pred = _pred()
+        feats = query_rt.get("features")
+        if pred is None or feats is None:
+            return False
+        family, name, _dim = ENCODERS[pred["model"]]
+        query_client.ensure(method_python(pred["model"]), family, name)
+        return True
+
+    def _start_openins_query(text, mode):
+        pred = _pred()
+        if pred is None or session is None:
+            return
+        query_rt["request_id"] += 1
+        request_id = query_rt["request_id"]
+        query_rt["status"] = "Waiting for GPU"
+        query_rt["pending"] = request_id
+        classes = split_relabel_prompts(text) if mode == QUERY_RELABEL else [text.strip()]
+        classes = [item for item in classes if item]
+        if not classes:
+            query_rt["status"] = "empty prompt"
+            return
+        script = os.path.join(os.path.dirname(__file__), "..", "predict", "models", "_openins3d_query.py")
+        out_json = os.path.join("/tmp", f"openins-query-{os.getpid()}-{request_id}.json")
+        spec = _spec(pred["label_set"])
+        root = submission_dir(spec, pred["run_id"], pred["model"], scannet_root)
+        param = os.path.join(
+            artifact_paths(spec, scannet_root)["evaluations"], pred["run_id"],
+            f"{pred['model']}.parameters.json")
+        args = [
+            method_python("openins3d"), os.path.abspath(script),
+            "--pointcloud", os.path.join(session["dir"], f"{session['id']}_vh_clean_2.ply"),
+            "--out-json", out_json, "--scene-id", session["id"],
+            "--submission-root", root, "--snap-root", openins_snap_root(pred["run_id"], session["id"]),
+            "--classes", *classes, "--request-id", str(request_id),
+            "--run-id", pred["run_id"],
+        ]
+        if os.path.isfile(param):
+            args += ["--parameters-json", param]
+
+        def work():
+            from predict.runner import child_env
+            from utils.gpu import gpu_lease
+            try:
+                settings = {"gpu_pool": [1, 2, 3, 4], "scannet_root": scannet_root}
+                try:
+                    from evaluation.benchmark import load_settings
+                    settings = load_settings()
+                except Exception:
+                    pass
+                with gpu_lease(settings["gpu_pool"], settings["scannet_root"]) as lease:
+                    env = child_env(lease, "openins3d")
+                    query_rt["status"] = "Querying snapshots"
+                    subprocess.run(args, env=env, check=True, pass_fds=(lease.fileno(),))
+                query_rt["openins"] = None
+                if query_rt["pending"] != request_id:
+                    return
+                with open(out_json) as fh:
+                    payload = json.load(fh)
+                if int(payload.get("request_id", -1)) != request_id:
+                    return
+                labels = dict(zip(payload.get("keys") or [], payload.get("labels") or []))
+                scores = dict(zip(payload.get("keys") or [], payload.get("scores") or []))
+                query_rt["labels"] = labels
+                query_rt["scores"] = {k: float(v) for k, v in scores.items()}
+                if mode == QUERY_SEARCH:
+                    ranked = sorted(
+                        ((k, query_rt["scores"][k]) for k in labels if labels[k]),
+                        key=lambda item: -item[1])
+                    query_rt["ranks"] = [k for k, _ in ranked[:10]]
+                else:
+                    query_rt["ranks"] = []
+                query_rt["status"] = ""
+                query_rt["pending"] = None
+            except Exception as exc:
+                if query_rt["pending"] == request_id:
+                    query_rt["status"] = str(exc)
+                    query_rt["pending"] = None
+            finally:
+                try:
+                    os.unlink(out_json)
+                except OSError:
+                    pass
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _submit_query(text):
+        mode = state["query_mode"]
+        query_rt["input"] = text
+        pred = _pred()
+        if pred is None or mode == QUERY_OFF:
+            return
+        if pred["model"] in NATIVE_LOOKUP_MODELS:
+            _start_openins_query(text, mode)
+            return
+        if not _ensure_encoder():
+            query_rt["status"] = "CLIP features unavailable"
+            return
+        query_rt["request_id"] += 1
+        request_id = query_rt["request_id"]
+        query_rt["pending"] = request_id
+        query_rt["status"] = "Encoding"
+        spec = _spec(pred["label_set"])
+        root = submission_dir(spec, pred["run_id"], pred["model"], scannet_root)
+        payload = {
+            "op": "image" if mode == QUERY_IMAGE else ("relabel" if mode == QUERY_RELABEL else "search"),
+            "features_path": clip_features_path(
+                spec, pred["run_id"], pred["model"], session["id"], scannet_root),
+            "index_path": os.path.join(root, session["id"] + ".txt"),
+        }
+        if mode == QUERY_IMAGE:
+            payload["path"] = text
+        else:
+            payload["text"] = text
+        try:
+            sent = query_client.submit(payload)
+            query_rt["request_id"] = sent
+            query_rt["pending"] = sent
+        except Exception as exc:
+            query_rt["status"] = str(exc)
+            query_rt["pending"] = None
+
+    def _apply_query_response(msg):
+        if not msg or msg.get("id") != query_rt.get("pending"):
+            if msg and not msg.get("ok") and query_rt.get("pending") is None:
+                query_rt["status"] = msg.get("error") or "query failed"
+            return False
+        if not msg.get("ok"):
+            query_rt["status"] = msg.get("error") or "query failed"
+            query_rt["pending"] = None
+            return True
+        keys = msg.get("keys") or []
+        if msg.get("op") == "relabel":
+            query_rt["labels"] = dict(zip(keys, msg.get("labels") or []))
+            query_rt["scores"] = dict(zip(keys, msg.get("scores") or []))
+            query_rt["ranks"] = []
+        else:
+            query_rt["ranks"] = keys
+            query_rt["scores"] = dict(zip(keys, msg.get("scores") or []))
+            query_rt["labels"] = {}
+        query_rt["status"] = ""
+        query_rt["pending"] = None
+        return True
+
     def _opts(values, enabled=True):
         if isinstance(enabled, dict):
             return [{"value": value, "enabled": bool(enabled.get(value, True))} for value in values]
@@ -1234,6 +1621,21 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             return _opts([False, True])
         if row == "cad":
             return _opts([False, True], bool(_cad_png()))
+        if row == "query":
+            pred = _pred()
+            model = pred["model"] if pred else None
+            modes = query_modes_for(
+                model, has_features=query_rt.get("features") is not None,
+                has_snap=bool(pred) and openins_snap_complete(pred["run_id"], pred["scene_id"]),
+                source_pred=state["source_mode"] == SOURCE_PRED)
+            enabled = {QUERY_OFF: True, QUERY_SEARCH: QUERY_SEARCH in modes,
+                       QUERY_RELABEL: QUERY_RELABEL in modes, QUERY_IMAGE: QUERY_IMAGE in modes}
+            return _opts([QUERY_OFF, QUERY_SEARCH, QUERY_RELABEL, QUERY_IMAGE], enabled)
+        if row == "camera":
+            has_frames = camera_rt["sequence"] is not None and bool(camera_rt["sequence"]["rgb_ids"])
+            return _opts(
+                [CAMERA_OFF, CAMERA_PATH, CAMERA_REPLAY],
+                {CAMERA_OFF: True, CAMERA_PATH: has_frames, CAMERA_REPLAY: has_frames})
         return []
 
     def _option_lists():
@@ -1256,6 +1658,11 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             return "Hidden" if value else "Visible"
         if row == "cad":
             return "Open" if value else "Closed"
+        if row == "query":
+            return {QUERY_OFF: "Off", QUERY_SEARCH: "Search", QUERY_RELABEL: "Relabel",
+                    QUERY_IMAGE: "Image"}[value]
+        if row == "camera":
+            return {CAMERA_OFF: "Off", CAMERA_PATH: "Path", CAMERA_REPLAY: "Replay"}[value]
         return value
 
     def _tree_rows():
@@ -1357,6 +1764,8 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                         obj["sel"] = src["sel"]
                     state["status"] = _score_predictions(data, root, pred)
         cache[key] = (objects, state["status"])
+        _load_query_features()
+        _rebuild_owners()
 
     def _variant():
         kind = "mesh" if state["geometry"] == "mesh" else "pointcloud"
@@ -1405,8 +1814,11 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     def _wanted():
         if state["source_mode"] == SOURCE_SCENE:
             return set(), set(), set()
+        rank_set = set(query_rt["ranks"]) if state["query_mode"] in (QUERY_SEARCH, QUERY_IMAGE) and query_rt["ranks"] else None
         keep = []
         for i, obj in enumerate(objects):
+            if rank_set is not None and obj.get("key") not in rank_set:
+                continue
             if state["color_mode"] == COLOR_TPGT and obj["verdict"] not in ("tp", "fp"):
                 continue
             if _ceiling_hidden(obj):
@@ -1476,11 +1888,16 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             label_cam = reset_camera_label_state()
 
     def _object_color(idx, o):
+        if state["color_mode"] == COLOR_QUERY:
+            score = float(query_rt["scores"].get(o.get("key"), 0.0))
+            t = max(0.0, min(1.0, (score + 1.0) * 0.5))
+            return colormaps["plasma"](t)[:3]
         if state["color_mode"] == COLOR_TPGT:
             return TP_COLOR if o["verdict"] == "tp" else FP_COLOR
         if state["color_mode"] == COLOR_INSTANCE:
             return colormaps["turbo"](idx / max(len(objects), 1))[:3]
-        return _class_color(o["class_name"], nyu40map, palette)
+        name = o.get("query_label") or o["class_name"]
+        return _class_color(name, nyu40map, palette)
 
     def _paint():
         clear_tracked(vis, displayed, "boxes")
@@ -1507,6 +1924,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         clear_tracked(vis, displayed, "objs")
         clear_tracked(vis, displayed, "boxes")
         clear_tracked(vis, displayed, "labels")
+        _detach_camera()
         if current.get("placeholder") is not None:
             vis.remove_geometry(current["placeholder"], reset_bounding_box=False)
             current["placeholder"] = None
@@ -1533,17 +1951,42 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                 _tree_rows(), state["cursor_id"], state["active_pred"],
                 session["id"] if session else None, state.get("active_method")),
             "cad_overlay": png if state.get("cad_open") and png else None,
+            "query": {
+                "mode": state["query_mode"],
+                "status": query_rt["status"],
+                "input": query_rt["input"],
+                "reset_id": query_rt["reset_id"],
+                "results": query_result_lines(
+                    state["query_mode"], query_rt["ranks"],
+                    [query_rt["scores"].get(k, 0.0) for k in query_rt["ranks"]],
+                    list(query_rt["labels"].values())),
+            },
+            "camera": {
+                "mode": state["camera_mode"],
+                "frame": camera_rt["frame"],
+                "count": len(camera_rt["sequence"]["rgb_ids"]) if camera_rt["sequence"] else 0,
+                "playing": camera_rt["playing"],
+                "live_tp": len(camera_rt["seen_tp"]) if state["camera_mode"] == CAMERA_REPLAY and state["query_mode"] != QUERY_RELABEL else None,
+                "live_gt": (scores.get(run_node_id(session["id"], pred), {}) or {}).get("gt") if pred and session else None,
+            },
+            "video": None if state.get("cad_open") else camera_rt.get("video"),
         }
 
     def _update_hud():
         payload = _hud_payload()
         publish_left({"tree": payload["tree"]})
         publish_right({k: payload[k] for k in (
-            "settings", "classes", "colors", "status", "focus", "cad_overlay", "info")})
+            "settings", "classes", "colors", "status", "focus", "cad_overlay", "info",
+            "query", "camera", "video")})
 
     def _normalize_color():
         if state["source_mode"] == SOURCE_SCENE:
             return
+        if state["query_mode"] == QUERY_RELABEL and state["color_mode"] == COLOR_TPGT:
+            state["color_mode"] = COLOR_CLASS
+        if state["color_mode"] == COLOR_QUERY and state["query_mode"] not in (
+                QUERY_SEARCH, QUERY_IMAGE):
+            state["color_mode"] = COLOR_CLASS
         if state["color_mode"] == COLOR_TPGT and (
                 state["source_mode"] != SOURCE_PRED or not _tp_available()):
             state["color_mode"] = COLOR_CLASS
@@ -1589,8 +2032,32 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                 _swap_scene()
         elif row == "cad":
             state["cad_open"] = bool(value)
+            if state["cad_open"]:
+                camera_rt["playing"] = False
             _update_hud()
             return
+        elif row == "query":
+            if value == state["query_mode"]:
+                return
+            state["query_mode"] = value
+            _clear_query()
+            if value in (QUERY_SEARCH, QUERY_IMAGE):
+                state["color_mode"] = COLOR_QUERY
+            elif state["color_mode"] == COLOR_QUERY:
+                state["color_mode"] = COLOR_CLASS
+        elif row == "camera":
+            if value == state["camera_mode"]:
+                return
+            state["camera_mode"] = value
+            camera_rt["frame"] = 0
+            camera_rt["last_tick"] = None
+            camera_rt["seen_tp"] = set()
+            camera_rt["playing"] = value == CAMERA_REPLAY
+            _rebuild_camera_path()
+            if value == CAMERA_REPLAY:
+                _render_replay_frame()
+            else:
+                camera_rt["video"] = None
         _normalize_color()
         if session is None:
             _update_hud()
@@ -1618,6 +2085,11 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         session = bundle
         objects = []
         state["cad_open"] = False
+        state["query_mode"] = QUERY_OFF
+        _clear_query()
+        _load_camera_sequence()
+        if state["camera_mode"] != CAMERA_OFF:
+            _rebuild_camera_path()
         state["expanded"].add(scene_node_id(recon_id[:9]))
         state["expanded"].add(scan_node_id(recon_id))
         return True
@@ -1674,7 +2146,48 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     def _activate_method(row):
         _activate_run(row)
 
+    def _sync_query_objects():
+        for obj in objects:
+            key = obj.get("key")
+            obj["query_label"] = query_rt["labels"].get(key) if state["query_mode"] == QUERY_RELABEL else None
+            if state["query_mode"] == QUERY_RELABEL:
+                obj["label"] = None
+        _rebuild_owners()
+        _paint()
+        _sync()
+
+    def _handle_hud_action(action):
+        kind = action.get("type")
+        if kind == "query_apply":
+            _submit_query(action.get("text") or "")
+            _update_hud()
+            return
+        if kind == "query_clear":
+            _clear_query()
+            if state["query_mode"] != QUERY_OFF and state["color_mode"] == COLOR_QUERY:
+                state["color_mode"] = COLOR_CLASS
+            _sync_query_objects()
+            _update_hud()
+            return
+        if kind == "replay_toggle":
+            if state["camera_mode"] == CAMERA_REPLAY:
+                camera_rt["playing"] = not camera_rt["playing"]
+                camera_rt["last_tick"] = None
+                _update_hud()
+            return
+        if kind == "replay_frame":
+            seq = camera_rt["sequence"]
+            count = len(seq["rgb_ids"]) if seq else 0
+            if count:
+                camera_rt["frame"] = min(max(0, int(action.get("frame") or 0)), count - 1)
+                camera_rt["playing"] = False
+                _render_replay_frame()
+                _update_hud()
+
     def _dispatch(key):
+        if isinstance(key, dict):
+            _handle_hud_action(key)
+            return
         if key in (ord("Q"), KEY_ESCAPE):
             vis.close()
             return
@@ -1703,14 +2216,32 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                     key = conn.recv()
                 except (EOFError, OSError):
                     break
-                if isinstance(key, int):
+                if isinstance(key, (int, dict)):
                     _dispatch(key)
 
     def _tick(_vis):
         _drain_keys()
+        msg = query_client.poll()
+        if msg and _apply_query_response(msg):
+            _sync_query_objects()
+            _update_hud()
+        updated = False
+        if state["camera_mode"] == CAMERA_REPLAY and camera_rt["sequence"] and not state.get("cad_open"):
+            ids = camera_rt["sequence"]["rgb_ids"]
+            nxt, last = advance_playback(
+                camera_rt["playing"], camera_rt["frame"], len(ids),
+                camera_rt["last_tick"], time.monotonic(), REPLAY_FPS)
+            if nxt != camera_rt["frame"] or camera_rt["video"] is None:
+                camera_rt["frame"] = nxt
+                camera_rt["last_tick"] = last
+                _render_replay_frame()
+                _update_hud()
+                updated = True
+            else:
+                camera_rt["last_tick"] = last
         if displayed["labels"]:
-            return _update_labels(_vis)
-        return False
+            return _update_labels(_vis) or updated
+        return updated
 
     def _key_action(key, handler):
         def callback(_vis, action, _mods):
@@ -1738,6 +2269,13 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     vis.register_animation_callback(_tick)
     print("Keys: Tab HUD, arrows, Enter, mouse view, Esc/Q quit")
     vis.run()
+    query_client.close()
+    proc = query_rt.get("openins")
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
     _stop_hud(left_q, left_p, stop_left)
     _stop_hud(right_q, right_p, stop_right)
     vis.destroy_window()

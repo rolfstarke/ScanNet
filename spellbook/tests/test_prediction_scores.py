@@ -297,8 +297,11 @@ class CleanupTests(unittest.TestCase):
             sidecar = score_sidecar_path(spec, "run-a", "mosaic3d", "scene0568_00", scannet_root=root)
             os.makedirs(os.path.dirname(sidecar))
             timing = os.path.join(os.path.dirname(sidecar), "scene0568_00.timing.json")
+            clip = os.path.join(os.path.dirname(sidecar), "scene0568_00.clip.npz")
             with open(timing, "w") as f:
                 f.write("{}\n")
+            with open(clip, "w") as f:
+                f.write("x\n")
             write_score_sidecar(sidecar, _sidecar_doc(tp=1, gt=1, verdicts={}))
             eval_dir = os.path.join(root, "derived", "evaluations", "ScanNet20", "run-a")
             os.makedirs(eval_dir, exist_ok=True)
@@ -308,6 +311,7 @@ class CleanupTests(unittest.TestCase):
                 purge_scan_predictions("scene0568_00", scannet_root=root)
             self.assertFalse(os.path.isfile(sidecar))
             self.assertFalse(os.path.isfile(timing))
+            self.assertFalse(os.path.isfile(clip))
             self.assertFalse(os.path.isfile(os.path.join(pred, "scene0568_00.txt")))
 
 

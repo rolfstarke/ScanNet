@@ -151,10 +151,93 @@ def _draw_setting_row(imgui, row, width, settings_focus):
     imgui.dummy(0, 4)
 
 
-def _draw_right(imgui, payload, height, width, overlay=None):
+def _send(keys_out, payload):
+    if keys_out is None:
+        return
+    try:
+        keys_out.send(payload)
+    except Exception:
+        pass
+
+
+def _sync_query_text(hud_state, payload):
+    query = payload.get("query") or {}
+    reset_id = query.get("reset_id")
+    if hud_state.get("reset_id") != reset_id:
+        hud_state["reset_id"] = reset_id
+        hud_state["query_text"] = query.get("input") or ""
+
+
+def _draw_video(imgui, overlay, width):
+    if not overlay or overlay.get("kind") != "video" or not overlay.get("id"):
+        return
+    iw, ih = overlay["wh"]
+    scale = min(1.0, 420 / max(iw, 1), 315 / max(ih, 1))
+    dw, dh = iw * scale, ih * scale
+    imgui.set_cursor_pos((max(8.0, width - dw - 8), 8.0))
+    imgui.image(overlay["id"], dw, dh)
+    imgui.set_cursor_pos((8.0, dh + 16.0))
+
+
+def _draw_query_block(imgui, payload, hud_state, keys_out):
+    query = payload.get("query")
+    if not query:
+        return
+    imgui.text("Query")
+    mode = query.get("mode") or "off"
+    imgui.text(f"Mode {mode}")
+    if query.get("status"):
+        imgui.text(query["status"])
+    if mode != "off":
+        _sync_query_text(hud_state, payload)
+        label = "Image path" if mode == "image" else "Prompt"
+        imgui.text(label)
+        current = hud_state.get("query_text") or ""
+        changed, value = imgui.input_text("##query_field", current, 512)
+        if changed and value is not None:
+            hud_state["query_text"] = value
+        if imgui.button("Apply"):
+            _send(keys_out, {"type": "query_apply", "text": hud_state.get("query_text") or ""})
+        imgui.same_line()
+        if imgui.button("Clear"):
+            hud_state["query_text"] = ""
+            _send(keys_out, {"type": "query_clear"})
+        results = query.get("results") or []
+        for line in results[:5]:
+            imgui.text(str(line))
+    imgui.separator()
+
+
+def _draw_replay_block(imgui, payload, keys_out):
+    camera = payload.get("camera")
+    if not camera or camera.get("mode") != "replay":
+        return
+    count = int(camera.get("count") or 0)
+    frame = int(camera.get("frame") or 0)
+    playing = bool(camera.get("playing"))
+    imgui.text("Replay")
+    if imgui.button("Pause" if playing else "Play"):
+        _send(keys_out, {"type": "replay_toggle"})
+    imgui.same_line()
+    imgui.text(f"{frame}/{max(count - 1, 0)}")
+    live = camera.get("live_tp")
+    live_gt = camera.get("live_gt")
+    if live is not None and live_gt is not None:
+        imgui.text(f"Replay TP/GT {live}/{live_gt}")
+    if count > 1:
+        changed, value = imgui.slider_int("##replay_frame", frame, 0, count - 1)
+        if changed and value is not None:
+            _send(keys_out, {"type": "replay_frame", "frame": int(value)})
+    imgui.separator()
+
+
+def _draw_right(imgui, payload, height, width, overlay=None, hud_state=None, keys_out=None):
+    interactive = not payload.get("cad_overlay")
     flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
              imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE |
-             imgui.WINDOW_NO_SAVED_SETTINGS | imgui.WINDOW_NO_INPUTS)
+             imgui.WINDOW_NO_SAVED_SETTINGS)
+    if not interactive:
+        flags |= imgui.WINDOW_NO_INPUTS
     imgui.set_next_window_position(0, 0)
     imgui.set_next_window_size(width, height)
     imgui.begin("##scannet_hud", flags=flags)
@@ -167,6 +250,8 @@ def _draw_right(imgui, payload, height, width, overlay=None):
         imgui.image(overlay["id"], dw, dh)
         imgui.end()
         return
+
+    _draw_video(imgui, overlay, width)
 
     if payload.get("status"):
         imgui.text(payload["status"])
@@ -196,11 +281,15 @@ def _draw_right(imgui, payload, height, width, overlay=None):
             imgui.text(f"TP/GT {tp}/{gt} · FP {fp_text}")
     imgui.separator()
 
+    _draw_replay_block(imgui, payload, keys_out)
+
     imgui.text("Settings")
     settings_focus = payload.get("focus") == "settings"
     for row in payload.get("settings") or []:
         _draw_setting_row(imgui, row, width, settings_focus)
     imgui.separator()
+
+    _draw_query_block(imgui, payload, hud_state or {}, keys_out)
 
     imgui.text("Classes")
     classes = payload.get("classes") or []
@@ -213,11 +302,12 @@ def _draw_right(imgui, payload, height, width, overlay=None):
     imgui.end()
 
 
-def _draw(imgui, payload, height, side, width, overlay=None, view_start=None):
+def _draw(imgui, payload, height, side, width, overlay=None, view_start=None,
+          hud_state=None, keys_out=None):
     if side == "left":
         _draw_left(imgui, payload, height, width, view_start or [0])
     else:
-        _draw_right(imgui, payload, height, width, overlay)
+        _draw_right(imgui, payload, height, width, overlay, hud_state, keys_out)
 
 
 def _display_size():
@@ -291,9 +381,19 @@ def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
     style.colors[imgui.COLOR_WINDOW_BACKGROUND] = (1.0, 1.0, 1.0, 1.0)
     style.colors[imgui.COLOR_TEXT] = (0.08, 0.08, 0.08, 1.0)
     style.colors[imgui.COLOR_BORDER] = (0.30, 0.30, 0.30, 1.0)
-    renderer = GlfwRenderer(window, attach_callbacks=False)
+    renderer = GlfwRenderer(window, attach_callbacks=(side == "right"))
 
-    def _on_key(_win, key, _scancode, action, _mods):
+    def _on_key(win, key, scancode, action, mods):
+        if side == "right":
+            callback = getattr(renderer, "keyboard_callback", None) or getattr(
+                renderer, "_keyboard_callback", None)
+            if callback:
+                callback(win, key, scancode, action, mods)
+            try:
+                if imgui.get_io().want_capture_keyboard:
+                    return
+            except Exception:
+                pass
         if keys_out is None or action != glfw.PRESS:
             return
         try:
@@ -310,9 +410,10 @@ def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
     payload = empty
     width, height = dock_w, dock_h
     dirty = True
-    overlay = {"id": None, "path": None, "wh": None}
+    overlay = {"id": None, "path": None, "wh": None, "kind": None, "frame_id": None}
     fullscreen = False
     view_start = [0]
+    hud_state = {"query_text": "", "reset_id": None}
 
     def _clear_overlay():
         if overlay["id"] is not None:
@@ -323,24 +424,48 @@ def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
         overlay["id"] = None
         overlay["path"] = None
         overlay["wh"] = None
+        overlay["kind"] = None
+        overlay["frame_id"] = None
 
-    def _sync_overlay(path):
-        if path == overlay["path"]:
-            return
-        if not path:
-            _clear_overlay()
-            return
-        dw, dh = _display_size()
-        try:
-            rgba = _load_overlay_rgba(path, dw, dh)
+    def _set_texture(rgba, kind, path=None, frame_id=None):
+        h, w = rgba.shape[:2]
+        if overlay["id"] is not None and overlay.get("wh") == (w, h):
+            gl.glBindTexture(gl.GL_TEXTURE_2D, overlay["id"])
+            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, w, h, gl.GL_RGBA,
+                               gl.GL_UNSIGNED_BYTE, rgba)
+        else:
             tex, iw, ih = _upload_overlay_texture(gl, rgba)
-        except Exception:
             _clear_overlay()
-            return
-        _clear_overlay()
-        overlay["id"] = tex
+            overlay["id"] = tex
+            overlay["wh"] = (iw, ih)
+        overlay["kind"] = kind
         overlay["path"] = path
-        overlay["wh"] = (iw, ih)
+        overlay["frame_id"] = frame_id
+
+    def _sync_overlay(path, video):
+        if path:
+            if overlay.get("kind") == "cad" and path == overlay["path"]:
+                return
+            dw, dh = _display_size()
+            try:
+                rgba = _load_overlay_rgba(path, dw, dh)
+                _set_texture(rgba, "cad", path=path)
+            except Exception:
+                _clear_overlay()
+            return
+        if video and video.get("rgba") is not None:
+            frame_id = video.get("frame_id")
+            if overlay.get("kind") == "video" and overlay.get("frame_id") == frame_id:
+                return
+            try:
+                import numpy as np
+                rgba = np.ascontiguousarray(video["rgba"], dtype=np.uint8)
+                _set_texture(rgba, "video", frame_id=frame_id)
+            except Exception:
+                _clear_overlay()
+            return
+        if overlay["id"] is not None:
+            _clear_overlay()
 
     def _dock():
         nonlocal width, height, fullscreen
@@ -372,6 +497,7 @@ def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
             break
 
         cad = payload.get("cad_overlay") if payload else None
+        video = payload.get("video") if payload else None
         if cad:
             dw, dh = _display_size()
             if not fullscreen or height != dh:
@@ -392,11 +518,11 @@ def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
         if payload and dirty:
             glfw.make_context_current(window)
             if side == "right":
-                _sync_overlay(cad)
+                _sync_overlay(cad, video)
             imgui.get_io().display_size = (float(fb_w), float(fb_h))
             renderer.process_inputs()
             imgui.new_frame()
-            _draw(imgui, payload, height, side, width, overlay, view_start)
+            _draw(imgui, payload, height, side, width, overlay, view_start, hud_state, keys_out)
             glClearColor(1.0, 1.0, 1.0, 1.0)
             glClear(GL_COLOR_BUFFER_BIT)
             imgui.render()
