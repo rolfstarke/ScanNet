@@ -29,7 +29,10 @@ import yaml
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import _benchmark_spec, scene_id_from_pointcloud, write_scannet_submission  # noqa: E402
+from common import (  # noqa: E402
+    _benchmark_spec, add_run_args, load_overrides, publish_clip_features,
+    scene_id_from_pointcloud, write_scannet_submission_rows,
+)
 
 OPEN3DIS_REPO = "/home/rolf/GIT/Open3DIS"
 OPEN3DIS_PY = "/data/open3dis/conda/envs/open3dis/bin/python"
@@ -94,25 +97,37 @@ def _ensure_working_ply(pointcloud_path, working_ply, limit):
     a voxel-decimated copy. Returns whether decimation was applied."""
     os.makedirs(os.path.dirname(working_ply), exist_ok=True)
     pcd = o3d.io.read_point_cloud(pointcloud_path)
+    meta_path = working_ply + ".limit"
 
     if len(pcd.points) <= limit:
         if os.path.islink(working_ply) or os.path.exists(working_ply):
             os.remove(working_ply)
+        if os.path.isfile(meta_path):
+            os.remove(meta_path)
         os.symlink(os.path.abspath(pointcloud_path), working_ply)
         return False
 
     if (os.path.exists(working_ply) and not os.path.islink(working_ply)
-            and os.path.getmtime(working_ply) >= os.path.getmtime(pointcloud_path)):
-        return True
+            and os.path.getmtime(working_ply) >= os.path.getmtime(pointcloud_path)
+            and os.path.isfile(meta_path)):
+        try:
+            with open(meta_path) as f:
+                cached = int(f.read().strip())
+        except (OSError, ValueError):
+            cached = None
+        if cached == int(limit):
+            return True
 
     voxel_size = 0.01
     down = pcd
     while len(down.points) > limit:
         voxel_size *= 1.4
         down = pcd.voxel_down_sample(voxel_size)
-    if os.path.islink(working_ply):
+    if os.path.islink(working_ply) or os.path.exists(working_ply):
         os.remove(working_ply)
     o3d.io.write_point_cloud(working_ply, down)
+    with open(meta_path, "w") as f:
+        f.write(str(int(limit)) + "\n")
     return True
 
 
@@ -157,28 +172,35 @@ def main():
     ap.add_argument("--out", required=True, help="predictions output dir")
     ap.add_argument("--benchmark", default="ScanNet20",
                     choices=["ScanNet20", "ScanNet200"])
+    add_run_args(ap)
     args = ap.parse_args()
     spec = _benchmark_spec(args.benchmark)
+    params = load_overrides(args.parameters_json, {
+        "min_mask_points", "decimate_limit", "final_instance_top_k"})
+    min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
+    decimate_limit = int(params.get("decimate_limit", DECIMATE_LIMIT))
+    final_instance_top_k = int(params.get("final_instance_top_k", FINAL_INSTANCE_TOP_K))
 
     os.makedirs(args.out, exist_ok=True)
     scene_id = scene_id_from_pointcloud(args.pointcloud)
+    print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params}")
 
     scene_2d_dir = os.path.join(OPEN3DIS_REPO, "data", "ov3dis_scene", "ov3dis_scene_2d", scene_id)
     working_ply = os.path.join(OPEN3DIS_REPO, "data", "ov3dis_scene", "original_ply", f"{scene_id}.ply")
     _link_frames(args.frames, scene_2d_dir)
-    decimated = _ensure_working_ply(args.pointcloud, working_ply, DECIMATE_LIMIT)
+    decimated = _ensure_working_ply(args.pointcloud, working_ply, decimate_limit)
 
-    split_path = os.path.join(SCRATCH_ROOT, scene_id, "open3dis_split.txt")
+    split_path = os.path.join(SCRATCH_ROOT, args.run_id, scene_id, "open3dis_split.txt")
     os.makedirs(os.path.dirname(split_path), exist_ok=True)
     with open(split_path, "w") as f:
         f.write(scene_id + "\n")
 
     img_dim, rgb_img_dim = _frame_img_dim(args.frames)
-    exp_name = f"{scene_id}_ov3discomp"
+    exp_name = f"{args.run_id}_{scene_id}_ov3discomp"
     run_config = _make_run_config(
         GENERIC_TEMPLATE_CONFIG,
         dict(split_path=split_path, img_dim=img_dim, rgb_img_dim=rgb_img_dim),
-        exp_name, args.classes, os.path.join(SCRATCH_ROOT, scene_id),
+        exp_name, args.classes, os.path.join(SCRATCH_ROOT, args.run_id, scene_id),
     )
     exp_dir = os.path.join(OPEN3DIS_REPO, "exp", exp_name)
 
@@ -212,17 +234,23 @@ def main():
 
     def _instances():
         for i, rle in enumerate(masks_rle):
-            if np.linalg.norm(inst_feat[i].numpy()) < 1e-6:
+            feat = inst_feat[i].numpy()
+            if np.linalg.norm(feat) < 1e-6:
                 continue
             sel = _rle_decode(rle).astype(bool)
             if nn_idx is not None:
                 sel = sel[nn_idx]
-            yield sel, args.classes[best_idx[i]], confidence[i]
+            yield sel, args.classes[best_idx[i]], confidence[i], feat
 
-    candidates = sorted(_instances(), key=lambda t: -t[2])[:FINAL_INSTANCE_TOP_K]
-    n_written = write_scannet_submission(args.out, scene_id, args.classes, candidates,
-                                         MIN_MASK_POINTS, spec)
-    print(f"[INFO] Wrote {n_written} instances to {args.out}")
+    ranked = sorted(_instances(), key=lambda t: -t[2])[:final_instance_top_k]
+    candidates = [(sel, cls, conf) for sel, cls, conf, _feat in ranked]
+    feature_rows = [feat for _sel, _cls, _conf, feat in ranked]
+    rows = write_scannet_submission_rows(args.out, scene_id, args.classes, candidates,
+                                        min_mask_points, spec)
+    publish_clip_features(
+        args.features_out, feature_rows, rows, spec, args.run_id, "open3dis", scene_id,
+        "openai_clip", "ViT-L/14@336px", 768)
+    print(f"[INFO] Wrote {rows['n_written']} instances to {args.out}")
 
 
 if __name__ == "__main__":

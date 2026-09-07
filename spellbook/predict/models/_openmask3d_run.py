@@ -25,7 +25,10 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import _benchmark_spec, decimate, scene_id_from_pointcloud, write_scannet_submission  # noqa: E402
+from common import (  # noqa: E402
+    _benchmark_spec, add_run_args, decimate, load_overrides, publish_clip_features,
+    scene_id_from_pointcloud, write_scannet_submission_rows,
+)
 
 OPENMASK3D_REPO = "/home/rolf/GIT/openmask3d"
 CHECKPOINT = "/data/openmask3d/resources/scannet200_model.ckpt"
@@ -34,6 +37,7 @@ SAM_CHECKPOINT = "/data/openmask3d/resources/sam_vit_h_4b8939.pth"
 POINT_LIMIT = 500_000  # Mask3D mask computation OOMs on a 16GB card above ~900k points (empirical)
 MIN_MASK_POINTS = 20
 DEDUP_IOU = 0.5
+SCRATCH_ROOT = "/data/openmask3d/scratch"
 
 
 def _lease_fd():
@@ -95,7 +99,7 @@ def _run_feature_computation(scene_ply, masks_path, frames, out_dir, frequency):
     return os.path.join(out_dir, f"{scene_name}_openmask3d_features.npy")
 
 
-def _classify(masks, feats, classes, device):
+def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS):
     model, _ = clip.load("ViT-L/14@336px", device=device)
     with torch.no_grad():
         text_ft = model.encode_text(clip.tokenize([f"a photo of a {c}." for c in classes]).to(device))
@@ -104,14 +108,15 @@ def _classify(masks, feats, classes, device):
     instances = []
     for mi in tqdm(range(masks.shape[1]), desc="classifying masks", unit="mask"):
         sel = masks[:, mi] > 0.5
-        if sel.sum() < MIN_MASK_POINTS:
+        if sel.sum() < min_mask_points:
             continue
         norm = np.linalg.norm(feats[mi])
         if norm < 1e-6:
             continue
-        sims = (feats[mi] / norm) @ text_ft.T
+        unit = feats[mi] / norm
+        sims = unit @ text_ft.T
         best = int(np.argmax(sims))
-        instances.append((sel, classes[best], (float(sims[best]) + 1) / 2))
+        instances.append((sel, classes[best], (float(sims[best]) + 1) / 2, unit))
     return instances
 
 
@@ -120,8 +125,8 @@ def _dedup_instances(instances, iou_threshold=DEDUP_IOU):
     cluster (overlap = intersection over the SMALLER mask, so a small spurious proposal
     nested inside a larger correct one still counts as a duplicate)."""
     by_class = {}
-    for i, (_, cls, _) in enumerate(instances):
-        by_class.setdefault(cls, []).append(i)
+    for i, inst in enumerate(instances):
+        by_class.setdefault(inst[1], []).append(i)
 
     keep = [False] * len(instances)
     for idxs in by_class.values():
@@ -147,47 +152,62 @@ def main():
     ap.add_argument("--out", required=True, help="predictions output dir")
     ap.add_argument("--benchmark", default="ScanNet20",
                     choices=["ScanNet20", "ScanNet200"])
+    add_run_args(ap)
     args = ap.parse_args()
     spec = _benchmark_spec(args.benchmark)
     scene_id = scene_id_from_pointcloud(args.pointcloud)
+    params = load_overrides(args.parameters_json, {
+        "point_limit", "min_mask_points", "dedup_iou"})
+    point_limit = int(params.get("point_limit", POINT_LIMIT))
+    min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
+    dedup_iou = float(params.get("dedup_iou", DEDUP_IOU))
+    print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params}")
 
     os.makedirs(args.out, exist_ok=True)
+    scratch = os.path.join(SCRATCH_ROOT, args.run_id, scene_id)
+    os.makedirs(scratch, exist_ok=True)
 
     pcd = o3d.io.read_point_cloud(args.pointcloud)
     full_pts = np.asarray(pcd.points)
     full_cols = np.asarray(pcd.colors)
-    working_pts, nn_idx = decimate(full_pts, POINT_LIMIT)
+    working_pts, nn_idx = decimate(full_pts, point_limit)
     if len(working_pts) < len(full_pts):
         working_cols = full_cols[cKDTree(full_pts).query(working_pts, k=1, workers=-1)[1]]
     else:
         working_cols = full_cols
 
-    scene_ply = os.path.join(args.out, "working_scene.ply")
+    scene_ply = os.path.join(scratch, "working_scene.ply")
     working_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(working_pts))
     working_pcd.colors = o3d.utility.Vector3dVector(working_cols)
     o3d.io.write_point_cloud(scene_ply, working_pcd)
 
-    masks_path = _run_mask_computation(scene_ply, args.out)
+    masks_path = _run_mask_computation(scene_ply, scratch)
 
     total_frames = len(glob.glob(os.path.join(args.frames, "pose", "*.txt")))
     frequency = max(1, total_frames // 400)
     features_path = _run_feature_computation(scene_ply, masks_path, args.frames,
-                                             args.out, frequency)
+                                             scratch, frequency)
 
     masks = np.asarray(torch.load(masks_path))
     feats = np.load(features_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    instances = _classify(masks, feats, args.classes, device)
-    deduped = _dedup_instances(instances)
+    instances = _classify(masks, feats, args.classes, device, min_mask_points)
+    deduped = _dedup_instances(instances, iou_threshold=dedup_iou)
 
-    def _instances():
-        for sel_decimated, class_name, confidence in deduped:
-            yield sel_decimated[nn_idx], class_name, confidence
+    candidates = []
+    feature_rows = []
+    for item in deduped:
+        sel_decimated, class_name, confidence, feat = item
+        candidates.append((sel_decimated[nn_idx], class_name, confidence))
+        feature_rows.append(feat)
 
-    n_written = write_scannet_submission(args.out, scene_id, args.classes, _instances(),
-                                         MIN_MASK_POINTS, spec)
+    rows = write_scannet_submission_rows(args.out, scene_id, args.classes, candidates,
+                                        min_mask_points, spec)
+    publish_clip_features(
+        args.features_out, feature_rows, rows, spec, args.run_id, "openmask3d", scene_id,
+        "openai_clip", "ViT-L/14@336px", 768)
     print(f"[INFO] {len(instances)} raw instances -> {len(deduped)} after IoU-overlap "
-          f"dedup, {n_written} written to {args.out}")
+          f"dedup, {rows['n_written']} written to {args.out}")
 
 
 if __name__ == "__main__":

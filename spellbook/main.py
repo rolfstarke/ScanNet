@@ -27,6 +27,10 @@ def main():
                         help="benchmark backend (default: spellbook/settings.yaml)")
     parser.add_argument("--run-id", type=str, default=None,
                         help="run id for output isolation (default: auto-generated)")
+    parser.add_argument("--run-parameters", type=str, default=None,
+                        help="JSON file mapping each --models entry to its parameters")
+    parser.add_argument("--issue", type=int, default=None,
+                        help="GitHub issue number to record on the prediction run manifest")
     parser.add_argument("--engine", nargs="+", default=None,
                         choices=["zed", "metashape", "rtabmap", "isaac", "open3d",
                                  "bundlefusion"],
@@ -39,16 +43,56 @@ def main():
     parser.add_argument("--replace", action="store_true",
                         help="re-extract frames even if a complete set exists")
     parser.add_argument("--scene", nargs="+",
-                        help="scene numbers (e.g., 0568_00 0304_00 or 9004 9009)")
+                        help="scene numbers (e.g., 0046_00 or 9004 9009); explicit "
+                             "prediction subsets are non-comparable")
+    parser.add_argument("--compare", action="store_true",
+                        help="generate the offline numerical comparison dashboard "
+                             "from existing artifacts and open it in the browser")
     args = parser.parse_args()
 
-    from evaluation.benchmark import load_settings, resolve_benchmark
+    if args.compare:
+        conflicts = [name for name, present in (
+            ("--visualize", args.visualize),
+            ("--predict", args.predict),
+            ("--gpu-check", args.gpu_check),
+            ("--engine", args.engine),
+            ("--extract-frames", args.extract_frames),
+            ("--replace", args.replace),
+            ("--scene", args.scene),
+            ("--models", args.models),
+            ("--classes", args.classes),
+            ("--benchmark", args.benchmark),
+            ("--run-id", args.run_id),
+            ("--run-parameters", args.run_parameters),
+            ("--issue", args.issue),
+        ) if present]
+        if conflicts:
+            parser.error("--compare is exclusive with " + ", ".join(conflicts))
+        from evaluation.benchmark import load_settings
+        from evaluation.comparison import generate_report, open_report
+        root = load_settings()["scannet_root"]
+        path = generate_report(root)
+        print(f"comparison -> {path}")
+        if not open_report(path):
+            print("no display or browser found; open the file above manually")
+        return
+
+    from evaluation.benchmark import (
+        PREDICTION_EVALUATION_SCENES, load_settings, resolve_benchmark,
+        validate_prediction_scenes,
+    )
     benchmark = args.benchmark or load_settings()["default"]
     spec = resolve_benchmark(benchmark)
 
+    if args.run_parameters is not None or args.issue is not None:
+        if not args.predict:
+            parser.error("--run-parameters and --issue require --predict")
+        if args.issue is not None and args.issue <= 0:
+            parser.error("--issue must be a positive integer")
+
     if args.gpu_check:
-        if args.visualize or args.predict or args.extract_frames:
-            parser.error("--gpu-check is exclusive with --visualize/--predict/--extract-frames")
+        if args.visualize or args.predict or args.extract_frames or args.compare:
+            parser.error("--gpu-check is exclusive with --visualize/--predict/--extract-frames/--compare")
         if args.scene:
             parser.error("--gpu-check does not use --scene")
         import sys as _sys
@@ -60,29 +104,38 @@ def main():
         from gpu_check import main as gpu_check_main
         gpu_check_main()
     elif args.extract_frames:
-        if args.visualize or args.predict or args.engine:
-            parser.error("--extract-frames is exclusive with --visualize/--predict/--engine")
+        if args.visualize or args.predict or args.engine or args.compare:
+            parser.error("--extract-frames is exclusive with --visualize/--predict/--engine/--compare")
         if not args.scene:
             parser.error("--extract-frames requires --scene")
         from reconstruct.extract import extract_scenes
         extract_scenes([int(s) for s in args.scene], replace=args.replace)
     elif args.visualize:
-        if len(args.scene or []) != 1:
-            parser.error("--visualize takes exactly one --scene")
+        if args.scene:
+            parser.error("--visualize does not take --scene")
         from utils.visualize import visualize
-        visualize(f"scene{args.scene[0]}", benchmark=benchmark, run_id=args.run_id)
+        visualize(benchmark=benchmark, run_id=args.run_id)
     elif args.predict:
         if not args.models:
             parser.error("--predict requires --models")
-        if not args.scene:
-            parser.error("--predict requires --scene")
+        if args.classes:
+            parser.error("--classes is not allowed for managed prediction")
         run_id = args.run_id or time.strftime("run-%Y%m%d-%H%M%S")
-        classes = args.classes.split(",") if args.classes else None
-        n_classes = len(classes) if classes else len(spec.class_labels)
-        print(f"[INFO] benchmark={spec.name} run_id={run_id} classes={n_classes}")
+        models = [m.strip() for m in args.models.split(",") if m.strip()]
+        if args.scene:
+            scene_ids = validate_prediction_scenes(args.scene)
+        else:
+            scene_ids = list(PREDICTION_EVALUATION_SCENES)
+        run_parameters = None
+        if args.run_parameters:
+            from evaluation.runs import load_run_parameters
+            run_parameters = load_run_parameters(args.run_parameters, models)
+        print(f"[INFO] benchmark={spec.name} run_id={run_id} classes={len(spec.class_labels)}")
         from predict.runner import predict
-        predict([f"scene{s}" for s in args.scene], args.models.split(","),
-                classes, benchmark, run_id)
+        results = predict(scene_ids, models, None, benchmark, run_id,
+                          run_parameters=run_parameters, issue=args.issue)
+        if any(not row[-1] for row in results):
+            sys.exit(1)
     elif args.engine:
         if not args.scene:
             parser.error("--engine requires --scene")

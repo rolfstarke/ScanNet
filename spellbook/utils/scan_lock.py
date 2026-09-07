@@ -42,6 +42,11 @@ def prediction_index_lock_path(scannet_root=None):
     return os.path.join(_root(scannet_root), LOCK_ROOT_REL, "prediction-artifacts.lock")
 
 
+def prediction_method_lock_path(method, scannet_root=None):
+    return os.path.join(_root(scannet_root), LOCK_ROOT_REL, "prediction-methods",
+                        f"{method}.lock")
+
+
 class ScanLock:
     """Held flock. Supports exclusive->shared downgrade on the same descriptor."""
 

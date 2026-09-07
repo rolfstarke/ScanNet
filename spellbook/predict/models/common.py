@@ -8,13 +8,35 @@ Prediction output follows ScanNet's official benchmark submission layout (scan-n
 per mesh vertex), which is the shape ScanNet's own evaluator
 (BenchmarkScripts/3d_evaluation/evaluate_semantic_instance.py) reads directly.
 """
+import json
+import math
 import os
 import pathlib
+import secrets
 import sys
 
 import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
+
+
+_INT_BOUNDS = {
+    "point_limit": (1, None),
+    "min_mask_points": (1, None),
+    "decimate_limit": (1, None),
+    "final_instance_top_k": (1, None),
+}
+_FLOAT_BOUNDS = {
+    "dedup_iou": (0.0, 1.0),
+    "grid_size": (0.0, None),
+    "mask_confidence_threshold": (0.0, 1.0),
+    "lookup_threshold": (0.0, 1.0),
+}
+_POSITIVE_FLOATS = frozenset({"grid_size"})
+_ENUMS = {
+    "condition": ("ScanNet", "ARKitScenes", "ScanNetPP"),
+    "detector": ("odise", "yoloworld"),
+}
 
 
 def _benchmark_spec(benchmark_name):
@@ -37,10 +59,47 @@ def scene_id_from_pointcloud(pointcloud_path):
     return pathlib.Path(pointcloud_path).parent.name
 
 
+def validate_run_id(run_id):
+    if not isinstance(run_id, str) or not run_id or run_id.strip() != run_id:
+        raise ValueError(f"invalid run_id {run_id!r}")
+    if os.sep in run_id or (os.altsep and os.altsep in run_id) or run_id in (".", ".."):
+        raise ValueError(f"invalid run_id {run_id!r}")
+    return run_id
+
+
+def _as_number(value, kind, key):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number, got {value!r}")
+    try:
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{key} must be finite, got {value!r}")
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{key} must be finite, got {value!r}") from exc
+    if kind is int:
+        if int(value) != value:
+            raise ValueError(f"{key} must be an integer, got {value!r}")
+        return int(value)
+    return float(value)
+
+
+def _check_bounds(key, value, lo, hi):
+    if key in _POSITIVE_FLOATS:
+        if value <= lo or (hi is not None and value > hi):
+            bound = f"> {lo}" if hi is None else f"in ({lo}, {hi}]"
+            raise ValueError(f"{key} must be {bound}, got {value!r}")
+        return value
+    if value < lo or (hi is not None and value > hi):
+        bound = f">= {lo}" if hi is None else f"in [{lo}, {hi}]"
+        raise ValueError(f"{key} must be {bound}, got {value!r}")
+    return value
+
+
 def decimate(pts, limit):
     """Voxel-downsample until under `limit` points; returns (kept_points, nn_idx) where
     nn_idx[i] is the index into kept_points nearest to the ORIGINAL points[i] -- used to
     propagate per-instance masks back onto every original point."""
+    if limit <= 0:
+        raise ValueError("point_limit must be positive")
     if len(pts) <= limit:
         return pts, np.arange(len(pts))
 
@@ -55,32 +114,115 @@ def decimate(pts, limit):
     return down, nn_idx
 
 
-def write_scannet_submission(submission_root, scene_id, classes, instances, min_mask_points, spec):
+def add_run_args(parser):
+    parser.add_argument("--run-id", default="adhoc", type=validate_run_id)
+    parser.add_argument("--parameters-json", default=None)
+    parser.add_argument("--features-out", default=None)
+
+
+def _query_module():
+    import importlib.util
+    spellbook_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    spec_path = os.path.join(spellbook_dir, "utils", "query.py")
+    spec = importlib.util.spec_from_file_location("spellbook_query", spec_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_overrides(path, allowed):
+    if not path:
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    if type(data) is not dict:
+        raise ValueError(f"parameters JSON must be an object: {path}")
+    extra = [key for key in data if key not in allowed]
+    if extra:
+        raise ValueError(f"unknown parameter(s): {extra}")
+    out = {}
+    for key, value in data.items():
+        if key in _INT_BOUNDS:
+            value = _check_bounds(key, _as_number(value, int, key), *_INT_BOUNDS[key])
+        elif key in _FLOAT_BOUNDS:
+            value = _check_bounds(key, _as_number(value, float, key), *_FLOAT_BOUNDS[key])
+        elif key in _ENUMS:
+            if value not in _ENUMS[key]:
+                raise ValueError(f"{key} must be one of {list(_ENUMS[key])}, got {value!r}")
+        out[key] = value
+    return out
+
+
+def write_scannet_submission_rows(submission_root, scene_id, classes, instances, min_mask_points, spec):
     """Writes <scene_id>.txt + predicted_masks/<scene_id>_NNN.txt in ScanNet's official
     benchmark submission layout (scan-net.org): one line per instance
     "predicted_masks/<scene_id>_NNN.txt <label_id> <confidence>", each mask one int per mesh
     vertex. `instances` is an iterable of (mask_bool_over_full_cloud, class_name, confidence);
     masks with fewer than `min_mask_points` set points are skipped. `spec` is a
     benchmark.BenchmarkSpec; its label_to_id assigns the scoreable label ids, and any class not
-    in it raises ValueError. Returns the number of instances written."""
+    in it raises ValueError. Returns a dict with n_written, index_path, keys, and source_indices."""
     unknown = [c for c in classes if c not in spec.label_to_id]
     if unknown:
         raise ValueError(
             f"write_scannet_submission: class(es) {unknown} are not in benchmark {spec.name} "
-            f"({len(spec.class_labels)} classes) — cannot assign a scoreable label id. Use only "
+            f"({len(spec.class_labels)} classes) - cannot assign a scoreable label id. Use only "
             f"the official benchmark class names."
         )
     label_ids = {c: spec.label_to_id[c] for c in classes}
     mask_dir = os.path.join(submission_root, "predicted_masks")
     os.makedirs(mask_dir, exist_ok=True)
-
+    index_path = os.path.join(submission_root, f"{scene_id}.txt")
+    tmp_index = index_path + ".tmp"
+    gen = secrets.token_hex(4)
+    written = []
+    keys = []
+    source_indices = []
     n_written = 0
-    with open(os.path.join(submission_root, f"{scene_id}.txt"), "w") as scene_f:
-        for mask, class_name, confidence in instances:
+    with open(tmp_index, "w") as scene_f:
+        for source_i, (mask, class_name, confidence) in enumerate(instances):
             if mask.sum() < min_mask_points:
                 continue
-            mask_name = f"{scene_id}_{n_written:03d}.txt"
-            np.savetxt(os.path.join(mask_dir, mask_name), mask.astype(int), fmt="%d")
-            scene_f.write(f"predicted_masks/{mask_name} {label_ids[class_name]} {confidence:.4f}\n")
+            mask_name = f"{scene_id}_{gen}_{n_written:03d}.txt"
+            final_mask = os.path.join(mask_dir, mask_name)
+            tmp_mask = final_mask + ".tmp"
+            np.savetxt(tmp_mask, mask.astype(int), fmt="%d")
+            with open(tmp_mask, "rb") as mask_f:
+                os.fsync(mask_f.fileno())
+            os.replace(tmp_mask, final_mask)
+            written.append(mask_name)
+            key = f"predicted_masks/{mask_name}"
+            keys.append(key)
+            source_indices.append(source_i)
+            scene_f.write(f"{key} {label_ids[class_name]} {confidence:.4f}\n")
             n_written += 1
-    return n_written
+        scene_f.flush()
+        os.fsync(scene_f.fileno())
+    os.replace(tmp_index, index_path)
+    keep = set(written)
+    prefix = scene_id + "_"
+    if os.path.isdir(mask_dir):
+        for name in os.listdir(mask_dir):
+            if name.startswith(prefix) and name.endswith(".txt") and name not in keep:
+                os.remove(os.path.join(mask_dir, name))
+    return {
+        "n_written": n_written,
+        "index_path": index_path,
+        "keys": keys,
+        "source_indices": source_indices,
+    }
+
+
+def write_scannet_submission(submission_root, scene_id, classes, instances, min_mask_points, spec):
+    return write_scannet_submission_rows(
+        submission_root, scene_id, classes, instances, min_mask_points, spec)["n_written"]
+
+
+def publish_clip_features(features_out, feature_rows, rows, spec, run_id, model, scene_id,
+                          encoder_family, encoder_name, feature_dim):
+    if not features_out:
+        return None
+    query = _query_module()
+    return query.write_aligned_features(
+        features_out, feature_rows, rows["source_indices"], rows["keys"], rows["index_path"],
+        scene_id=scene_id, benchmark=spec.name, run_id=run_id, model=model,
+        encoder_family=encoder_family, encoder_name=encoder_name, feature_dim=feature_dim)

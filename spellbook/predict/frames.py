@@ -49,11 +49,12 @@ def _sens_num_frames(sens_path):
         return struct.unpack("<Q", f.read(8))[0]
 
 
-def extract_frames(scene_id, replace=False):
+def extract_frames(scene_id, replace=False, scannet_root=None):
     """Extract ALL frames from <scene>.sens to <scene>/frames/ with sequential 0..N-1 names.
     Idempotent: returns early if frames/ already holds the full expected count.
     With replace=True, an existing frames/ directory is removed first so extraction runs again."""
-    scene_dir = os.path.join(SCANS_DIR, scene_id)
+    scans_dir = os.path.join(scannet_root, "scans") if scannet_root else SCANS_DIR
+    scene_dir = os.path.join(scans_dir, scene_id)
     sens_path = os.path.join(scene_dir, f"{scene_id}.sens")
     frames_dir = os.path.join(scene_dir, "frames")
     color_dir, depth_dir, pose_dir = (os.path.join(frames_dir, d) for d in ("color", "depth", "pose"))

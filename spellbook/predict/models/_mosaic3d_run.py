@@ -19,7 +19,10 @@ import torch
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import _benchmark_spec, decimate, scene_id_from_pointcloud, write_scannet_submission  # noqa: E402
+from common import (  # noqa: E402
+    _benchmark_spec, add_run_args, decimate, load_overrides, publish_clip_features,
+    scene_id_from_pointcloud, write_scannet_submission_rows,
+)
 
 MOSAIC3D_REPO = "/home/rolf/GIT/Mosaic3D"
 CHECKPOINT = "/data/mosaic3d/ckpts/spunet34c.ckpt"
@@ -53,9 +56,17 @@ def main():
     ap.add_argument("--out", required=True, help="predictions output dir")
     ap.add_argument("--benchmark", default="ScanNet20",
                     choices=["ScanNet20", "ScanNet200"])
+    add_run_args(ap)
     args = ap.parse_args()
     spec = _benchmark_spec(args.benchmark)
     scene_id = scene_id_from_pointcloud(args.pointcloud)
+    params = load_overrides(args.parameters_json, {
+        "grid_size", "point_limit", "min_mask_points", "condition"})
+    grid_size = float(params.get("grid_size", GRID_SIZE))
+    point_limit = int(params.get("point_limit", POINT_LIMIT))
+    min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
+    condition = str(params.get("condition", CONDITION))
+    print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -66,10 +77,10 @@ def main():
     full_cols = np.asarray(pcd.colors)
     up_axis = _detect_up_axis(full_pts)
 
-    working_pts, nn_idx = decimate(full_pts, POINT_LIMIT)
+    working_pts, nn_idx = decimate(full_pts, point_limit)
     if len(working_pts) < len(full_pts):
         working_cols = full_cols[cKDTree(full_pts).query(working_pts, k=1, workers=-1)[1]]
-        working_ply = os.path.join(SCRATCH_ROOT, scene_id, "working_scene.ply")
+        working_ply = os.path.join(SCRATCH_ROOT, args.run_id, scene_id, "working_scene.ply")
         os.makedirs(os.path.dirname(working_ply), exist_ok=True)
         working_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(working_pts))
         working_pcd.colors = o3d.utility.Vector3dVector(working_cols)
@@ -80,22 +91,63 @@ def main():
 
     sys.path.insert(0, MOSAIC3D_REPO)
     os.chdir(MOSAIC3D_REPO)  # run_custom_scene.py's own imports assume repo root as cwd
-    from scripts.run_custom_scene import run_inference
+    from scripts.run_custom_scene import (  # noqa: E402
+        CLIP_CFG, build_net, load_backbone_ckpt, run_inference)
+    from src.models.utils.clip_models import build_clip_model  # noqa: E402
 
+    class _CaptureNet:
+        def __init__(self, net):
+            self.net = net
+            self.point = None
+
+        def __call__(self, *args, **kwargs):
+            self.point = self.net(*args, **kwargs)
+            return self.point
+
+        def eval(self):
+            self.net.eval()
+            return self
+
+        def to(self, device_):
+            self.net.to(device_)
+            return self
+
+    net = build_net()
+    load_backbone_ckpt(net, CHECKPOINT)
+    net = net.to(device).eval()
+    clip_model = build_clip_model(CLIP_CFG, device=device)
+    clip_model.eval()
+    for param in clip_model.parameters():
+        param.requires_grad = False
+    capturer = _CaptureNet(net)
     objects, _, _ = run_inference(
-        scene_ply, args.classes, CHECKPOINT, device, condition=CONDITION, grid_size=GRID_SIZE, up_axis=up_axis,
-        class_profiles=STRUCTURAL_CLASS_PROFILES,
+        scene_ply, args.classes, CHECKPOINT, device, condition=condition, grid_size=grid_size, up_axis=up_axis,
+        class_profiles=STRUCTURAL_CLASS_PROFILES, net=capturer, clip_model=clip_model,
     )
+    if capturer.point is None:
+        raise RuntimeError("Mosaic3D encoder produced no captured point features")
+    point = capturer.point
+    point_feat = point.sparse_conv_feat.features[point.v2p_map]
+    point_feat = torch.nn.functional.normalize(point_feat.float(), dim=-1).detach().cpu().numpy()
 
-    def _instances():
-        for obj in objects:
-            sel_working = np.zeros(len(working_pts), dtype=bool)
-            sel_working[obj["point_indices"]] = True
-            yield sel_working[nn_idx], obj["class_name"], obj["score"]
+    candidates = []
+    feature_rows = []
+    for obj in objects:
+        sel_working = np.zeros(len(working_pts), dtype=bool)
+        sel_working[obj["point_indices"]] = True
+        vec = point_feat[obj["point_indices"]].mean(axis=0)
+        norm = np.linalg.norm(vec)
+        if norm >= 1e-6:
+            vec = vec / norm
+        candidates.append((sel_working[nn_idx], obj["class_name"], obj["score"]))
+        feature_rows.append(vec.astype(np.float32))
 
-    n_written = write_scannet_submission(args.out, scene_id, args.classes, _instances(),
-                                         MIN_MASK_POINTS, spec)
-    print(f"[INFO] Wrote {n_written} instances to {args.out} ({len(working_pts)}/{len(full_pts)} points used)")
+    rows = write_scannet_submission_rows(args.out, scene_id, args.classes, candidates,
+                                        min_mask_points, spec)
+    publish_clip_features(
+        args.features_out, feature_rows, rows, spec, args.run_id, "mosaic3d", scene_id,
+        "open_clip", CLIP_CFG["model_id"], 768)
+    print(f"[INFO] Wrote {rows['n_written']} instances to {args.out} ({len(working_pts)}/{len(full_pts)} points used)")
 
 
 if __name__ == "__main__":

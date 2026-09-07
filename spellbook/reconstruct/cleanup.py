@@ -55,9 +55,20 @@ def purge_scan_predictions(scene_id, scannet_root=None):
                                 _safe_unlink(p)
                                 changed = True
                         if changed:
-                            # stale aggregate CSV under evaluations
                             csv_path = os.path.join(eval_root, run_id, f"{model}.csv")
                             _safe_unlink(csv_path)
+                            sidecar_dir = os.path.join(eval_root, run_id, model)
+                            _safe_unlink(os.path.join(sidecar_dir, f"{scene_id}.tp50.json"))
+                            _safe_unlink(os.path.join(sidecar_dir, f"{scene_id}.timing.json"))
+                            _safe_unlink(os.path.join(sidecar_dir, f"{scene_id}.clip.npz"))
+                            if model == "openins3d":
+                                from utils.query import openins_snap_root
+                                shutil.rmtree(openins_snap_root(run_id, scene_id), ignore_errors=True)
+                            try:
+                                if os.path.isdir(sidecar_dir) and not os.listdir(sidecar_dir):
+                                    os.rmdir(sidecar_dir)
+                            except OSError:
+                                pass
 
             if os.path.isdir(eval_root):
                 for run_id in os.listdir(eval_root):
@@ -81,6 +92,19 @@ def purge_scan_predictions(scene_id, scannet_root=None):
                             os.replace(tmp, tasks)
                             csv_path = os.path.join(run_dir, name.replace(".tasks", ".csv"))
                             _safe_unlink(csv_path)
+                            model = name[:-6]
+                            sidecar_dir = os.path.join(run_dir, model)
+                            _safe_unlink(os.path.join(sidecar_dir, f"{scene_id}.tp50.json"))
+                            _safe_unlink(os.path.join(sidecar_dir, f"{scene_id}.timing.json"))
+                            _safe_unlink(os.path.join(sidecar_dir, f"{scene_id}.clip.npz"))
+                            if model == "openins3d":
+                                from utils.query import openins_snap_root
+                                shutil.rmtree(openins_snap_root(run_id, scene_id), ignore_errors=True)
+                            try:
+                                if os.path.isdir(sidecar_dir) and not os.listdir(sidecar_dir):
+                                    os.rmdir(sidecar_dir)
+                            except OSError:
+                                pass
 
 
 def remove_scan_dir(path):
