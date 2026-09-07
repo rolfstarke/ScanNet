@@ -11,6 +11,7 @@ the tightest range is "up", matching room height).
 """
 import argparse
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -25,12 +26,15 @@ from common import (  # noqa: E402
 )
 
 MOSAIC3D_REPO = "/home/rolf/GIT/Mosaic3D"
-CHECKPOINT = "/data/mosaic3d/ckpts/spunet34c.ckpt"
-CONDITION = "ARKitScenes"  # handheld mobile LiDAR domain -- closest match to a handheld ZED scan
+CHECKPOINT = "/data/mosaic3d/ckpts/sc.ckpt"
+CONDITION = "ScanNet"
 GRID_SIZE = 0.02
+INSTANCE_HEAD = "mask3d"
+OPENINS3D_PY = "/data/openins3d/conda/envs/openins3d/bin/python"
+MASK3D_CONFIDENCE = 0.001
 
 POINT_LIMIT = 1_500_000  # SpUNet's per-point feature gather OOMs on a 16GB card above ~2M points
-MIN_MASK_POINTS = 20
+MIN_MASK_POINTS = 100
 SCRATCH_ROOT = "/data/mosaic3d/scratch"  # transient decimated meshes -- kept off the submission root
 
 STRUCTURAL_CLASS_PROFILES = {
@@ -38,6 +42,21 @@ STRUCTURAL_CLASS_PROFILES = {
     "floor": dict(eps=0.40, min_points=100, max_extent=8.0),
     "ceiling": dict(eps=0.40, min_points=100, max_extent=8.0),
 }
+
+
+def _mask3d_masks(pointcloud, run_id, scene_id, confidence):
+    out = os.path.join(SCRATCH_ROOT, "mask3d_proposals", scene_id, "mask3d_masks.npz")
+    if os.path.isfile(out):
+        return np.load(out)["masks"]
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    script = os.path.join(os.path.dirname(__file__), "_mask3d_proposals.py")
+    fd = os.environ.get("SPELLBOOK_GPU_LEASE_FD")
+    pass_fds = (int(fd),) if fd else ()
+    subprocess.run(
+        [OPENINS3D_PY, script, "--pointcloud", pointcloud, "--out", out,
+         "--confidence", str(confidence)],
+        env=os.environ.copy(), check=True, pass_fds=pass_fds)
+    return np.load(out)["masks"]
 
 
 def _detect_up_axis(pts):
@@ -61,12 +80,16 @@ def main():
     spec = _benchmark_spec(args.benchmark)
     scene_id = scene_id_from_pointcloud(args.pointcloud)
     params = load_overrides(args.parameters_json, {
-        "grid_size", "point_limit", "min_mask_points", "condition"})
+        "grid_size", "point_limit", "min_mask_points", "condition",
+        "instance_head", "mask3d_confidence", "checkpoint"})
     grid_size = float(params.get("grid_size", GRID_SIZE))
     point_limit = int(params.get("point_limit", POINT_LIMIT))
     min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
     condition = str(params.get("condition", CONDITION))
-    print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params}")
+    instance_head = str(params.get("instance_head", INSTANCE_HEAD))
+    mask3d_confidence = float(params.get("mask3d_confidence", MASK3D_CONFIDENCE))
+    checkpoint = str(params.get("checkpoint", CHECKPOINT))
+    print(f"[INFO] {scene_id} run_id={args.run_id} head={instance_head} ckpt={checkpoint} overrides={params}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -112,41 +135,61 @@ def main():
             self.net.to(device_)
             return self
 
-    net = build_net()
-    load_backbone_ckpt(net, CHECKPOINT)
-    net = net.to(device).eval()
-    clip_model = build_clip_model(CLIP_CFG, device=device)
-    clip_model.eval()
-    for param in clip_model.parameters():
-        param.requires_grad = False
-    capturer = _CaptureNet(net)
-    objects, _, _ = run_inference(
-        scene_ply, args.classes, CHECKPOINT, device, condition=condition, grid_size=grid_size, up_axis=up_axis,
-        class_profiles=STRUCTURAL_CLASS_PROFILES, net=capturer, clip_model=clip_model,
-    )
-    if capturer.point is None:
-        raise RuntimeError("Mosaic3D encoder produced no captured point features")
-    point = capturer.point
-    point_feat = point.sparse_conv_feat.features[point.v2p_map]
-    point_feat = torch.nn.functional.normalize(point_feat.float(), dim=-1).detach().cpu().numpy()
+    feature_rows = None
+    if instance_head == "mask3d":
+        from scripts.run_custom_scene import classify_mask3d_proposals
+        masks = _mask3d_masks(args.pointcloud, args.run_id, scene_id, mask3d_confidence)
+        if masks.shape[0] != len(full_pts):
+            raise RuntimeError(f"Mask3D N={masks.shape[0]} != mesh N={len(full_pts)}")
+        ppt_conditions = ["ScanNet"] if checkpoint.rstrip("/").endswith("sc.ckpt") else None
+        objects, _ = classify_mask3d_proposals(
+            args.pointcloud, args.classes, checkpoint, device, masks,
+            condition=condition, grid_size=grid_size, up_axis=up_axis,
+            min_mask_points=min_mask_points, ppt_conditions=ppt_conditions)
+        nn_idx = np.arange(len(full_pts))
+        working_pts = full_pts
+    else:
+        net = build_net()
+        load_backbone_ckpt(net, checkpoint)
+        net = net.to(device).eval()
+        clip_model = build_clip_model(CLIP_CFG, device=device)
+        clip_model.eval()
+        for param in clip_model.parameters():
+            param.requires_grad = False
+        capturer = _CaptureNet(net)
+        objects, _, _ = run_inference(
+            scene_ply, args.classes, checkpoint, device, condition=condition,
+            grid_size=grid_size, up_axis=up_axis,
+            class_profiles=STRUCTURAL_CLASS_PROFILES, net=capturer, clip_model=clip_model,
+        )
+        if capturer.point is None:
+            raise RuntimeError("Mosaic3D encoder produced no captured point features")
+        point = capturer.point
+        point_feat = point.sparse_conv_feat.features[point.v2p_map]
+        point_feat = torch.nn.functional.normalize(
+            point_feat.float(), dim=-1).detach().cpu().numpy()
+        feature_rows = []
+        for obj in objects:
+            vec = point_feat[obj["point_indices"]].mean(axis=0)
+            norm = np.linalg.norm(vec)
+            if norm >= 1e-6:
+                vec = vec / norm
+            feature_rows.append(vec.astype(np.float32))
 
     candidates = []
-    feature_rows = []
     for obj in objects:
         sel_working = np.zeros(len(working_pts), dtype=bool)
         sel_working[obj["point_indices"]] = True
-        vec = point_feat[obj["point_indices"]].mean(axis=0)
-        norm = np.linalg.norm(vec)
-        if norm >= 1e-6:
-            vec = vec / norm
         candidates.append((sel_working[nn_idx], obj["class_name"], obj["score"]))
-        feature_rows.append(vec.astype(np.float32))
 
     rows = write_scannet_submission_rows(args.out, scene_id, args.classes, candidates,
                                         min_mask_points, spec)
-    publish_clip_features(
-        args.features_out, feature_rows, rows, spec, args.run_id, "mosaic3d", scene_id,
-        "open_clip", CLIP_CFG["model_id"], 768)
+    if feature_rows is not None:
+        publish_clip_features(
+            args.features_out, feature_rows, rows, spec, args.run_id, "mosaic3d", scene_id,
+            "open_clip", CLIP_CFG["model_id"], 768)
+    else:
+        print(f"[INFO] mask3d head exposes no point features; skipping clip publish")
     print(f"[INFO] Wrote {rows['n_written']} instances to {args.out} ({len(working_pts)}/{len(full_pts)} points used)")
 
 

@@ -59,7 +59,7 @@ MODEL_RESOURCES = {
     "mosaic3d": (
         "/home/rolf/GIT/Mosaic3D",
         "/home/rolf/GIT/Mosaic3D/scripts/run_custom_scene.py",
-        "/data/mosaic3d/ckpts/spunet34c.ckpt",
+        "/data/mosaic3d/ckpts/sc.ckpt",
     ),
     "openins3d": (
         "/home/rolf/GIT/OpenIns3D",
