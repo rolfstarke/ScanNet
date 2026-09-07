@@ -11,7 +11,6 @@ ALL physical devices) to that visible device. The lease descriptor is forwarded 
 blocking subprocesses with pass_fds so no child outlives the lease.
 """
 import argparse
-import glob
 import os
 import subprocess
 import sys
@@ -35,7 +34,11 @@ CHECKPOINT = "/data/openmask3d/resources/scannet200_model.ckpt"
 SAM_CHECKPOINT = "/data/openmask3d/resources/sam_vit_h_4b8939.pth"
 
 POINT_LIMIT = 500_000  # Mask3D mask computation OOMs on a 16GB card above ~900k points (empirical)
-MIN_MASK_POINTS = 20
+MIN_MASK_POINTS = 1
+NUM_QUERIES = 150
+DBSCAN_MIN_POINTS = 1
+FREQUENCY = 10
+CLIP_PROMPT = "a {} in a scene"
 DEDUP_IOU = 0.5
 SCRATCH_ROOT = "/data/openmask3d/scratch"
 
@@ -45,24 +48,26 @@ def _lease_fd():
     return (int(fd),) if fd else ()
 
 
-def _run_mask_computation(scene_ply, out_dir):
+def _run_mask_computation(scene_ply, out_dir, num_queries, dbscan_min_points):
+    env = os.environ.copy()
+    env["OPENMASK3D_FORCE_GPU"] = "0"
     args = [
         sys.executable, "class_agnostic_mask_computation/get_masks_single_scene.py",
         "general.experiment_name=openmask3d_util",
         f"general.checkpoint={CHECKPOINT}",
         "general.train_mode=false",
         "data.test_mode=test",
-        "model.num_queries=120",
+        f"model.num_queries={num_queries}",
         "general.use_dbscan=true",
         "general.dbscan_eps=0.95",
-        "general.dbscan_min_points=10",
+        f"general.dbscan_min_points={dbscan_min_points}",
         "general.save_visualizations=false",
         f"general.scene_path={scene_ply}",
         f"general.mask_save_dir={out_dir}",
         f"hydra.run.dir={out_dir}/hydra_outputs/class_agnostic_mask_computation",
     ]
     subprocess.run(args, cwd=os.path.join(OPENMASK3D_REPO, "openmask3d"),
-                   env=os.environ.copy(), check=True, pass_fds=_lease_fd())
+                   env=env, check=True, pass_fds=_lease_fd())
     scene_name = os.path.basename(scene_ply)[:-4]
     return os.path.join(out_dir, f"{scene_name}_masks.pt")
 
@@ -99,13 +104,29 @@ def _run_feature_computation(scene_ply, masks_path, frames, out_dir, frequency):
     return os.path.join(out_dir, f"{scene_name}_openmask3d_features.npy")
 
 
-def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS):
+def _clip_vocab(spec):
+    if spec.name != "ScanNet200":
+        return list(spec.class_labels)
+    import importlib.util
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))
+    path = os.path.join(repo, "BenchmarkScripts", "ScanNet200", "scannet200_constants.py")
+    spec_mod = importlib.util.spec_from_file_location("scannet200_constants", path)
+    module = importlib.util.module_from_spec(spec_mod)
+    spec_mod.loader.exec_module(module)
+    return list(module.CLASS_LABELS_200)
+
+
+def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS,
+              clip_prompt=CLIP_PROMPT):
     model, _ = clip.load("ViT-L/14@336px", device=device)
     with torch.no_grad():
-        text_ft = model.encode_text(clip.tokenize([f"a photo of a {c}." for c in classes]).to(device))
+        texts = [clip_prompt.format(c) for c in classes]
+        text_ft = model.encode_text(clip.tokenize(texts).to(device))
         text_ft = (text_ft / text_ft.norm(dim=-1, keepdim=True)).cpu().numpy()
 
     instances = []
+    skipped = 0
     for mi in tqdm(range(masks.shape[1]), desc="classifying masks", unit="mask"):
         sel = masks[:, mi] > 0.5
         if sel.sum() < min_mask_points:
@@ -116,7 +137,12 @@ def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS):
         unit = feats[mi] / norm
         sims = unit @ text_ft.T
         best = int(np.argmax(sims))
-        instances.append((sel, classes[best], (float(sims[best]) + 1) / 2, unit))
+        name = classes[best]
+        if name in ("wall", "floor"):
+            skipped += 1
+            continue
+        instances.append((sel, name, 1.0, unit))
+    print(f"[INFO] skipped {skipped} wall/floor CLIP assignments")
     return instances
 
 
@@ -157,11 +183,17 @@ def main():
     spec = _benchmark_spec(args.benchmark)
     scene_id = scene_id_from_pointcloud(args.pointcloud)
     params = load_overrides(args.parameters_json, {
-        "point_limit", "min_mask_points", "dedup_iou"})
+        "point_limit", "min_mask_points", "num_queries", "dbscan_min_points",
+        "frequency", "clip_prompt", "dedup_iou"})
     point_limit = int(params.get("point_limit", POINT_LIMIT))
     min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
+    num_queries = int(params.get("num_queries", NUM_QUERIES))
+    dbscan_min_points = int(params.get("dbscan_min_points", DBSCAN_MIN_POINTS))
+    frequency = int(params.get("frequency", FREQUENCY))
+    clip_prompt = str(params.get("clip_prompt", CLIP_PROMPT))
     dedup_iou = float(params.get("dedup_iou", DEDUP_IOU))
-    print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params}")
+    print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params} "
+          f"queries={num_queries} dbscan_min={dbscan_min_points} freq={frequency}")
 
     os.makedirs(args.out, exist_ok=True)
     scratch = os.path.join(SCRATCH_ROOT, args.run_id, scene_id)
@@ -181,17 +213,16 @@ def main():
     working_pcd.colors = o3d.utility.Vector3dVector(working_cols)
     o3d.io.write_point_cloud(scene_ply, working_pcd)
 
-    masks_path = _run_mask_computation(scene_ply, scratch)
+    masks_path = _run_mask_computation(scene_ply, scratch, num_queries, dbscan_min_points)
 
-    total_frames = len(glob.glob(os.path.join(args.frames, "pose", "*.txt")))
-    frequency = max(1, total_frames // 400)
     features_path = _run_feature_computation(scene_ply, masks_path, args.frames,
                                              scratch, frequency)
 
     masks = np.asarray(torch.load(masks_path))
     feats = np.load(features_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    instances = _classify(masks, feats, args.classes, device, min_mask_points)
+    clip_classes = _clip_vocab(spec)
+    instances = _classify(masks, feats, clip_classes, device, min_mask_points, clip_prompt)
     deduped = _dedup_instances(instances, iou_threshold=dedup_iou)
 
     candidates = []
