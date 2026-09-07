@@ -235,6 +235,31 @@ def gpu_check_model(model, lease, hold_seconds=5):
                 seconds=round(time.time() - start, 1), reason=None)
 
 
+def _auto_evaluate(spec, run_id, models, unique_scenes, scannet_root):
+    """Grade a finished prediction run: export missing GT, then evaluate each
+    model. Never raises — a failed grade must not downgrade good predictions."""
+    from evaluation.benchmark import artifact_paths
+    from evaluation.evaluate import evaluate_cli, export_gt_cli
+    from evaluation.runs import run_is_evaluated
+    gt_dir = artifact_paths(spec, scannet_root)["gt"]
+    for scene_id in unique_scenes:
+        if os.path.isfile(os.path.join(gt_dir, scene_id + ".txt")):
+            continue
+        try:
+            export_gt_cli(["--scene", scene_id, "--benchmark", spec.name,
+                           "--scannet-root", scannet_root])
+        except Exception as exc:
+            print(f"[WARN] GT export failed for {scene_id} ({exc})")
+    for model in models:
+        if run_is_evaluated(spec, run_id, model, scannet_root):
+            continue
+        try:
+            evaluate_cli(["--run-id", run_id, "--benchmark", spec.name,
+                          "--models", model, "--scannet-root", scannet_root])
+        except Exception as exc:
+            print(f"[WARN] auto-evaluation failed for {model} ({exc})")
+
+
 def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, replace=False,
             run_parameters=None, issue=None):
     """Run predictions for `models` on all `scene_ids`, in parallel over the automatic
@@ -387,6 +412,10 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
                 futures = [pool.submit(work, t) for t in pending]
                 for fut in futures:
                     results.append(fut.result())
+        if all(row[-1] for row in results):
+            _auto_evaluate(spec, run_id, models, unique_scenes, scannet_root)
+        else:
+            print("[WARN] evaluation skipped (failed tasks)")
         return results
     finally:
         for lk in reversed(locks):

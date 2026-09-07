@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import yaml
@@ -11,18 +12,27 @@ _SPELLBOOK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _SPELLBOOK)
 
 from evaluation.evaluate import write_score_sidecar  # noqa: E402
-from utils.hud import _draw_right, ellipsize, format_metric  # noqa: E402
+from utils.hud import (  # noqa: E402
+    _draw_class_row, _draw_pipeline_block, _draw_replay_block, _draw_right,
+    ellipsize, format_metric)
 from utils.visualize import (  # noqa: E402
-    COLOR_CLASS, COLOR_TPGT, FOCUS_SETTINGS, FOCUS_TREE, KEY_DOWN, KEY_ENTER,
+    COLOR_CLASS, COLOR_TPGT, FOCUS_REPLAY, FOCUS_SETTINGS, FOCUS_TREE,
+    KEY_DOWN, KEY_ENTER,
     KEY_LEFT, KEY_RIGHT, KEY_TAB, KEY_UP, KIND_METHOD, KIND_RUN, KIND_SCAN,
-    SETTING_ROWS, SOURCE_GT, SOURCE_PRED, SOURCE_SCENE, apply_prediction_labels,
-    best_prediction, cad_report_png, camera_label_update, capped_geometry,
-    clamp_cursor, clear_tracked, collect_tp_scores, discover_reconstructions,
-    flatten_tree, group_scenes, handle_navigation, index_predictions,
+    MODEL_PIPELINE, SETTING_ROWS, SOURCE_GT, SOURCE_PRED, SOURCE_SCENE,
+    _place_label, apply_prediction_labels,
+    best_prediction, cad_report_png, capped_geometry,
+    class_count_stats, clamp_cursor, clear_tracked, collect_tp_scores,
+    colorize_detections, colorize_masks,
+    discover_reconstructions, eligible_gt_counts,
+    ensure_object_decorations,
+    flatten_tree, group_scenes, handle_navigation, handle_replay,
+    index_predictions,
+    instance_color,
     collect_prediction_times, collect_reconstruction_times, information_payload,
     load_cad_accuracy, merge_tp_gt_overlay, method_node_id,
     object_bounds, prediction_artifact_mtime, render_object_fields,
-    require_scene, reset_camera_label_state, run_node_id, scan_node_id,
+    require_scene, run_node_id, scan_node_id,
     scene_node_id, settings_payload,
 )
 
@@ -207,7 +217,7 @@ class NavigationTests(unittest.TestCase):
                 {"value": True, "enabled": False},
             ],
             "query": [{"value": "off"}],
-            "camera": [{"value": "off"}],
+            "view": [{"value": "classes"}],
         }
 
     def test_enter_toggles_folder_without_activation(self):
@@ -298,6 +308,15 @@ class NavigationTests(unittest.TestCase):
         self.assertIsNone(self.state["candidate"])
         self.assertEqual(self.state["focus"], FOCUS_TREE)
 
+    def test_enter_reopens_active_search_prompt(self):
+        self.state["focus"] = FOCUS_SETTINGS
+        self.state["setting_index"] = SETTING_ROWS.index("query")
+        self.state["query_mode"] = "search"
+        options = dict(self.options)
+        options["query"] = [{"value": "off"}, {"value": "search"}]
+        action = handle_navigation(self.state, KEY_ENTER, self.rows, options)
+        self.assertEqual(action["apply"], ("query", "search"))
+
     def test_settings_option_kinds(self):
         self.state["focus"] = FOCUS_SETTINGS
         self.state["candidate"] = ("benchmark", "ScanNet20")
@@ -321,11 +340,25 @@ class NavigationTests(unittest.TestCase):
         action = handle_navigation(self.state, KEY_ENTER, self.rows, options)
         self.assertEqual(action["apply"], ("cad", False))
 
-    def test_cad_row_disabled_without_png(self):
+    def test_query_search_stays_visible_when_enabled(self):
+        options = dict(self.options)
+        options["query"] = [
+            {"value": "off"},
+            {"value": "search"},
+            {"value": "image", "enabled": False},
+        ]
+        rows = settings_payload(self.state, options, lambda _r, v: str(v))
+        query = next(row for row in rows if row["key"] == "query")
+        self.assertEqual([opt["text"] for opt in query["options"]], ["off", "search"])
+
+    def test_cad_row_hidden_without_png(self):
         rows = settings_payload(self.state, self.options, lambda _r, v: str(v))
-        cad = next(row for row in rows if row["key"] == "cad")
-        self.assertTrue(cad["options"])
-        self.assertTrue(all(option["kind"] == "disabled" for option in cad["options"]))
+        self.assertFalse(any(row["key"] == "cad" for row in rows))
+        mode = next(row for row in rows if row["key"] == "mode")
+        self.assertEqual([opt["text"] for opt in mode["options"]],
+                         [SOURCE_GT, SOURCE_SCENE])
+        color = next(row for row in rows if row["key"] == "color")
+        self.assertFalse(any(opt["text"] == COLOR_TPGT for opt in color["options"]))
 
 
 class CadPngTests(unittest.TestCase):
@@ -423,6 +456,48 @@ class SidecarTreeTests(unittest.TestCase):
 
 
 class HudHelperTests(unittest.TestCase):
+    def test_class_row_draws_pred_gt_bar(self):
+        class FakeDraw:
+            def __init__(self):
+                self.texts = []
+                self.rects = []
+                self.lines = []
+
+            def add_text(self, *args):
+                self.texts.append(args[-1])
+
+            def add_rect_filled(self, *args):
+                self.rects.append(args)
+
+            def add_line(self, *args):
+                self.lines.append(args)
+
+        class FakeImgui:
+            def __init__(self):
+                self.draw = FakeDraw()
+
+            def get_window_draw_list(self):
+                return self.draw
+
+            def get_cursor_screen_pos(self):
+                return 0.0, 0.0
+
+            def get_color_u32_rgba(self, *rgba):
+                return rgba
+
+            def dummy(self, *_args):
+                pass
+
+        imgui = FakeImgui()
+        _draw_class_row(imgui, "chair", (0.2, 0.3, 0.4), {
+            "pred": 3, "gt": 2, "tp": 1, "fp": 1, "ignored": 1,
+        })
+        self.assertIn("chair [3/2]", imgui.draw.texts)
+        self.assertEqual(len(imgui.draw.lines), 1)
+        # swatch + background + single class-color fill (no TP/FP segments)
+        self.assertEqual(len(imgui.draw.rects), 3)
+        self.assertEqual(imgui.draw.rects[2][4], (0.2, 0.3, 0.4, 1.0))
+
     def test_ellipsize(self):
         self.assertEqual(ellipsize("abcdefghij", 5, len), "ab...")
         self.assertEqual(ellipsize("ok", 10, len), "ok")
@@ -470,8 +545,65 @@ class HudHelperTests(unittest.TestCase):
         self.assertIn("AP 0.370 · AP50 0.486 · AP25 0.538", imgui.texts)
         self.assertIn("TP/GT 15/25 · FP 293", imgui.texts)
 
+    def test_query_block_shows_when_search_available(self):
+        class FakeImgui:
+            WINDOW_NO_TITLE_BAR = 1
+            WINDOW_NO_RESIZE = 2
+            WINDOW_NO_MOVE = 4
+            WINDOW_NO_COLLAPSE = 8
+            WINDOW_NO_SAVED_SETTINGS = 16
+            WINDOW_NO_INPUTS = 32
+
+            def __init__(self):
+                self.texts = []
+
+            def text(self, value):
+                self.texts.append(value)
+
+            def input_text(self, *_a, **_k):
+                return False, ""
+
+            def button(self, *_a, **_k):
+                return False
+
+            def __getattr__(self, _name):
+                return lambda *args, **kwargs: None
+
+        imgui = FakeImgui()
+        _draw_right(imgui, {
+            "info": {"scene": "scene0618_00"},
+            "query": {"mode": "off", "can_search": True, "reset_id": 1,
+                      "input": "", "results": []},
+        }, 1080, 680, hud_state={"query_text": "", "reset_id": None})
+        self.assertIn("Query", imgui.texts)
+
 
 class InformationTests(unittest.TestCase):
+    def test_scene_present_classes_and_prediction_stats(self):
+        spec = SimpleNamespace(id_to_label={3: "chair", 5: "table"})
+        gt_ids = np.array([3001] * 100 + [3002] * 99 + [5001] * 120 + [9001] * 200)
+        counts = eligible_gt_counts(gt_ids, spec)
+        self.assertEqual(counts, {"chair": 1, "table": 1})
+        objects = [
+            {"class_name": "chair", "verdict": "tp"},
+            {"class_name": "chair", "verdict": "fp"},
+            {"class_name": "chair", "verdict": "ignored"},
+            {"class_name": "chair", "verdict": None},
+            {"class_name": "lamp", "verdict": "fp"},
+        ]
+        stats = class_count_stats(objects, sorted(counts), counts)
+        self.assertEqual(stats["chair"], {
+            "pred": 4, "gt": 1, "tp": 1, "fp": 1, "ignored": 1,
+        })
+        self.assertNotIn("lamp", stats)
+
+    def test_instance_colors_are_unique_beyond_colormap_limit(self):
+        colors = {
+            tuple(np.rint(instance_color(index) * 255).astype(np.uint8))
+            for index in range(1000)
+        }
+        self.assertEqual(len(colors), 1000)
+
     def test_information_payload_and_tp_overlay(self):
         pred = {
             "label_set": "ScanNet200",
@@ -514,24 +646,56 @@ class LazyHelperTests(unittest.TestCase):
         np.testing.assert_array_equal(bounds["anchor"], [2.0, 1.05, 5.0])
         self.assertIsNone(object_bounds(np.zeros((0, 3)), 2))
         stub = render_object_fields(
-            {"class_name": "chair", "points": points, "sel": [True, False]},
+            {"class_name": "chair", "points": points, "sel": [True, False], "score": 0.8},
             "predicted_masks/a.txt", 1)
         self.assertIsNone(stub["box"])
         self.assertIsNone(stub["label"])
         self.assertEqual(stub["key"], "predicted_masks/a.txt")
+        self.assertEqual(stub["score"], 0.8)
 
-    def test_camera_label_throttle_and_final(self):
-        state = reset_camera_label_state()
-        extrinsic = np.eye(4)
-        self.assertTrue(camera_label_update(state, extrinsic, 800.0, 10.0, interval=0.1))
-        self.assertFalse(camera_label_update(state, extrinsic, 800.0, 10.05, interval=0.1))
-        moved = np.eye(4)
-        moved[0, 3] = 1.0
-        self.assertFalse(camera_label_update(state, moved, 800.0, 10.05, interval=0.1))
-        self.assertTrue(state["pending"])
-        self.assertTrue(camera_label_update(state, moved, 800.0, 10.2, interval=0.1))
-        self.assertFalse(state["pending"])
-        self.assertFalse(camera_label_update(state, moved, 800.0, 10.25, interval=0.1))
+    def test_static_labels_use_world_height(self):
+        from utils.visualize import LABEL_FONT_UNITS, LABEL_WORLD
+        up = np.array([0.0, 0.0, 1.0])
+        x = np.array([1.0, 0.0, 0.0])
+
+        def _obj():
+            return {"class_name": "chair",
+                    "bounds": {"anchor": np.array([1.0, 2.0, 3.0])},
+                    "box": None, "label": None, "pcd": None}
+
+        small = _obj()
+        ensure_object_decorations(
+            small, (1.0, 0.0, 0.0), x, up, 2,
+            label_height=LABEL_WORLD["small"],
+            want_box=False, want_label=True)
+        v = np.asarray(small["label"]["mesh"].vertices)
+        # cap height is 10 font units -> world height equals label_height
+        self.assertAlmostEqual(
+            float(v[:, 2].max() - v[:, 2].min()), 0.05, places=6)
+        self.assertAlmostEqual(
+            float(v[:, 0].max() + v[:, 0].min()) / 2.0, 1.0, places=6)
+        self.assertGreater(LABEL_FONT_UNITS, 0.0)
+        # cap faces the camera side (a third of the triangles), so glyphs
+        # survive back-face culling instead of rendering as hollow outlines
+        normals = np.asarray(small["label"]["mesh"].triangle_normals)
+        facing = float((normals @ np.array([0.0, -1.0, 0.0]) > 0.9).mean())
+        self.assertAlmostEqual(facing, 1.0 / 3.0, places=2)
+        # static: re-decoration never rewrites placed vertices (zoom-proof)
+        before = v.copy()
+        ensure_object_decorations(
+            small, (0.0, 1.0, 0.0), -x, up, 2,
+            label_height=LABEL_WORLD["large"],
+            want_box=False, want_label=True)
+        np.testing.assert_array_equal(
+            np.asarray(small["label"]["mesh"].vertices), before)
+        large = _obj()
+        ensure_object_decorations(
+            large, (1.0, 0.0, 0.0), x, up, 2,
+            label_height=LABEL_WORLD["large"],
+            want_box=False, want_label=True)
+        w = np.asarray(large["label"]["mesh"].vertices)
+        self.assertAlmostEqual(
+            float(w[:, 2].max() - w[:, 2].min()), 0.09, places=6)
 
     def test_capped_geometry_created_once(self):
         session = {
@@ -554,6 +718,392 @@ class LazyHelperTests(unittest.TestCase):
         self.assertIs(second, first)
         self.assertEqual(calls, [("mesh", 2, 1.5)])
         self.assertIsNone(session["pointcloud_capped"])
+
+
+class HudContentTests(unittest.TestCase):
+    def test_pipeline_texts_cover_all_methods_in_six_sentences(self):
+        self.assertEqual(
+            sorted(MODEL_PIPELINE),
+            ["mosaic3d", "open3dis", "openins3d", "openmask3d", "openyolo3d"])
+        for method, text in MODEL_PIPELINE.items():
+            sentences = [s for s in text.split(". ") if s.strip()]
+            self.assertGreaterEqual(len(sentences), 1, method)
+            self.assertLessEqual(len(sentences), 6, method)
+            for banned in ("utils/", ".py", "topk", "ckpt", "subprocess"):
+                self.assertNotIn(banned, text, method)
+
+    def test_information_payload_reports_official_counts(self):
+        pred = {"label_set": "ScanNet20", "run_id": "run-a", "model": "mosaic3d"}
+        score = {"tp": 10, "gt": 22, "verdicts": {"a": "fp"}}
+        run_key = run_node_id("scene0568_00", pred)
+        info = information_payload(
+            "scene0568_00", pred, {run_key: score}, {},
+            masks={"pred": 598, "gt": 22, "tp": 10, "fp": 558, "ignored": 30})
+        self.assertEqual(
+            (info["masks_pred"], info["masks_gt"]), (598, 22))
+        self.assertEqual((info["tp"], info["fp"], info["ignored"]), (10, 558, 30))
+        self.assertEqual(info["gt"], 22)
+
+    def test_label_base_is_float_finite_and_has_normals(self):
+        from utils.visualize import _label_base
+        mesh, base = _label_base("chair", (1.0, 0.0, 0.0))
+        self.assertEqual(base.dtype, np.float64)
+        self.assertTrue(np.all(np.isfinite(base)))
+        self.assertGreater(len(np.asarray(mesh.triangle_normals)), 0)
+        # centred on the full bounding box, not just x
+        np.testing.assert_allclose(
+            base.max(0) + base.min(0), np.zeros(3), atol=1e-9)
+
+    def test_place_label_math_is_finite_scaled_and_positioned(self):
+        import open3d as o3d
+        mesh = o3d.geometry.TriangleMesh()
+        base = np.array([[0.0, 0.0, 0.0], [43.0, 0.0, 0.0], [0.0, 10.0, 0.0]])
+        mesh.vertices = o3d.utility.Vector3dVector(base)
+        mesh.triangles = o3d.utility.Vector3iVector([[0, 1, 2]])
+        pos = np.array([1.0, 2.0, 3.0])
+        out = _place_label(mesh, base, pos, 0.1,
+                           np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]))
+        self.assertEqual(len(out.vertices), 3)
+        v = np.asarray(out.vertices)
+        self.assertTrue(np.all(np.isfinite(v)))
+        np.testing.assert_allclose(v[0], pos, atol=1e-9)
+        # Reading direction maps to +x (screen-right), glyph up maps to +z.
+        self.assertAlmostEqual(v[1, 0] - v[0, 0], 4.3, places=6)
+        self.assertAlmostEqual(v[2, 2] - v[0, 2], 1.0, places=6)
+
+    def test_labels_setting_row_lists_sizes(self):
+        state = _nav_state()
+        options = {
+            "benchmark": [{"value": "ScanNet200"}],
+            "labels": [{"value": v} for v in ("off", "small", "large")],
+        }
+        rows = settings_payload(state, options, lambda _r, v: str(v))
+        labels = next(row for row in rows if row["key"] == "labels")
+        self.assertEqual(
+            [opt["text"] for opt in labels["options"]], ["off", "small", "large"])
+
+
+class PanelRenderTests(unittest.TestCase):
+    class _Imgui:
+        WINDOW_NO_TITLE_BAR = 1
+        WINDOW_NO_RESIZE = 2
+        WINDOW_NO_MOVE = 4
+        WINDOW_NO_COLLAPSE = 8
+        WINDOW_NO_SAVED_SETTINGS = 16
+        WINDOW_NO_INPUTS = 32
+
+        def __init__(self):
+            self.texts = []
+            self.wrapped = []
+
+        def text(self, value):
+            self.texts.append(value)
+
+        def text_wrapped(self, value):
+            self.wrapped.append(value)
+
+        def button(self, *_a, **_k):
+            return False
+
+        def same_line(self, *_a, **_k):
+            return None
+
+        def slider_int(self, *_a, **_k):
+            return False, None
+
+        def separator(self, *_a, **_k):
+            return None
+
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: None
+
+    def test_masks_line_and_official_suffix(self):
+        imgui = self._Imgui()
+        _draw_right(imgui, {"info": {
+            "scene": "scene0618_00",
+            "method": "openyolo3d",
+            "run": "vis-replay-openyolo3d",
+            "ap": 0.1, "ap50": 0.2, "ap25": 0.3,
+            "tp": 10, "gt": 22, "fp": 558, "ignored": 30,
+            "masks_pred": 598, "masks_gt": 22,
+        }}, 1080, 680)
+        self.assertIn("AP 0.100 · AP50 0.200 · AP25 0.300", imgui.texts)
+        self.assertIn("Masks [598/22] · TP 10 · FP 558 · ignored 30", imgui.texts)
+
+    def test_pipeline_block_renders_method_text(self):
+        imgui = self._Imgui()
+        _draw_pipeline_block(imgui, {"pipeline": {
+            "method": "openyolo3d", "text": MODEL_PIPELINE["openyolo3d"]}})
+        self.assertIn("Pipeline: openyolo3d", imgui.texts)
+        self.assertEqual(imgui.wrapped, [MODEL_PIPELINE["openyolo3d"]])
+        quiet = self._Imgui()
+        _draw_pipeline_block(quiet, {})
+        self.assertEqual(quiet.texts, [])
+
+    def test_replay_block_shows_adapter_caption(self):
+        imgui = self._Imgui()
+        _draw_replay_block(imgui, {"camera": {
+            "mode": "replay", "phase": "ready", "count": 90, "frame": 3,
+            "playing": True, "replay_index": 1,
+            "status": "", "caption": "YOLO-World · every 10th frame",
+        }}, None)
+        self.assertIn("YOLO-World · every 10th frame", imgui.texts)
+        self.assertIn("3/89", imgui.texts)
+        hidden = self._Imgui()
+        _draw_replay_block(hidden, {"camera": {"mode": "off"}}, None)
+        self.assertEqual(hidden.texts, [])
+
+
+class ReplayTransportTests(unittest.TestCase):
+    class _Imgui:
+        def __init__(self, clicks=()):
+            self.texts = []
+            self.buttons = []
+            self._clicks = list(clicks)
+
+        def text(self, value):
+            self.texts.append(value)
+
+        def button(self, label):
+            self.buttons.append(label)
+            return bool(self._clicks.pop(0)) if self._clicks else False
+
+        def same_line(self, *_a, **_k):
+            return None
+
+        def separator(self, *_a, **_k):
+            return None
+
+        def slider_int(self, *_a, **_k):
+            return False, None
+
+        def progress_bar(self, frac):
+            self.texts.append(f"progress:{frac:.2f}")
+
+    class _Keys:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    def test_tab_reaches_replay_only_while_active(self):
+        state = _nav_state(focus=FOCUS_SETTINGS)
+        handle_navigation(state, KEY_TAB, [], {})
+        self.assertEqual(state["focus"], FOCUS_TREE)
+        state = _nav_state(focus=FOCUS_SETTINGS, camera_mode="replay")
+        handle_navigation(state, KEY_TAB, [], {})
+        self.assertEqual(state["focus"], FOCUS_REPLAY)
+        handle_navigation(state, KEY_TAB, [], {})
+        self.assertEqual(state["focus"], FOCUS_TREE)
+
+    def test_arrows_select_enter_confirms_transport(self):
+        state = _nav_state(focus=FOCUS_REPLAY, camera_mode="replay",
+                           replay_index=1)
+        action = handle_navigation(state, KEY_RIGHT, [], {})
+        self.assertEqual(state["replay_index"], 2)
+        self.assertIsNone(action.get("transport"))
+        action = handle_navigation(state, KEY_ENTER, [], {})
+        self.assertEqual(action.get("transport"), "forward")
+        handle_navigation(state, KEY_LEFT, [], {})
+        handle_navigation(state, KEY_LEFT, [], {})
+        self.assertEqual(state["replay_index"], 0)
+        action = handle_navigation(state, KEY_ENTER, [], {})
+        self.assertEqual(action.get("transport"), "back")
+
+    def test_handle_replay_ignores_other_keys(self):
+        state = {"replay_index": 1}
+        self.assertIsNone(handle_replay(state, KEY_UP)["transport"])
+        self.assertEqual(state["replay_index"], 1)
+
+    def test_loading_block_shows_progress_not_transport(self):
+        imgui = self._Imgui()
+        _draw_replay_block(imgui, {
+            "camera": {
+                "mode": "replay", "phase": "loading", "count": 0,
+                "frame": 0, "playing": False, "replay_index": 1,
+                "caption": "YOLO-World · every 10th frame",
+                "done": 3, "total": 9, "elapsed": 12.0,
+                "status": "loading YOLO-World (12s)…",
+            },
+        }, None)
+        self.assertIn("YOLO-World · every 10th frame", imgui.texts)
+        self.assertIn("Caching video 3/9…", imgui.texts)
+        self.assertIn("progress:0.33", imgui.texts)
+        self.assertIn("12s elapsed", imgui.texts)
+        self.assertIn("loading YOLO-World (12s)…", imgui.texts)
+        self.assertEqual(imgui.buttons, [])
+
+    def test_ready_block_selects_and_clicks_transport(self):
+        keys = self._Keys()
+        imgui = self._Imgui(clicks=(False, False, True))
+        _draw_replay_block(imgui, {
+            "focus": FOCUS_REPLAY,
+            "camera": {
+                "mode": "replay", "phase": "ready", "count": 90,
+                "frame": 3, "playing": False, "replay_index": 2,
+                "status": "", "caption": "YOLO-World · every 10th frame",
+            },
+        }, keys)
+        self.assertEqual(imgui.buttons, ["Back", "Play", "> Forward <"])
+        self.assertEqual(keys.sent, [{"type": "replay_transport",
+                                      "option": "forward"}])
+
+    def test_error_block_reports_status(self):
+        imgui = self._Imgui()
+        _draw_replay_block(imgui, {
+            "camera": {
+                "mode": "replay", "phase": "error", "count": 0,
+                "frame": 0, "playing": False, "replay_index": 1,
+                "status": "2D output not retained for this run",
+            },
+        }, None)
+        self.assertIn("2D output not retained for this run", imgui.texts)
+        self.assertEqual(imgui.buttons, [])
+
+
+class ReplayColorizeTests(unittest.TestCase):
+    def test_boxes_gain_color_from_adapter_triples(self):
+        dets = colorize_detections(
+            [([10, 10, 30, 30], "chair", 0.9)], lambda n: (255, 0, 0))
+        self.assertEqual(
+            dets, [([10, 10, 30, 30], "chair", 0.9, (255, 0, 0))])
+
+    def test_boxes_pass_colored_quadruples_through(self):
+        dets = [([1, 1, 5, 5], "chair", 0.5, (0, 255, 0))]
+        self.assertEqual(
+            colorize_detections(dets, lambda n: (0, 0, 0)), dets)
+
+    def test_empty_boxes_never_crash(self):
+        self.assertEqual(colorize_detections([], lambda n: (0, 0, 0)), [])
+        self.assertEqual(colorize_detections(None, lambda n: (0, 0, 0)), [])
+
+    def test_masks_gain_color_from_adapter_triples(self):
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[2:5, 2:5] = True
+        out = colorize_masks([(mask, "chair", 0.8)], lambda n: (255, 0, 0))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0][1:], ("chair", 0.8, (255, 0, 0)))
+        np.testing.assert_array_equal(out[0][0], mask)
+
+    def test_colorized_boxes_draw_without_unpack_error(self):
+        from utils.detect_replay import draw_detections
+        rgb = np.zeros((48, 64, 3), dtype=np.uint8)
+        dets = colorize_detections(
+            [([10, 10, 30, 30], "chair", 0.9)], lambda n: (255, 0, 0))
+        out = draw_detections(rgb, dets)
+        self.assertEqual(out.shape, (48, 64, 3))
+        self.assertGreater(int(out.sum()), 0)
+
+
+class BottomPanelTests(unittest.TestCase):
+    class _Imgui:
+        WINDOW_NO_TITLE_BAR = 1
+        WINDOW_NO_RESIZE = 2
+        WINDOW_NO_MOVE = 4
+        WINDOW_NO_COLLAPSE = 8
+        WINDOW_NO_SAVED_SETTINGS = 16
+        WINDOW_NO_INPUTS = 32
+
+        def __init__(self):
+            self.texts = []
+            self.images = []
+
+        def text(self, value):
+            self.texts.append(value)
+
+        def image(self, *_a, **_k):
+            self.images.append(True)
+
+        def get_cursor_screen_pos(self):
+            return (0.0, 0.0)
+
+        def get_window_draw_list(self):
+            class _Draw:
+                def add_rect_filled(self, *_a, **_k):
+                    return None
+
+                def add_rect(self, *_a, **_k):
+                    return None
+
+                def add_line(self, *_a, **_k):
+                    return None
+
+                def add_text(self, *_a, **_k):
+                    return None
+            return _Draw()
+
+        def get_color_u32_rgba(self, *_a, **_k):
+            return 0
+
+        def calc_text_size(self, text):
+            class _Size:
+                x = float(len(text))
+            return _Size()
+
+        def columns(self, *_a, **_k):
+            return None
+
+        def next_column(self, *_a, **_k):
+            return None
+
+        def dummy(self, *_a, **_k):
+            return None
+
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: None
+
+    def _payload(self, panel=None):
+        payload = {
+            "info": {"scene": "scene0618_00"},
+            "settings": [],
+            "classes": ["chair"],
+            "colors": {"chair": (1.0, 0.0, 0.0)},
+            "class_stats": {},
+            "camera": {"mode": "off"},
+            "pipeline": {"method": "openyolo3d",
+                         "text": MODEL_PIPELINE["openyolo3d"]},
+        }
+        if panel is not None:
+            payload["panel"] = panel
+        return payload
+
+    def _video(self):
+        return {"kind": "video", "id": 7, "wh": (64, 48)}
+
+    def test_default_panel_shows_classes_only(self):
+        imgui = self._Imgui()
+        _draw_right(imgui, self._payload(), 1080, 680, overlay=self._video())
+        self.assertIn("Classes", imgui.texts)
+        self.assertNotIn("Pipeline: openyolo3d", imgui.texts)
+        self.assertEqual(imgui.images, [])
+
+    def test_preview_panel_shows_video_only(self):
+        imgui = self._Imgui()
+        _draw_right(imgui, self._payload("preview"), 1080, 680,
+                    overlay=self._video())
+        self.assertEqual(len(imgui.images), 1)
+        self.assertNotIn("Classes", imgui.texts)
+        self.assertNotIn("Pipeline: openyolo3d", imgui.texts)
+
+    def test_pipeline_panel_shows_explainer_only(self):
+        imgui = self._Imgui()
+        _draw_right(imgui, self._payload("pipeline"), 1080, 680,
+                    overlay=self._video())
+        self.assertIn("Pipeline: openyolo3d", imgui.texts)
+        self.assertNotIn("Classes", imgui.texts)
+        self.assertEqual(imgui.images, [])
+
+    def test_view_setting_row_lists_options(self):
+        state = _nav_state()
+        options = {"view": [{"value": v} for v in
+                            ("classes", "pipeline", "path", "replay")]}
+        rows = settings_payload(state, options, lambda _r, v: str(v))
+        self.assertEqual([row["key"] for row in rows], ["view"])
+        view = rows[0]
+        self.assertEqual(
+            [opt["text"] for opt in view["options"]],
+            ["classes", "pipeline", "path", "replay"])
 
 
 if __name__ == "__main__":

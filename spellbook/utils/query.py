@@ -19,7 +19,6 @@ ENCODERS = {
 }
 QUERY_OFF = "off"
 QUERY_SEARCH = "search"
-QUERY_RELABEL = "relabel"
 QUERY_IMAGE = "image"
 SEARCH_TOP_K = 10
 
@@ -194,26 +193,17 @@ def cosine_search(features, query_vec, top_k=SEARCH_TOP_K):
     return picked.astype(np.int32), scores[picked].astype(np.float32)
 
 
-def relabel_features(features, prompt_matrix):
-    prompts = l2_normalize_rows(prompt_matrix)
-    sims = features @ prompts.T
-    best = sims.argmax(axis=1).astype(np.int32)
-    scores = sims[np.arange(len(best)), best].astype(np.float32)
-    return best, scores
-
-
-def split_relabel_prompts(text):
-    parts = [item.strip() for item in str(text).split(",")]
-    return [item for item in parts if item]
+def clip_path_ready(path):
+    return bool(path) and os.path.isfile(path)
 
 
 def query_modes_for(model, has_features=False, has_snap=False, source_pred=False):
     if not source_pred:
         return [QUERY_OFF]
     if model in INSTANT_MODELS and has_features:
-        return [QUERY_OFF, QUERY_SEARCH, QUERY_RELABEL, QUERY_IMAGE]
+        return [QUERY_OFF, QUERY_SEARCH, QUERY_IMAGE]
     if model in NATIVE_LOOKUP_MODELS and has_snap:
-        return [QUERY_OFF, QUERY_SEARCH, QUERY_RELABEL]
+        return [QUERY_OFF, QUERY_SEARCH]
     return [QUERY_OFF]
 
 
@@ -246,6 +236,7 @@ class QueryClient:
         self.python = None
         self.family = None
         self.name = None
+        self.device = None
         self._next_id = 0
         self._lock = threading.Lock()
 
@@ -268,21 +259,25 @@ class QueryClient:
             except Exception:
                 pass
 
-    def ensure(self, python, family, name):
+    def ensure(self, python, family, name, device="cuda:0"):
         if (self.proc is not None and self.proc.poll() is None
-                and self.python == python and self.family == family and self.name == name):
+                and self.python == python and self.family == family and self.name == name
+                and self.device == device):
             return
         self.close()
         script = os.path.abspath(__file__)
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["CUDA_VISIBLE_DEVICES"] = "0"
+        env.pop("SPELLBOOK_GPU_LEASE_FD", None)
         self.proc = subprocess.Popen(
-            [python, script, "worker", "--family", family, "--name", name],
+            [python, script, "worker", "--family", family, "--name", name,
+             "--device", device],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=env, text=True)
         self.python = python
         self.family = family
         self.name = name
+        self.device = device
 
     def submit(self, payload):
         with self._lock:
@@ -386,8 +381,9 @@ def worker_main(argv=None):
     parser.add_argument("mode")
     parser.add_argument("--family", required=True)
     parser.add_argument("--name", required=True)
+    parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args(argv)
-    encoder = _load_worker_encoder(args.family, args.name, "cpu")
+    encoder = _load_worker_encoder(args.family, args.name, args.device)
     cache = {}
     import sys
     for line in sys.stdin:
@@ -405,17 +401,6 @@ def worker_main(argv=None):
                     "ok": True, "id": req["id"], "op": op,
                     "ranks": ranks.tolist(), "scores": scores.tolist(),
                     "keys": [keys[i] for i in ranks],
-                }
-            elif op == "relabel":
-                prompts = split_relabel_prompts(req["text"])
-                if not prompts:
-                    raise ValueError("no relabel prompts")
-                matrix = _encode_texts(encoder, prompts)
-                best, scores = relabel_features(features, matrix)
-                out = {
-                    "ok": True, "id": req["id"], "op": op,
-                    "labels": [prompts[i] for i in best],
-                    "scores": scores.tolist(), "keys": keys,
                 }
             elif op == "image":
                 vec = _encode_image(encoder, req["path"])

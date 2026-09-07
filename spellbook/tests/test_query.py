@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -10,9 +11,9 @@ sys.path.insert(0, _SPELLBOOK)
 
 from evaluation.benchmark import BENCHMARKS  # noqa: E402
 from utils.query import (  # noqa: E402
-    QUERY_IMAGE, QUERY_OFF, QUERY_RELABEL, QUERY_SEARCH, QueryClient,
+    QUERY_IMAGE, QUERY_OFF, QUERY_SEARCH, QueryClient,
     clip_features_path, cosine_search, l2_normalize_rows, load_clip_features,
-    query_modes_for, relabel_features, split_relabel_prompts, write_aligned_features,
+    query_modes_for, write_aligned_features,
     write_clip_features,
 )
 
@@ -66,21 +67,21 @@ class ArtifactTests(unittest.TestCase):
 
 
 class SimilarityTests(unittest.TestCase):
-    def test_search_relabel_and_modes(self):
+    def test_search_and_modes(self):
         feats = l2_normalize_rows(np.array([[1.0, 0.0], [0.0, 1.0], [0.7, 0.7]], dtype=np.float32))
         ranks, scores = cosine_search(feats, [1.0, 0.0], top_k=2)
         self.assertEqual(list(ranks), [0, 2])
         self.assertGreater(scores[0], scores[1])
-        best, rel_scores = relabel_features(feats, np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32))
-        self.assertEqual(list(best), [0, 1, 0])
-        self.assertEqual(split_relabel_prompts("chair, table, "), ["chair", "table"])
         self.assertEqual(
             query_modes_for("openmask3d", has_features=True, source_pred=True),
-            [QUERY_OFF, QUERY_SEARCH, QUERY_RELABEL, QUERY_IMAGE])
+            [QUERY_OFF, QUERY_SEARCH, QUERY_IMAGE])
         self.assertEqual(
             query_modes_for("openins3d", has_snap=True, source_pred=True),
-            [QUERY_OFF, QUERY_SEARCH, QUERY_RELABEL])
+            [QUERY_OFF, QUERY_SEARCH])
         self.assertEqual(query_modes_for("openyolo3d", source_pred=True), [QUERY_OFF])
+        from utils.query import clip_path_ready
+        self.assertFalse(clip_path_ready(None))
+        self.assertFalse(clip_path_ready("/no/such/clip.npz"))
 
 
 class ClientTests(unittest.TestCase):
@@ -112,6 +113,18 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(second, first + 1)
         self.assertEqual(len(dummy.lines), 2)
         client.close()
+
+    def test_worker_is_pinned_to_gpu_zero_without_lease(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        with mock.patch.dict(os.environ, {"SPELLBOOK_GPU_LEASE_FD": "123"}):
+            with mock.patch("utils.query.subprocess.Popen", return_value=proc) as popen:
+                client = QueryClient()
+                client.ensure("/method/python", "open_clip", "encoder", device="cuda:0")
+        args, kwargs = popen.call_args
+        self.assertEqual(kwargs["env"]["CUDA_VISIBLE_DEVICES"], "0")
+        self.assertNotIn("SPELLBOOK_GPU_LEASE_FD", kwargs["env"])
+        self.assertEqual(args[0][-2:], ["--device", "cuda:0"])
 
 
 class WriterRowTests(unittest.TestCase):

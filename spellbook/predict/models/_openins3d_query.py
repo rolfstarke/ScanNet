@@ -22,10 +22,15 @@ LOOKUP_THRESHOLD = 0.3
 def _load_final_masks(submission_root, scene_id):
     import importlib.util
     spellbook_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    benchmark_dir = os.path.join(os.path.dirname(spellbook_dir), "BenchmarkScripts")
     spec = importlib.util.spec_from_file_location(
-        "spellbook_util_3d", os.path.join(os.path.dirname(spellbook_dir), "BenchmarkScripts", "util_3d.py"))
+        "spellbook_util_3d", os.path.join(benchmark_dir, "util_3d.py"))
     util_3d = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(util_3d)
+    sys.path.insert(0, benchmark_dir)
+    try:
+        spec.loader.exec_module(util_3d)
+    finally:
+        sys.path.remove(benchmark_dir)
     index_path = os.path.join(submission_root, scene_id + ".txt")
     instances = util_3d.read_instance_prediction_file(index_path, submission_root)
     keys = []
@@ -69,6 +74,7 @@ def main():
 
     os.chdir(OPENINS3D_REPO)
     sys.path.insert(0, OPENINS3D_REPO)
+    sys.path.insert(0, os.path.join(OPENINS3D_REPO, "openins3d"))
     from openins3d.lookup import Lookup
 
     results_folder = os.path.join(args.snap_root, f"{args.scene_id}_query")

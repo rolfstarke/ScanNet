@@ -204,8 +204,8 @@ _validate()
 def validate_gpu_pool(pool):
     """Validate the managed GPU pool from settings.yaml.
 
-    Physical GPU 0 is user-reserved: Spellbook never locks, selects, or initializes
-    it. The pool must therefore be a non-empty list of unique positive integer indices.
+    Physical GPU 0 is excluded from managed workloads. The pool must therefore be a
+    non-empty list of unique positive integer indices.
     """
     if not isinstance(pool, list) or not pool:
         raise ValueError("settings.yaml: gpu_pool must be a non-empty list")

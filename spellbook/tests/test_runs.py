@@ -310,5 +310,62 @@ class RunnerTests(unittest.TestCase):
             run_one.assert_not_called()
 
 
+class AutoEvaluateTests(unittest.TestCase):
+    def _gt(self, root, scene):
+        path = os.path.join(
+            root, "derived", "ground_truth", "ScanNet20", scene + ".txt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("1001\n")
+
+    def test_exports_missing_gt_and_evaluates_each_model(self):
+        from predict.runner import _auto_evaluate
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            self._gt(root, "scene0568_01")
+            calls = []
+            with mock.patch(
+                    "evaluation.evaluate.evaluate_cli",
+                    side_effect=lambda argv: calls.append(("eval", argv))), \
+                 mock.patch(
+                    "evaluation.evaluate.export_gt_cli",
+                    side_effect=lambda argv: calls.append(("gt", argv))):
+                _auto_evaluate(spec, "run-a", ["openyolo3d"],
+                               ["scene0568_01", "scene0575_00"], root)
+            gt_calls = [c for c in calls if c[0] == "gt"]
+            self.assertEqual(len(gt_calls), 1)
+            self.assertIn("scene0575_00", gt_calls[0][1])
+            eval_calls = [c for c in calls if c[0] == "eval"]
+            self.assertEqual(len(eval_calls), 1)
+            self.assertIn("run-a", eval_calls[0][1])
+
+    def test_skips_model_with_existing_csv(self):
+        from predict.runner import _auto_evaluate
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            self._gt(root, "scene0568_01")
+            _write_csv(os.path.join(
+                root, "derived", "evaluations", "ScanNet20",
+                "run-a", "openyolo3d.csv"), _csv_rows(0.1, 0.1, 0.1))
+            with mock.patch(
+                    "evaluation.evaluate.evaluate_cli") as eval_cli, \
+                 mock.patch("evaluation.evaluate.export_gt_cli") as export_gt:
+                _auto_evaluate(spec, "run-a", ["openyolo3d"],
+                               ["scene0568_01"], root)
+            eval_cli.assert_not_called()
+            export_gt.assert_not_called()
+
+    def test_grader_failure_warns_instead_of_raising(self):
+        from predict.runner import _auto_evaluate
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            self._gt(root, "scene0568_01")
+            with mock.patch(
+                    "evaluation.evaluate.evaluate_cli",
+                    side_effect=RuntimeError("boom")):
+                _auto_evaluate(spec, "run-a", ["openyolo3d"],
+                               ["scene0568_01"], root)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -231,6 +231,57 @@ class OverlayAndLoadTests(unittest.TestCase):
             np.testing.assert_array_equal(dispatch[1], reference[1])
 
 
+class DuplicateSubmissionTests(unittest.TestCase):
+    def _dup_layout(self, root):
+        spec = _spec()
+        lab_a, lab_b = spec.valid_ids[0], spec.valid_ids[1]
+        scene = "scene0568_00"
+        pred = os.path.join(root, "predictions", spec.name, "run-a", "mosaic3d")
+        os.makedirs(os.path.join(pred, "predicted_masks"), exist_ok=True)
+        same = np.array([1, 0, 1, 0, 1, 1, 0, 0], dtype=np.uint8)
+        other = np.array([0, 1, 0, 1, 0, 0, 1, 1], dtype=np.uint8)
+        rows = [(same, lab_a, 0.2), (same, lab_b, 1.0), (other, lab_a, 0.5)]
+        lines = []
+        for index, (mask, label, conf) in enumerate(rows):
+            rel = f"predicted_masks/{scene}_{index:03d}.txt"
+            _write_mask(os.path.join(pred, rel), mask)
+            lines.append(f"{rel} {label} {conf}\n")
+        with open(os.path.join(pred, scene + ".txt"), "w") as fh:
+            fh.writelines(lines)
+        return spec, pred, scene, lab_b
+
+    def test_text_path_keeps_all_submitted_rows(self):
+        # Same mask submitted under two labels: the official submission keeps
+        # both rows, so load_predictions must keep all three objects.
+        points = np.arange(24, dtype=float).reshape(8, 3)
+        colors = np.ones((8, 3), dtype=float)
+        with tempfile.TemporaryDirectory() as root:
+            spec, pred, scene, lab_b = self._dup_layout(root)
+            data = load_predictions(pred, scene, points, colors, spec)
+            self.assertEqual(len(data["objects"]), 3)
+            self.assertEqual(len(data["pred_instances"]), 3)
+            by_key = {o["key"]: o for o in data["objects"]}
+            self.assertEqual(by_key["predicted_masks/scene0568_00_001.txt"]["score"], 1.0)
+            self.assertEqual(
+                by_key["predicted_masks/scene0568_00_001.txt"]["class_name"],
+                spec.id_to_label[lab_b])
+
+    def test_packed_path_matches_text(self):
+        points = np.arange(24, dtype=float).reshape(8, 3)
+        colors = np.ones((8, 3), dtype=float)
+        with tempfile.TemporaryDirectory() as root:
+            spec, pred, scene, _ = self._dup_layout(root)
+            text = load_predictions(pred, scene, points, colors, spec)
+            mtime = prediction_artifact_mtime(pred, scene)
+            cached = load_predictions(
+                pred, scene, points, colors, spec,
+                run_id="run-a", model="mosaic3d", scannet_root=root,
+                source_mtime=mtime)
+            self.assertEqual(
+                sorted(o["key"] for o in cached["objects"]),
+                sorted(o["key"] for o in text["objects"]))
+
+
 class CliTests(unittest.TestCase):
     def test_build_missing_only(self):
         with tempfile.TemporaryDirectory() as root:

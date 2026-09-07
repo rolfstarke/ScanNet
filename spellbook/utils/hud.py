@@ -107,14 +107,35 @@ def _draw_left(imgui, payload, height, width, view_start):
     imgui.end()
 
 
-def _draw_class_row(imgui, name, color):
+def _draw_class_row(imgui, name, color, stats=None):
     draw = imgui.get_window_draw_list()
     x, y = imgui.get_cursor_screen_pos()
     text = imgui.get_color_u32_rgba(0.08, 0.08, 0.08, 1.0)
     swatch = imgui.get_color_u32_rgba(*color, 1.0)
     draw.add_rect_filled(x, y + 2, x + 11, y + 13, swatch, 2)
-    draw.add_text(x + 17, y, text, name)
-    imgui.dummy(315, 17)
+    label = name
+    if stats and stats.get("gt") is not None:
+        label += f" [{stats.get('pred', 0)}/{stats['gt']}]"
+    draw.add_text(x + 17, y, text, label)
+    if not stats or stats.get("gt") is None:
+        imgui.dummy(315, 17)
+        return
+    bar_x, bar_y, bar_w, bar_h = x + 17, y + 18, 270.0, 6.0
+    scale = max(1, int(stats.get("pred") or 0), int(stats.get("gt") or 0))
+    draw.add_rect_filled(
+        bar_x, bar_y, bar_x + bar_w, bar_y + bar_h,
+        imgui.get_color_u32_rgba(0.88, 0.88, 0.88, 1.0), 1)
+    cursor = bar_x
+    width = max(0.0, min(
+        bar_x + bar_w - cursor,
+        bar_w * max(0, int(stats.get("pred") or 0)) / scale))
+    if width:
+        draw.add_rect_filled(
+            cursor, bar_y, cursor + width, bar_y + bar_h,
+            imgui.get_color_u32_rgba(*color, 1.0), 0)
+    marker_x = min(bar_x + bar_w - 1, bar_x + bar_w * int(stats["gt"]) / scale)
+    draw.add_line(marker_x, bar_y - 3, marker_x, bar_y + bar_h + 3, text, 2.0)
+    imgui.dummy(315, 30)
 
 
 def _draw_setting_row(imgui, row, width, settings_focus):
@@ -125,6 +146,8 @@ def _draw_setting_row(imgui, row, width, settings_focus):
     first = True
     max_x = x + width - 12
     for opt in row.get("options") or []:
+        if not opt.get("enabled", True) or opt.get("kind") == "disabled":
+            continue
         token = opt["text"] if first else f" | {opt['text']}"
         tw = imgui.calc_text_size(token).x
         cx, cy = imgui.get_cursor_screen_pos()
@@ -160,51 +183,30 @@ def _send(keys_out, payload):
         pass
 
 
-def _sync_query_text(hud_state, payload):
-    query = payload.get("query") or {}
-    reset_id = query.get("reset_id")
-    if hud_state.get("reset_id") != reset_id:
-        hud_state["reset_id"] = reset_id
-        hud_state["query_text"] = query.get("input") or ""
-
-
 def _draw_video(imgui, overlay, width):
     if not overlay or overlay.get("kind") != "video" or not overlay.get("id"):
         return
     iw, ih = overlay["wh"]
-    scale = min(1.0, 420 / max(iw, 1), 315 / max(ih, 1))
-    dw, dh = iw * scale, ih * scale
-    imgui.set_cursor_pos((max(8.0, width - dw - 8), 8.0))
+    dw = max(1.0, width - 16.0)
+    dh = dw * ih / max(iw, 1)
     imgui.image(overlay["id"], dw, dh)
-    imgui.set_cursor_pos((8.0, dh + 16.0))
+    imgui.dummy(0, 8)
 
 
 def _draw_query_block(imgui, payload, hud_state, keys_out):
     query = payload.get("query")
     if not query:
         return
-    imgui.text("Query")
     mode = query.get("mode") or "off"
-    imgui.text(f"Mode {mode}")
+    can_search = bool(query.get("can_search") or query.get("can_image") or mode != "off")
+    if not can_search:
+        return
+    imgui.text("Query")
     if query.get("status"):
         imgui.text(query["status"])
-    if mode != "off":
-        _sync_query_text(hud_state, payload)
-        label = "Image path" if mode == "image" else "Prompt"
-        imgui.text(label)
-        current = hud_state.get("query_text") or ""
-        changed, value = imgui.input_text("##query_field", current, 512)
-        if changed and value is not None:
-            hud_state["query_text"] = value
-        if imgui.button("Apply"):
-            _send(keys_out, {"type": "query_apply", "text": hud_state.get("query_text") or ""})
-        imgui.same_line()
-        if imgui.button("Clear"):
-            hud_state["query_text"] = ""
-            _send(keys_out, {"type": "query_clear"})
-        results = query.get("results") or []
-        for line in results[:5]:
-            imgui.text(str(line))
+    results = query.get("results") or []
+    for line in results[:5]:
+        imgui.text(str(line))
     imgui.separator()
 
 
@@ -212,22 +214,66 @@ def _draw_replay_block(imgui, payload, keys_out):
     camera = payload.get("camera")
     if not camera or camera.get("mode") != "replay":
         return
+    phase = camera.get("phase") or "loading"
     count = int(camera.get("count") or 0)
     frame = int(camera.get("frame") or 0)
     playing = bool(camera.get("playing"))
     imgui.text("Replay")
-    if imgui.button("Pause" if playing else "Play"):
-        _send(keys_out, {"type": "replay_toggle"})
+    if camera.get("caption"):
+        imgui.text(str(camera["caption"]))
+    if phase == "loading":
+        total = max(1, int(camera.get("total") or 0))
+        done = min(total, max(0, int(camera.get("done") or 0)))
+        imgui.text(f"Caching video {done}/{total}…")
+        try:
+            imgui.progress_bar(done / total)
+        except Exception:
+            imgui.text(f"{done}/{total}")
+        try:
+            elapsed = float(camera.get("elapsed") or 0.0)
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        imgui.text(f"{elapsed:.0f}s elapsed")
+        if camera.get("status"):
+            imgui.text(str(camera["status"]))
+        imgui.separator()
+        return
+    if phase != "ready":
+        if camera.get("status"):
+            imgui.text(str(camera["status"]))
+        else:
+            imgui.text("Replay unavailable")
+        imgui.separator()
+        return
+    labels = ("Back", "Pause" if playing else "Play", "Forward")
+    options = ("back", "toggle", "forward")
+    sel = int(camera.get("replay_index") or 0) % len(options)
+    focused = payload.get("focus") == "replay"
+    for i, (option, label) in enumerate(zip(options, labels)):
+        if i:
+            imgui.same_line()
+        text = f"> {label} <" if (focused and i == sel) else label
+        if imgui.button(text):
+            _send(keys_out, {"type": "replay_transport", "option": option})
     imgui.same_line()
     imgui.text(f"{frame}/{max(count - 1, 0)}")
-    live = camera.get("live_tp")
-    live_gt = camera.get("live_gt")
-    if live is not None and live_gt is not None:
-        imgui.text(f"Replay TP/GT {live}/{live_gt}")
+    if camera.get("status"):
+        imgui.text(str(camera["status"]))
     if count > 1:
         changed, value = imgui.slider_int("##replay_frame", frame, 0, count - 1)
         if changed and value is not None:
             _send(keys_out, {"type": "replay_frame", "frame": int(value)})
+    imgui.separator()
+
+
+def _draw_pipeline_block(imgui, payload):
+    pipe = payload.get("pipeline")
+    if not pipe or not pipe.get("text"):
+        return
+    imgui.text(f"Pipeline: {pipe.get('method')}")
+    imgui.push_style_color(imgui.COLOR_TEXT, 0.45, 0.45, 0.45, 1.0)
+    imgui.text_wrapped(str(pipe["text"]))
+    imgui.pop_style_color()
     imgui.separator()
 
 
@@ -251,8 +297,6 @@ def _draw_right(imgui, payload, height, width, overlay=None, hud_state=None, key
         imgui.end()
         return
 
-    _draw_video(imgui, overlay, width)
-
     if payload.get("status"):
         imgui.text(payload["status"])
         imgui.separator()
@@ -269,19 +313,28 @@ def _draw_right(imgui, payload, height, width, overlay=None, hud_state=None, key
         prediction = format_elapsed(info.get("prediction_s"))
         if prediction:
             imgui.text(f"Prediction {prediction}")
-        imgui.text(
+        ap_line = (
             f"AP {format_metric(info.get('ap'))} · "
             f"AP50 {format_metric(info.get('ap50'))} · "
             f"AP25 {format_metric(info.get('ap25'))}")
-        tp, gt, fp = info.get("tp"), info.get("gt"), info.get("fp")
-        if tp is None or gt is None:
-            imgui.text("TP/GT -")
+        imgui.text(ap_line)
+        if info.get("masks_pred") is not None:
+            gt_txt = "-" if info.get("masks_gt") is None else str(info["masks_gt"])
+            tp_txt = "-" if info.get("tp") is None else str(info["tp"])
+            fp_txt = "-" if info.get("fp") is None else str(info["fp"])
+            line = (f"Masks [{info['masks_pred']}/{gt_txt}] · "
+                    f"TP {tp_txt} · FP {fp_txt}")
+            if info.get("ignored") is not None:
+                line += f" · ignored {info['ignored']}"
+            imgui.text(line)
         else:
-            fp_text = "-" if fp is None else str(fp)
-            imgui.text(f"TP/GT {tp}/{gt} · FP {fp_text}")
+            tp, gt, fp = info.get("tp"), info.get("gt"), info.get("fp")
+            if tp is None or gt is None:
+                imgui.text("TP/GT -")
+            else:
+                fp_text = "-" if fp is None else str(fp)
+                imgui.text(f"TP/GT {tp}/{gt} · FP {fp_text}")
     imgui.separator()
-
-    _draw_replay_block(imgui, payload, keys_out)
 
     imgui.text("Settings")
     settings_focus = payload.get("focus") == "settings"
@@ -290,15 +343,24 @@ def _draw_right(imgui, payload, height, width, overlay=None, hud_state=None, key
     imgui.separator()
 
     _draw_query_block(imgui, payload, hud_state or {}, keys_out)
-
-    imgui.text("Classes")
-    classes = payload.get("classes") or []
-    if classes:
-        imgui.columns(2, "class_columns", border=False)
-        for name in classes:
-            _draw_class_row(imgui, name, payload["colors"][name])
-            imgui.next_column()
-        imgui.columns(1)
+    _draw_replay_block(imgui, payload, keys_out)
+    panel = payload.get("panel", "classes")
+    if panel == "preview":
+        _draw_video(imgui, overlay, width)
+    elif panel == "pipeline":
+        _draw_pipeline_block(imgui, payload)
+    else:
+        imgui.text("Classes")
+        classes = payload.get("classes") or []
+        if classes:
+            class_stats = payload.get("class_stats") or {}
+            if class_stats:
+                imgui.text("[Pred/GT]   class color = predicted   | GT")
+            imgui.columns(2, "class_columns", border=False)
+            for name in classes:
+                _draw_class_row(imgui, name, payload["colors"][name], class_stats.get(name))
+                imgui.next_column()
+            imgui.columns(1)
     imgui.end()
 
 
@@ -406,14 +468,16 @@ def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
     imgui.get_io().display_size = (float(max(fb_w, 1)), float(max(fb_h, 1)))
 
     empty = {"tree": [], "settings": [], "classes": [], "colors": {},
-             "status": "", "focus": "tree", "cad_overlay": None}
+              "status": "", "focus": "tree", "cad_overlay": None,
+              "panel": "classes"}
     payload = empty
     width, height = dock_w, dock_h
     dirty = True
-    overlay = {"id": None, "path": None, "wh": None, "kind": None, "frame_id": None}
+    overlay = {"id": None, "path": None, "wh": None, "kind": None,
+               "frame_id": None, "revision": None}
     fullscreen = False
     view_start = [0]
-    hud_state = {"query_text": "", "reset_id": None}
+    hud_state = {}
 
     def _clear_overlay():
         if overlay["id"] is not None:
@@ -426,8 +490,9 @@ def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
         overlay["wh"] = None
         overlay["kind"] = None
         overlay["frame_id"] = None
+        overlay["revision"] = None
 
-    def _set_texture(rgba, kind, path=None, frame_id=None):
+    def _set_texture(rgba, kind, path=None, frame_id=None, revision=None):
         h, w = rgba.shape[:2]
         if overlay["id"] is not None and overlay.get("wh") == (w, h):
             gl.glBindTexture(gl.GL_TEXTURE_2D, overlay["id"])
@@ -441,6 +506,7 @@ def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
         overlay["kind"] = kind
         overlay["path"] = path
         overlay["frame_id"] = frame_id
+        overlay["revision"] = revision
 
     def _sync_overlay(path, video):
         if path:
@@ -455,12 +521,14 @@ def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
             return
         if video and video.get("rgba") is not None:
             frame_id = video.get("frame_id")
-            if overlay.get("kind") == "video" and overlay.get("frame_id") == frame_id:
+            revision = video.get("revision")
+            if (overlay.get("kind") == "video" and overlay.get("frame_id") == frame_id
+                    and overlay.get("revision") == revision):
                 return
             try:
                 import numpy as np
                 rgba = np.ascontiguousarray(video["rgba"], dtype=np.uint8)
-                _set_texture(rgba, "video", frame_id=frame_id)
+                _set_texture(rgba, "video", frame_id=frame_id, revision=revision)
             except Exception:
                 _clear_overlay()
             return
@@ -515,20 +583,20 @@ def run(updates, parent_pid, side="right", viewer_rect=None, keys_out=None):
         fb_w, fb_h = glfw.get_framebuffer_size(window)
         if fb_w < 8 or fb_h < 8:
             continue
-        if payload and dirty:
-            glfw.make_context_current(window)
-            if side == "right":
-                _sync_overlay(cad, video)
-            imgui.get_io().display_size = (float(fb_w), float(fb_h))
-            renderer.process_inputs()
-            imgui.new_frame()
+        glfw.make_context_current(window)
+        if side == "right" and payload:
+            _sync_overlay(cad, video)
+        imgui.get_io().display_size = (float(fb_w), float(fb_h))
+        renderer.process_inputs()
+        imgui.new_frame()
+        if payload:
             _draw(imgui, payload, height, side, width, overlay, view_start, hud_state, keys_out)
-            glClearColor(1.0, 1.0, 1.0, 1.0)
-            glClear(GL_COLOR_BUFFER_BIT)
-            imgui.render()
-            renderer.render(imgui.get_draw_data())
-            glfw.swap_buffers(window)
-            dirty = False
+        glClearColor(1.0, 1.0, 1.0, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT)
+        imgui.render()
+        renderer.render(imgui.get_draw_data())
+        glfw.swap_buffers(window)
+        dirty = False
 
     _clear_overlay()
     renderer.shutdown()

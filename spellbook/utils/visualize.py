@@ -18,22 +18,24 @@ import util_3d  # noqa: E402
 from evaluation.benchmark import BENCHMARKS, artifact_paths, resolve_benchmark, submission_dir  # noqa: E402
 from evaluation.evaluate import load_score_sidecar, score_sidecar_path  # noqa: E402
 from evaluation.runs import _is_comparable, load_manifest, read_evaluator_csv  # noqa: E402
-from utils import hud  # noqa: E402
+from utils import hud, query_prompt  # noqa: E402
 from utils.compute_time import (  # noqa: E402
     load_timing, prediction_timing_path, reconstruction_timing_path)
 from utils.camera_replay import (  # noqa: E402
-    CAMERA_OFF, CAMERA_PATH, CAMERA_REPLAY, REPLAY_FPS, advance_playback,
-    composite_overlay, discover_frames, frustum_corners, is_valid_pose,
-    load_calibration, load_color_rgb, load_depth_m, load_pose, owner_colors,
-    packed_visible, project_points, resize_rgb, rgb_to_rgba_bytes,
-    trajectory_polylines, update_seen_tp, zbuffer_colors)
+    CAMERA_OFF, CAMERA_PATH, CAMERA_REPLAY, FRUSTUM_LINES, REPLAY_FPS,
+    REPLAY_TRANSPORT, advance_playback, discover_frames,
+    fill_replay_cache, frustum_corners, is_valid_pose, load_calibration,
+    load_color_rgb, load_pose, move_replay_selection, resize_rgb,
+    rgb_to_rgba_bytes, step_replay_frame, trajectory_polylines)
+from utils import replay2d  # noqa: E402
+from utils.detect_replay import draw_detections, draw_masks  # noqa: E402
 from utils.prediction_masks import (  # noqa: E402
     load_or_build_packed_masks, merge_packed_overlay, unpack_mask)
 from utils.query import (  # noqa: E402
     ENCODERS, INSTANT_MODELS, NATIVE_LOOKUP_MODELS, QUERY_IMAGE, QUERY_OFF,
-    QUERY_RELABEL, QUERY_SEARCH, QueryClient, clip_features_path,
-    load_clip_features, method_python, openins_snap_complete, openins_snap_root,
-    query_modes_for, split_relabel_prompts)
+    QUERY_SEARCH, QueryClient, clip_features_path,
+    clip_path_ready, load_clip_features, method_python, openins_snap_complete,
+    openins_snap_root, query_modes_for)
 
 
 DEFAULT_SCANNET_DIR = "/data/scannet/scans"
@@ -42,11 +44,49 @@ _SCENE_ID_RE = re.compile(r"^(scene\d{4})_(\d{2})$")
 _GEOMETRY_REF = os.path.join(_SPELLBOOK, "reconstruct", "geometry_reference.yaml")
 
 _PALETTE = colormaps["tab20"].colors
-TARGET_LABEL_PX = 14.0
 TP_COLOR = np.array([0.10, 0.80, 0.20], dtype=float)
 FP_COLOR = np.array([0.90, 0.15, 0.15], dtype=float)
+IGNORED_COLOR = np.array([0.55, 0.55, 0.55], dtype=float)
 MIN_REGION_SIZE = 100
 AP50_THRESHOLD = 0.5
+
+MODEL_PIPELINE = {
+    "mosaic3d": (
+        "A single 3D network reads the point cloud directly — no photos needed at run time. "
+        "It was trained on millions of automatically captioned 3D regions, aligning every "
+        "point's feature with text. A lightweight decoder turns those language-aligned "
+        "features straight into object masks. A written query is matched against the "
+        "masks in one pass."
+    ),
+    "openins3d": (
+        "A 3D network cuts the point cloud into unnamed masks, using no photos as input. "
+        "The method renders its own overview pictures from the 3D scene and lets a 2D "
+        "detector list everything it sees in them. Each 3D mask is projected into the "
+        "same pictures and matched against those detections by overlap. Unmatched masks "
+        "get a second chance on close-up crops; masks that still find no name are dropped."
+    ),
+    "openyolo3d": (
+        "A 3D network cuts the point cloud into unnamed object masks. A 2D detector "
+        "labels boxes in the scan photos, and each mask adopts whichever label sits "
+        "under most of its projected points."
+    ),
+    "open3dis": (
+        "Object candidates come from two sides: a 3D network proposing masks from the "
+        "point cloud, and a 2D segmenter drawing masks in the photos. The photo masks "
+        "are projected onto small uniform point regions and grown into coherent 3D "
+        "pieces, then merged across views into fuller objects. This catches small and "
+        "unusual objects the 3D network alone misses. Each candidate is described with "
+        "image-language features from several views, and queries are answered by "
+        "comparing text to those descriptions."
+    ),
+    "openmask3d": (
+        "A 3D network cuts the point cloud into unnamed object masks. For each mask, "
+        "the method picks the few photos where it is most visible, outlines it there, "
+        "and crops the result at several zoom levels. Each crop is embedded by a "
+        "vision-language model. The crops are averaged into one feature vector per "
+        "mask, and a query returns the masks closest to the query text."
+    ),
+}
 
 SOURCE_GT = "ground_truth"
 SOURCE_SCENE = "scene_only"
@@ -61,6 +101,8 @@ KIND_METHOD = "method"
 KIND_RUN = "run"
 FOCUS_TREE = "tree"
 FOCUS_SETTINGS = "settings"
+FOCUS_REPLAY = "replay"
+REPLAY_LABELS = {"back": "Back", "toggle": "Pause", "forward": "Forward"}
 
 KEY_TAB = 258
 KEY_ENTER = 257
@@ -70,21 +112,29 @@ KEY_DOWN = 264
 KEY_UP = 265
 KEY_ESCAPE = 256
 KEY_PRESS = 1
-LABEL_UPDATE_INTERVAL = 0.1
-LABEL_CAMERA_ATOL = 1e-5
 
-SETTING_ROWS = ("benchmark", "mode", "color", "geometry", "boxes", "ceiling", "cad",
-                "query", "camera")
+SETTING_ROWS = ("benchmark", "mode", "color", "geometry", "boxes", "labels", "ceiling",
+                "cad", "query", "view")
+PANEL_CLASSES = "classes"
+PANEL_PIPELINE = "pipeline"
+PANEL_PREVIEW = "preview"
+VIEW_CLASSES = "classes"
+VIEW_PIPELINE = "pipeline"
+VIEW_PATH = "path"
+VIEW_REPLAY = "replay"
+LABEL_WORLD = {"off": 0.0, "small": 0.05, "large": 0.09}
+LABEL_FONT_UNITS = 10.0
 SETTING_NAMES = {
     "benchmark": "Label set",
     "mode": "Mode",
     "color": "Color",
     "geometry": "Geometry",
     "boxes": "Boxes",
+    "labels": "Labels",
     "ceiling": "Ceiling",
     "cad": "CAD report",
     "query": "Query",
-    "camera": "Camera",
+    "view": "View",
 }
 
 
@@ -96,6 +146,20 @@ def _class_color(name, nyu40map, palette, _cache={}):
         else:
             _cache[name] = _PALETTE[len(_cache) % len(_PALETTE)]
     return _cache[name]
+
+
+def instance_color(index):
+    """Deterministic PASCAL-VOC-style RGB, unique for up to 2^24 - 1 instances."""
+    label = int(index) + 1
+    if label <= 0 or label >= (1 << 24):
+        raise ValueError("instance index must be in [0, 2^24 - 2]")
+    red = green = blue = 0
+    for bit in range(8):
+        red |= (label & 1) << (7 - bit)
+        green |= ((label >> 1) & 1) << (7 - bit)
+        blue |= ((label >> 2) & 1) << (7 - bit)
+        label >>= 3
+    return np.array([red, green, blue], dtype=float) / 255.0
 
 
 def _detect_up_axis(pts):
@@ -113,19 +177,43 @@ def _below_height(geom, up_axis, max_val):
 
 def _label_base(text, color):
     import open3d as o3d
-    t_mesh = o3d.t.geometry.TriangleMesh.create_text(text, depth=0)
-    raw_width = float(t_mesh.get_axis_aligned_bounding_box().max_bound[0].item())
+    t_mesh = o3d.t.geometry.TriangleMesh.create_text(text, depth=1.0)
+    bounds = t_mesh.get_axis_aligned_bounding_box()
+    center = np.array(
+        ((bounds.min_bound + bounds.max_bound) / 2).numpy(), dtype=float)
     mesh = t_mesh.to_legacy()
+    # create_text emits inverted winding: the capped face is culled from its
+    # own outward side (verified: hollow/mirrored glyphs on screen). Flip once
+    # so the cap survives back-face culling, then derive normals from it.
+    mesh.triangles = o3d.utility.Vector3iVector(
+        np.asarray(mesh.triangles)[:, ::-1])
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
     mesh.paint_uniform_color(color)
-    base_vertices = np.asarray(mesh.vertices) - np.array([raw_width / 2, 0, 0])
+    base_vertices = np.asarray(mesh.vertices, dtype=float) - center
     return mesh, base_vertices
 
 
 def _place_label(mesh, base_vertices, position, char_size, x_dir, y_dir):
-    import open3d as o3d
+    # Update vertices in place: the legacy visualizer binds the original
+    # vertex buffer at add_geometry time, so replacing the attribute object
+    # would leave the renderer showing stale geometry.
+    # Proper rotation (det +1): local +X is the reading direction on
+    # screen-right, local +Y is glyph-up, local +Z faces the camera. The old
+    # code negated z (a reflection, det -1), which flipped winding and showed
+    # hollow mirrored outlines. Verified on screen: solid correct glyphs.
     z_dir = np.cross(x_dir, y_dir)
     rotation = np.column_stack([x_dir, y_dir, z_dir])
-    mesh.vertices = o3d.utility.Vector3dVector((base_vertices * char_size) @ rotation.T + position)
+    np.asarray(mesh.vertices)[:, :] = (
+        (base_vertices * char_size) @ rotation.T + position)
+    # Normals must follow the same rotation or lighting stays glued to the
+    # font frame while the glyphs turn. (Placement happens once per label.)
+    if mesh.has_vertex_normals():
+        normals = np.asarray(mesh.vertex_normals)
+        np.asarray(mesh.vertex_normals)[:, :] = normals @ rotation.T
+    if mesh.has_triangle_normals():
+        normals = np.asarray(mesh.triangle_normals)
+        np.asarray(mesh.triangle_normals)[:, :] = normals @ rotation.T
     return mesh
 
 
@@ -614,37 +702,12 @@ def render_object_fields(src, key, up_axis):
         "key": key,
         "sel": src.get("sel"),
         "packed": src.get("packed"),
+        "score": src.get("score"),
         "verdict": src.get("verdict"),
         "bounds": object_bounds(src["points"], up_axis),
         "box": None,
         "label": None,
     }
-
-
-def reset_camera_label_state():
-    return {"extrinsic": None, "fy": None, "t": 0.0, "pending": False}
-
-
-def camera_label_update(state, extrinsic, fy, now,
-                        interval=LABEL_UPDATE_INTERVAL, atol=LABEL_CAMERA_ATOL):
-    extrinsic = np.asarray(extrinsic)
-    prev = state.get("extrinsic")
-    changed = (
-        prev is None
-        or abs(float(fy) - float(state.get("fy") or 0.0)) > atol
-        or np.max(np.abs(extrinsic - prev)) > atol
-    )
-    if not changed and not state.get("pending"):
-        return False
-    last = float(state.get("t") or 0.0)
-    if now - last < interval:
-        state["pending"] = True
-        return False
-    state["extrinsic"] = np.array(extrinsic, copy=True)
-    state["fy"] = float(fy)
-    state["t"] = now
-    state["pending"] = False
-    return True
 
 
 def capped_geometry(session, kind, cropper):
@@ -657,22 +720,38 @@ def capped_geometry(session, kind, cropper):
     return geom
 
 
-def ensure_object_decorations(obj, color, label_x_dir, label_y_dir, up_axis):
-    if obj.get("box") is None:
-        box = obj["pcd"].get_axis_aligned_bounding_box()
-        box.color = color
-        obj["box"] = box
-    else:
-        obj["box"].color = color
+def ensure_object_decorations(obj, color, label_x_dir, label_y_dir, up_axis,
+                              label_height=0.05, want_box=True, want_label=True):
+    """Build box + text label once. Labels are static world-size geometry:
+    `label_height` is the cap height in meters, facing is fixed at creation,
+    and nothing is rewritten per frame — zoom and orbit never rescale them."""
+    if want_box:
+        if obj.get("box") is None:
+            box = obj["pcd"].get_axis_aligned_bounding_box()
+            box.color = color
+            obj["box"] = box
+        else:
+            obj["box"].color = color
+    if not want_label:
+        return obj
     if obj.get("label") is None:
         bounds = obj.get("bounds")
         if bounds is None:
-            label_pos = np.array(obj["box"].get_center())
-            label_pos[up_axis] = obj["box"].max_bound[up_axis] + 0.05
+            if obj.get("box") is not None:
+                label_pos = np.array(obj["box"].get_center())
+                label_pos[up_axis] = obj["box"].max_bound[up_axis] + 0.05
+            elif obj.get("pcd") is not None:
+                bb = obj["pcd"].get_axis_aligned_bounding_box()
+                label_pos = np.array(bb.get_center())
+                label_pos[up_axis] = bb.max_bound[up_axis] + 0.05
+            else:
+                return obj
         else:
             label_pos = np.array(bounds["anchor"], dtype=float)
         mesh, base = _label_base(obj.get("query_label") or obj["class_name"], color)
-        _place_label(mesh, base, label_pos, 0.06, label_x_dir, label_y_dir)
+        _place_label(mesh, base, label_pos,
+                     label_height / LABEL_FONT_UNITS,
+                     label_x_dir, label_y_dir)
         obj["label"] = {"mesh": mesh, "base": base, "anchor": label_pos}
     else:
         obj["label"]["mesh"].paint_uniform_color(color)
@@ -685,6 +764,35 @@ def fp_count(score):
     return sum(1 for value in (score.get("verdicts") or {}).values() if value == "fp")
 
 
+def colorize_detections(detections, color_of):
+    """Attach 0-255 RGB colors to adapter boxes.
+
+    Adapters return 3-tuples (xyxy, name, score); the drawing helper needs
+    4-tuples (xyxy, name, score, color). 4-tuples pass through untouched so
+    mixed inputs never crash the Replay tick.
+    """
+    out = []
+    for det in detections or []:
+        if len(det) == 4:
+            out.append(tuple(det))
+            continue
+        xyxy, name, score = det
+        out.append((xyxy, name, score, tuple(color_of(name))))
+    return out
+
+
+def colorize_masks(masks, color_of):
+    """Attach 0-255 RGB colors to adapter masks (same contract as boxes)."""
+    out = []
+    for item in masks or []:
+        if len(item) == 4:
+            out.append(tuple(item))
+            continue
+        mask, name, score = item
+        out.append((mask, name, score, tuple(color_of(name))))
+    return out
+
+
 def format_metric(value):
     if value is None or not isinstance(value, (int, float)) or not math.isfinite(value):
         return "-"
@@ -692,7 +800,7 @@ def format_metric(value):
 
 
 def information_payload(scene_id, selected_pred, scores, run_metrics,
-                        recon_times=None, pred_times=None):
+                        recon_times=None, pred_times=None, masks=None):
     info = {
         "scene": scene_id,
         "method": None,
@@ -703,6 +811,9 @@ def information_payload(scene_id, selected_pred, scores, run_metrics,
         "tp": None,
         "gt": None,
         "fp": None,
+        "ignored": None,
+        "masks_pred": None,
+        "masks_gt": None,
         "reconstruction_s": None,
         "prediction_s": None,
     }
@@ -726,6 +837,13 @@ def information_payload(scene_id, selected_pred, scores, run_metrics,
             info["gt"] = score["gt"]
             info["fp"] = fp_count(score)
         info["prediction_s"] = (pred_times or {}).get(run_key)
+    if masks:
+        info["masks_pred"] = masks.get("pred")
+        info["masks_gt"] = masks.get("gt")
+        if masks.get("tp") is not None:
+            info["tp"] = masks["tp"]
+            info["fp"] = masks.get("fp")
+            info["ignored"] = masks.get("ignored")
     return info
 
 
@@ -878,27 +996,44 @@ def enabled_values(specs):
     return [spec["value"] for spec in specs if spec.get("enabled", True)]
 
 
-def clamp_setting_index(state):
-    n = len(SETTING_ROWS)
-    idx = state.get("setting_index", 0)
-    if n <= 0:
+def visible_setting_rows(option_lists):
+    out = []
+    for name in SETTING_ROWS:
+        specs = option_lists.get(name) or []
+        if any(spec.get("enabled", True) for spec in specs):
+            out.append(name)
+    return out
+
+
+def clamp_setting_index(state, option_lists=None):
+    visible = visible_setting_rows(option_lists) if option_lists is not None else list(SETTING_ROWS)
+    if not visible:
         state["setting_index"] = 0
         return 0
-    state["setting_index"] = min(max(0, idx), n - 1)
-    return state["setting_index"]
+    idx = min(max(0, state.get("setting_index", 0)), len(SETTING_ROWS) - 1)
+    row = SETTING_ROWS[idx]
+    if row not in visible:
+        state["setting_index"] = SETTING_ROWS.index(visible[0])
+        return state["setting_index"]
+    state["setting_index"] = idx
+    return idx
 
 
 def handle_settings(state, key, option_lists):
     action = {"apply": None}
-    idx = clamp_setting_index(state)
-    n = len(SETTING_ROWS)
+    visible = visible_setting_rows(option_lists)
+    if not visible:
+        state["setting_index"] = 0
+        return action
+    idx = clamp_setting_index(state, option_lists)
+    row = SETTING_ROWS[idx]
     if key in (KEY_UP, KEY_DOWN):
         state["candidate"] = None
-        nxt = idx + (-1 if key == KEY_UP else 1)
-        if 0 <= nxt < n:
-            state["setting_index"] = nxt
+        pos = visible.index(row)
+        nxt = pos + (-1 if key == KEY_UP else 1)
+        if 0 <= nxt < len(visible):
+            state["setting_index"] = SETTING_ROWS.index(visible[nxt])
         return action
-    row = SETTING_ROWS[idx]
     specs = option_lists.get(row) or []
     enabled = enabled_values(specs)
     applied = state_value(state, row)
@@ -916,18 +1051,53 @@ def handle_settings(state, key, option_lists):
     if key == KEY_ENTER:
         value = current
         state["candidate"] = None
-        if value != applied and value in enabled:
+        reopen_query = row == "query" and value in (QUERY_SEARCH, QUERY_IMAGE)
+        if value in enabled and (value != applied or reopen_query):
             action["apply"] = (row, value)
     return action
+
+
+def handle_replay(state, key):
+    """Arrow-select Back / Pause-Play / Forward, Enter confirms.
+
+    Mirrors the settings contract: Left/Right move a selection, Enter
+    applies it. Returns {"transport": option or None}.
+    """
+    action = {"transport": None}
+    idx = int(state.get("replay_index", 1)) % len(REPLAY_TRANSPORT)
+    if key == KEY_LEFT:
+        state["replay_index"] = move_replay_selection(idx, -1)
+    elif key == KEY_RIGHT:
+        state["replay_index"] = move_replay_selection(idx, 1)
+    elif key == KEY_ENTER:
+        action["transport"] = REPLAY_TRANSPORT[idx]
+    return action
+
+
+def _focus_order(state):
+    order = [FOCUS_TREE, FOCUS_SETTINGS]
+    if state.get("camera_mode") == CAMERA_REPLAY:
+        order.append(FOCUS_REPLAY)
+    return order
 
 
 def handle_navigation(state, key, rows, option_lists):
     if key == KEY_TAB:
         state["candidate"] = None
-        state["focus"] = (FOCUS_SETTINGS if state["focus"] == FOCUS_TREE else FOCUS_TREE)
+        order = _focus_order(state)
+        try:
+            pos = order.index(state.get("focus"))
+        except ValueError:
+            pos = 0
+        state["focus"] = order[(pos + 1) % len(order)]
         return {"activate": None, "apply": None}
     if state["focus"] == FOCUS_TREE:
         action = handle_tree(state, key, rows)
+        action["apply"] = None
+        return action
+    if state["focus"] == FOCUS_REPLAY:
+        action = handle_replay(state, key)
+        action["activate"] = None
         action["apply"] = None
         return action
     action = handle_settings(state, key, option_lists)
@@ -942,28 +1112,28 @@ def state_value(state, row):
         "color": state["color_mode"],
         "geometry": state["geometry"],
         "boxes": state["boxes"],
+        "labels": state.get("labels", "off"),
         "ceiling": state["ceiling_hidden"],
         "cad": state.get("cad_open", False),
         "query": state.get("query_mode", QUERY_OFF),
-        "camera": state.get("camera_mode", CAMERA_OFF),
+        "view": state.get("view", VIEW_CLASSES),
     }[row]
 
 
 def settings_payload(state, option_lists, display_value):
     pending = state.get("candidate")
-    idx = state.get("setting_index", 0)
+    visible = visible_setting_rows(option_lists)
+    idx = clamp_setting_index(state, option_lists)
     out = []
-    for i, name in enumerate(SETTING_ROWS):
-        specs = option_lists.get(name) or []
+    for name in visible:
+        specs = [spec for spec in (option_lists.get(name) or []) if spec.get("enabled", True)]
         applied = state_value(state, name)
         target = pending[1] if pending is not None and pending[0] == name else applied
+        i = SETTING_ROWS.index(name)
         options = []
         for spec in specs:
             value = spec["value"]
-            enabled = spec.get("enabled", True)
-            if not enabled:
-                kind = "disabled"
-            elif i == idx and pending is not None and pending[0] == name and value == pending[1] and value != applied:
+            if i == idx and pending is not None and pending[0] == name and value == pending[1] and value != applied:
                 kind = "pending"
             elif value == applied:
                 kind = "applied"
@@ -973,11 +1143,11 @@ def settings_payload(state, option_lists, display_value):
                 "text": display_value(name, value),
                 "kind": kind,
                 "sel": False,
-                "enabled": enabled,
+                "enabled": True,
             })
         if i == idx:
             for option, spec in zip(options, specs):
-                if spec["value"] == target and spec.get("enabled", True):
+                if spec["value"] == target:
                     option["sel"] = True
                     break
         out.append({
@@ -1002,6 +1172,35 @@ def clear_tracked(vis, displayed, key):
 
 def _instance_counts(objects):
     return Counter(o["class_name"] for o in objects)
+
+
+def eligible_gt_counts(gt_ids, spec, min_region_size=MIN_REGION_SIZE):
+    gt_ids = np.asarray(gt_ids, dtype=np.int64)
+    counts = Counter()
+    instance_ids, sizes = np.unique(gt_ids, return_counts=True)
+    for instance_id, size in zip(instance_ids, sizes):
+        label_id = int(instance_id) // 1000
+        if (instance_id >= 1000 and int(size) >= int(min_region_size)
+                and label_id in spec.id_to_label):
+            counts[spec.id_to_label[label_id]] += 1
+    return counts
+
+
+def class_count_stats(objects, classes, gt_counts=None):
+    pred = _instance_counts(objects)
+    tp = Counter(o["class_name"] for o in objects if o.get("verdict") == "tp")
+    fp = Counter(o["class_name"] for o in objects if o.get("verdict") == "fp")
+    ignored = Counter(o["class_name"] for o in objects if o.get("verdict") == "ignored")
+    rows = {}
+    for name in classes:
+        rows[name] = {
+            "pred": int(pred[name]),
+            "gt": None if gt_counts is None else int(gt_counts[name]),
+            "tp": int(tp[name]),
+            "fp": int(fp[name]),
+            "ignored": int(ignored[name]),
+        }
+    return rows
 
 
 def _display_size():
@@ -1034,11 +1233,6 @@ def load_scene_bundle(scene_id, scannet_dir, ceiling_height, nyu40map, palette):
     ceiling_val = floor_val + ceiling_height
     up_vec = np.zeros(3)
     up_vec[up_axis] = 1.0
-    horiz_axes = [a for a in range(3) if a != up_axis]
-    read_axis = max(horiz_axes, key=lambda a: (scene_pts.max(0) - scene_pts.min(0))[a])
-    label_x_dir, label_y_dir = np.zeros(3), np.zeros(3)
-    label_x_dir[read_axis] = 1.0
-    label_y_dir[up_axis] = 1.0
     gt = load_gt_instances(scene_dir, scene_pts, scene_colors)
     return {
         "id": scene_id,
@@ -1052,10 +1246,9 @@ def load_scene_bundle(scene_id, scannet_dir, ceiling_height, nyu40map, palette):
         "up_axis": up_axis,
         "up_vec": up_vec,
         "ceiling_val": ceiling_val,
-        "label_x_dir": label_x_dir,
-        "label_y_dir": label_y_dir,
         "gt": gt,
         "gt_counts": _instance_counts(gt["objects"]) if gt else Counter(),
+        "eligible_gt_counts": {},
         "source_cache": {},
         "nyu40map": nyu40map,
         "palette": palette,
@@ -1129,12 +1322,6 @@ def _stop_hud(conn, process, stop_pub=None):
 
 def query_result_lines(mode, keys, scores, labels=None):
     lines = []
-    if mode == QUERY_RELABEL:
-        counts = Counter(labels or [])
-        for name, count in counts.most_common(5):
-            if name:
-                lines.append(f"{name} x{count}")
-        return lines
     for key, score in zip(keys or [], scores or []):
         name = os.path.basename(key)
         lines.append(f"{float(score):.3f}  {name}")
@@ -1181,6 +1368,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         "setting_index": 0,
         "geometry": "mesh",
         "boxes": False,
+        "labels": "off",
         "ceiling_hidden": False,
         "status": "Enter a scan",
         "focus": FOCUS_TREE,
@@ -1191,7 +1379,13 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         "active_method": None,
         "cad_open": False,
         "query_mode": QUERY_OFF,
+        "view": VIEW_CLASSES,
+        # camera_mode/panel mirror "view" for the render loop and HUD payload;
+        # "view" is the single setting the user edits.
         "camera_mode": CAMERA_OFF,
+        "panel": PANEL_CLASSES,
+        # replay_index selects Back / Pause-Play / Forward in FOCUS_REPLAY.
+        "replay_index": 1,
     }
 
     display_width, display_height = _display_size()
@@ -1207,18 +1401,26 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     displayed = {"objs": set(), "boxes": set(), "labels": set(), "camera": set()}
     objects = []
     overlay = {"pcd": None}
-    label_cam = reset_camera_label_state()
     query_client = QueryClient()
     query_rt = {
         "request_id": 0, "status": "", "labels": {}, "scores": {}, "ranks": [],
         "reset_id": 0, "pending": None, "features": None, "input": "",
-        "openins": None,
+        "openins": None, "native_result": None,
+    }
+    prompt_rt = {
+        "process": None, "recv": None, "mode": None,
     }
     camera_rt = {
         "sequence": None, "calib": None, "poses": {}, "frame": 0, "playing": False,
-        "last_tick": None, "seen_tp": set(), "owners": None, "colors": None,
-        "geoms": {"path": None, "frustum": None}, "video": None, "status": "",
-        "color_size": None,
+        "last_tick": None,
+        "geoms": {"path": None, "marker": None}, "video": None, "status": "",
+        "video_revision": 0, "color_size": None,
+        "replay": None, "replay_key": None,
+        # RAM-only replay cache: phase is idle/loading/ready/error, ids the
+        # ordered frame keys, cache maps fid -> final RGBA frame bytes.
+        # Nothing is ever written to disk; everything drops on close.
+        "phase": "idle", "ids": [], "cache": {}, "requested": set(),
+        "cache_t0": None, "last_report": None,
     }
 
     context = multiprocessing.get_context("spawn")
@@ -1252,6 +1454,25 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             artifact_paths(_spec(pred["label_set"]), scannet_root)["gt"], scene_id + ".txt")
         return os.path.isfile(gt_file)
 
+    def _eligible_scene_gt_counts():
+        if session is None:
+            return None
+        pred = _pred()
+        spec = _spec(pred["label_set"] if pred else state["benchmark"])
+        cached = session["eligible_gt_counts"]
+        if spec.name in cached:
+            return cached[spec.name]
+        gt_file = os.path.join(
+            artifact_paths(spec, scannet_root)["gt"], session["id"] + ".txt")
+        if not os.path.isfile(gt_file):
+            cached[spec.name] = None
+            return None
+        try:
+            cached[spec.name] = eligible_gt_counts(util_3d.load_ids(gt_file), spec)
+        except (OSError, ValueError):
+            cached[spec.name] = None
+        return cached[spec.name]
+
     def _cad_png():
         if session is None:
             return None
@@ -1265,6 +1486,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         query_rt["ranks"] = []
         query_rt["pending"] = None
         query_rt["input"] = ""
+        query_rt["native_result"] = None
         query_rt["reset_id"] += 1
         proc = query_rt.get("openins")
         query_rt["openins"] = None
@@ -1273,6 +1495,57 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                 proc.terminate()
             except Exception:
                 pass
+
+    def _close_query_prompt():
+        proc = prompt_rt.get("process")
+        recv = prompt_rt.get("recv")
+        prompt_rt.update({"process": None, "recv": None, "mode": None})
+        if recv is not None:
+            try:
+                recv.close()
+            except OSError:
+                pass
+        if proc is not None:
+            if proc.is_alive():
+                proc.terminate()
+            proc.join(timeout=1)
+
+    def _launch_query_prompt(mode):
+        _close_query_prompt()
+        recv, send = context.Pipe(duplex=False)
+        proc = context.Process(
+            target=query_prompt.run,
+            args=(send, os.getpid(), mode, view_rect),
+            daemon=True)
+        proc.start()
+        send.close()
+        prompt_rt.update({"process": proc, "recv": recv, "mode": mode})
+        state["focus"] = FOCUS_SETTINGS
+        query_rt["status"] = "Waiting for prompt"
+
+    def _poll_query_prompt():
+        proc = prompt_rt.get("process")
+        recv = prompt_rt.get("recv")
+        if proc is None or recv is None:
+            return False
+        answer = None
+        ready = False
+        try:
+            if recv.poll():
+                answer = recv.recv()
+                ready = True
+        except (EOFError, OSError):
+            ready = True
+        if not ready and proc.is_alive():
+            return False
+        mode = prompt_rt.get("mode")
+        _close_query_prompt()
+        state["focus"] = FOCUS_SETTINGS
+        query_rt["status"] = ""
+        if answer and state["query_mode"] == mode:
+            _submit_query(answer)
+        _update_hud()
+        return True
 
     def _load_query_features():
         query_rt["features"] = None
@@ -1313,16 +1586,22 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     def _detach_camera():
         clear_tracked(vis, displayed, "camera")
         camera_rt["geoms"]["path"] = None
-        camera_rt["geoms"]["frustum"] = None
+        camera_rt["geoms"]["marker"] = None
         camera_rt["video"] = None
+        camera_rt["video_revision"] = 0
         camera_rt["playing"] = False
         camera_rt["last_tick"] = None
-        camera_rt["seen_tp"] = set()
+        camera_rt["phase"] = "idle"
+        camera_rt["ids"] = []
+        camera_rt["cache"] = {}
+        camera_rt["requested"] = set()
+        camera_rt["cache_t0"] = None
+        camera_rt["last_report"] = None
 
     def _rebuild_camera_path():
         clear_tracked(vis, displayed, "camera")
         camera_rt["geoms"]["path"] = None
-        camera_rt["geoms"]["frustum"] = None
+        camera_rt["geoms"]["marker"] = None
         if state["camera_mode"] == CAMERA_OFF or camera_rt["sequence"] is None:
             return
         poses = [camera_rt["poses"].get(fid) for fid in camera_rt["sequence"]["rgb_ids"]]
@@ -1353,103 +1632,237 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         camera_rt["geoms"]["path"] = path
         vis.add_geometry(path, reset_bounding_box=False)
         displayed["camera"].add(path)
-        if state["camera_mode"] == CAMERA_REPLAY:
-            _update_frustum()
 
-    def _update_frustum():
-        geom = camera_rt["geoms"].get("frustum")
+    def _update_camera_marker(pose):
+        """Classical wireframe camera pyramid at the current replay pose."""
+        marker = camera_rt["geoms"].get("marker")
         seq = camera_rt["sequence"]
-        if seq is None or camera_rt["calib"] is None or camera_rt["color_size"] is None:
+        calib = camera_rt.get("calib")
+        size = camera_rt.get("color_size")
+        if (state["camera_mode"] != CAMERA_REPLAY
+                or camera_rt.get("phase") != "ready"
+                or pose is None or not is_valid_pose(pose)
+                or calib is None or calib.get("K_color") is None
+                or not size or seq is None):
+            if marker in displayed["camera"]:
+                vis.remove_geometry(marker, reset_bounding_box=False)
+                displayed["camera"].discard(marker)
             return
-        ids = seq["rgb_ids"]
-        if not ids:
-            return
-        fid = ids[int(camera_rt["frame"]) % len(ids)]
-        pose = camera_rt["poses"].get(fid)
-        if pose is None or not is_valid_pose(pose):
-            camera_rt["status"] = f"Frame {fid}: tracking lost"
-            return
-        origin, corners = frustum_corners(
-            pose, camera_rt["calib"]["K_color"], camera_rt["color_size"][0],
-            camera_rt["color_size"][1])
-        pts = np.vstack([origin, corners])
-        segs = np.array([[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [2, 3], [3, 4], [4, 1]], dtype=np.int32)
-        import open3d as o3d
-        if geom is None:
-            geom = o3d.geometry.LineSet()
-            camera_rt["geoms"]["frustum"] = geom
-            vis.add_geometry(geom, reset_bounding_box=False)
-            displayed["camera"].add(geom)
-        geom.points = o3d.utility.Vector3dVector(pts)
-        geom.lines = o3d.utility.Vector2iVector(segs)
-        geom.paint_uniform_color([1.0, 0.55, 0.1])
-        vis.update_geometry(geom)
-
-    def _rebuild_owners():
-        camera_rt["owners"] = None
-        camera_rt["colors"] = None
-        if session is None or not objects:
-            return
-        camera_rt["owners"], camera_rt["colors"] = owner_colors(
-            len(session["scene_pts"]), objects, _object_color)
-
-    def _render_replay_frame():
-        seq = camera_rt["sequence"]
-        camera_rt["video"] = None
-        if seq is None or state["camera_mode"] != CAMERA_REPLAY:
-            return False
-        ids = seq["rgb_ids"]
-        if not ids:
-            return False
-        fid = ids[int(camera_rt["frame"]) % len(ids)]
-        color_path = os.path.join(seq["dir"], "color", f"{fid}.jpg")
         try:
-            rgb = load_color_rgb(color_path)
+            origin, corners = frustum_corners(
+                pose, calib["K_color"], size[0], size[1])
+        except Exception:
+            return
+        pts = np.vstack([origin, corners])
+        segs = np.asarray(FRUSTUM_LINES, dtype=np.int32)
+        if marker is None:
+            marker = o3d.geometry.LineSet()
+            camera_rt["geoms"]["marker"] = marker
+            vis.add_geometry(marker, reset_bounding_box=False)
+            displayed["camera"].add(marker)
+        marker.points = o3d.utility.Vector3dVector(pts)
+        marker.lines = o3d.utility.Vector2iVector(segs)
+        marker.paint_uniform_color([1.0, 0.55, 0.1])
+        if marker in displayed["camera"]:
+            vis.update_geometry(marker)
+
+    def _replay_frame_count():
+        if state["camera_mode"] != CAMERA_REPLAY:
+            return 0
+        return len(camera_rt.get("ids") or [])
+
+    def _replay_caption():
+        if state["camera_mode"] != CAMERA_REPLAY:
+            return None
+        adapter = camera_rt.get("replay")
+        if adapter is None:
+            return None
+        return getattr(adapter, "caption", None) or None
+
+    def _close_replay():
+        adapter = camera_rt.get("replay")
+        camera_rt["replay"] = None
+        camera_rt["replay_key"] = None
+        camera_rt["phase"] = "idle"
+        camera_rt["ids"] = []
+        camera_rt["cache"] = {}
+        camera_rt["requested"] = set()
+        camera_rt["cache_t0"] = None
+        camera_rt["last_report"] = None
+        camera_rt["video"] = None
+        camera_rt["status"] = ""
+        if state.get("focus") == FOCUS_REPLAY:
+            state["focus"] = FOCUS_SETTINGS
+        if adapter is not None:
+            try:
+                adapter.close()
+            except Exception:
+                pass
+
+    def _replay_color(name):
+        rgb01 = _class_color(name, nyu40map, palette)
+        return tuple(int(round(v * 255)) for v in rgb01)
+
+    def _ensure_replay():
+        """Return (adapter, reason). Reused while the selection is unchanged."""
+        if state["camera_mode"] != CAMERA_REPLAY:
+            return None, ""
+        pred = _pred()
+        key = (pred["run_id"], pred["model"], pred["label_set"],
+               session["id"] if session else None) if pred else None
+        adapter = camera_rt.get("replay")
+        if adapter is not None and camera_rt.get("replay_key") == key:
+            return adapter, ""
+        _close_replay()
+        try:
+            spec = _spec(pred["label_set"] if pred else state["benchmark"])
+            adapter = replay2d.build(
+                pred, sequence=camera_rt["sequence"], spec=spec,
+                scannet_root=scannet_root, color_of=_replay_color)
         except Exception as exc:
-            camera_rt["status"] = f"Frame {fid}: {exc}"
-            return False
-        pose = camera_rt["poses"].get(fid)
-        overlay_rgb = None
-        mask = None
-        valid = None
-        if (pose is not None and is_valid_pose(pose) and camera_rt["calib"] is not None
-                and fid in seq["proj_ids"] and session is not None
-                and state["source_mode"] != SOURCE_SCENE):
-            depth = load_depth_m(os.path.join(seq["dir"], "depth", f"{fid}.png"))
-            if depth is not None:
-                if camera_rt["owners"] is None:
-                    _rebuild_owners()
-                uv, zc, valid = project_points(
-                    session["scene_pts"], pose, camera_rt["calib"], depth,
-                    (rgb.shape[1], rgb.shape[0]))
-                colors = camera_rt["colors"] if camera_rt["colors"] is not None else np.zeros_like(session["scene_pts"])
-                owned = valid & (camera_rt["owners"] >= 0) if camera_rt["owners"] is not None else valid
-                overlay_rgb, mask = zbuffer_colors(
-                    uv, zc, colors, owned, rgb.shape[0], rgb.shape[1])
-            else:
-                camera_rt["status"] = f"Frame {fid}: no depth"
-        elif pose is None or not is_valid_pose(pose):
-            camera_rt["status"] = f"Frame {fid}: tracking lost"
+            return None, str(exc)
+        camera_rt["replay"] = adapter
+        camera_rt["replay_key"] = key
+        return adapter, ""
+
+    def _composite_replay_entry(entry):
+        """Composite one adapter entry into final RGBA frame bytes (RAM)."""
+        rgb = np.asarray(entry["image"], dtype=np.uint8)
         small = resize_rgb(rgb)
-        if overlay_rgb is not None and mask is not None and np.any(mask):
-            from PIL import Image
-            ov = (np.clip(overlay_rgb * 255.0, 0, 255).astype(np.uint8)
-                  if overlay_rgb.max() <= 1.0 else np.clip(overlay_rgb, 0, 255).astype(np.uint8))
-            ov_i = Image.fromarray(ov, mode="RGB").resize((small.shape[1], small.shape[0]), Image.NEAREST)
-            mk_i = Image.fromarray((mask.astype(np.uint8) * 255), mode="L").resize(
-                (small.shape[1], small.shape[0]), Image.NEAREST)
-            overlay_s = np.asarray(ov_i)
-            mask_s = np.asarray(mk_i) > 0
-            small = composite_overlay(small, overlay_s, mask_s)
+        sx = small.shape[1] / max(rgb.shape[1], 1)
+        small = draw_detections(
+            small, colorize_detections(entry.get("boxes"), _replay_color),
+            scale=sx)
+        if entry.get("masks"):
+            small = draw_masks(
+                small, colorize_masks(entry["masks"], _replay_color), scale=sx)
+        return rgb_to_rgba_bytes(small)
+
+    def _start_replay_cache():
+        """Build the adapter and begin RAM-only prefetch on replay-press."""
+        camera_rt["phase"] = "loading"
+        camera_rt["ids"] = []
+        camera_rt["cache"] = {}
+        camera_rt["requested"] = set()
+        camera_rt["video"] = None
+        camera_rt["frame"] = 0
+        camera_rt["playing"] = False
+        camera_rt["last_tick"] = None
+        camera_rt["last_report"] = None
+        camera_rt["cache_t0"] = time.monotonic()
+        state["replay_index"] = 1
+        state["focus"] = FOCUS_REPLAY
+        adapter, reason = _ensure_replay()
+        if adapter is None:
+            camera_rt["phase"] = "error"
+            camera_rt["status"] = reason or "replay unavailable"
+            return False
+        try:
+            camera_rt["ids"] = list(adapter.frames() or [])
+        except Exception:
+            camera_rt["ids"] = []
+        camera_rt["status"] = "starting 2D workers…"
+        return True
+
+    def _pump_replay_cache():
+        """One non-blocking prefetch slice. Returns True when HUD-worthy
+        progress happened. Playback starts only once every frame is cached."""
+        if (state["camera_mode"] != CAMERA_REPLAY
+                or camera_rt.get("phase") != "loading"):
+            return False
+        adapter = camera_rt.get("replay")
+        if adapter is None:
+            camera_rt["phase"] = "error"
+            camera_rt["status"] = "replay unavailable"
+            return True
+        try:
+            ids = list(adapter.frames() or [])
+        except Exception as exc:
+            camera_rt["phase"] = "error"
+            camera_rt["status"] = f"replay failed: {exc}"
+            return True
+        if ids:
+            camera_rt["ids"] = ids
+        else:
+            try:
+                adapter.poll()
+            except Exception:
+                pass
+            camera_rt["status"] = "loading 2D frames…"
+            report = (0, 0, camera_rt["status"])
+            if report != camera_rt["last_report"]:
+                camera_rt["last_report"] = report
+                return True
+            return False
+        _done, status = fill_replay_cache(
+            adapter, camera_rt["ids"], camera_rt["cache"],
+            camera_rt["requested"], _composite_replay_entry)
+        total = len(camera_rt["ids"])
+        have = len(camera_rt["cache"])
+        if status:
+            camera_rt["status"] = status
+        elif have < total:
+            camera_rt["status"] = f"caching video {have}/{total}…"
+        if have >= total and total:
+            camera_rt["phase"] = "ready"
+            camera_rt["frame"] = 0
+            camera_rt["playing"] = True
+            camera_rt["last_tick"] = None
+            camera_rt["status"] = ""
+            _show_cached_frame(0)
+            camera_rt["last_report"] = None
+            return True
+        report = (have, total, camera_rt["status"])
+        if report != camera_rt["last_report"]:
+            camera_rt["last_report"] = report
+            return True
+        return False
+
+    def _show_cached_frame(index):
+        """Display one fully-cached frame. No disk, worker, or PIL work."""
+        ids = camera_rt.get("ids") or []
+        if not ids:
+            return False
+        fid = ids[int(index) % len(ids)]
+        rgba = camera_rt["cache"].get(fid)
+        if rgba is None:
+            return False
+        pose = camera_rt["poses"].get(fid if isinstance(fid, int) else -1)
+        _update_camera_marker(pose)
+        camera_rt["video_revision"] += 1
         camera_rt["video"] = {
             "frame_id": int(fid),
-            "rgba": rgb_to_rgba_bytes(small),
+            "revision": camera_rt["video_revision"],
+            "rgba": rgba,
+            "ready": True,
         }
-        if valid is not None and objects:
-            packed = packed_visible(valid, len(session["scene_pts"]))
-            camera_rt["seen_tp"], _ = update_seen_tp(camera_rt["seen_tp"], packed, objects)
-        _update_frustum()
         return True
+
+    def _invalidate_replay_cache():
+        """Drop composited frames after a recolor; keep the warm worker."""
+        if state["camera_mode"] != CAMERA_REPLAY:
+            return
+        adapter = camera_rt.get("replay")
+        if adapter is None:
+            _start_replay_cache()
+            return
+        try:
+            adapter.invalidate_colors()
+        except Exception:
+            pass
+        camera_rt["cache"] = {}
+        camera_rt["requested"] = set()
+        camera_rt["video"] = None
+        camera_rt["frame"] = 0
+        camera_rt["playing"] = False
+        camera_rt["last_tick"] = None
+        camera_rt["last_report"] = None
+        camera_rt["cache_t0"] = time.monotonic()
+        camera_rt["phase"] = "loading"
+        try:
+            camera_rt["ids"] = list(adapter.frames() or [])
+        except Exception:
+            pass
 
     def _ensure_encoder():
         pred = _pred()
@@ -1457,7 +1870,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         if pred is None or feats is None:
             return False
         family, name, _dim = ENCODERS[pred["model"]]
-        query_client.ensure(method_python(pred["model"]), family, name)
+        query_client.ensure(method_python(pred["model"]), family, name, device="cuda:0")
         return True
 
     def _start_openins_query(text, mode):
@@ -1466,9 +1879,9 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             return
         query_rt["request_id"] += 1
         request_id = query_rt["request_id"]
-        query_rt["status"] = "Waiting for GPU"
+        query_rt["status"] = "Querying snapshots on GPU 0"
         query_rt["pending"] = request_id
-        classes = split_relabel_prompts(text) if mode == QUERY_RELABEL else [text.strip()]
+        classes = [text.strip()]
         classes = [item for item in classes if item]
         if not classes:
             query_rt["status"] = "empty prompt"
@@ -1492,44 +1905,34 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             args += ["--parameters-json", param]
 
         def work():
-            from predict.runner import child_env
-            from utils.gpu import gpu_lease
+            proc = None
             try:
-                settings = {"gpu_pool": [1, 2, 3, 4], "scannet_root": scannet_root}
-                try:
-                    from evaluation.benchmark import load_settings
-                    settings = load_settings()
-                except Exception:
-                    pass
-                with gpu_lease(settings["gpu_pool"], settings["scannet_root"]) as lease:
-                    env = child_env(lease, "openins3d")
-                    query_rt["status"] = "Querying snapshots"
-                    subprocess.run(args, env=env, check=True, pass_fds=(lease.fileno(),))
-                query_rt["openins"] = None
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = "0"
+                env.pop("SPELLBOOK_GPU_LEASE_FD", None)
+                proc = subprocess.Popen(args, env=env)
+                query_rt["openins"] = proc
+                returncode = proc.wait()
+                if returncode:
+                    raise subprocess.CalledProcessError(returncode, args)
                 if query_rt["pending"] != request_id:
                     return
                 with open(out_json) as fh:
                     payload = json.load(fh)
                 if int(payload.get("request_id", -1)) != request_id:
                     return
-                labels = dict(zip(payload.get("keys") or [], payload.get("labels") or []))
-                scores = dict(zip(payload.get("keys") or [], payload.get("scores") or []))
-                query_rt["labels"] = labels
-                query_rt["scores"] = {k: float(v) for k, v in scores.items()}
-                if mode == QUERY_SEARCH:
-                    ranked = sorted(
-                        ((k, query_rt["scores"][k]) for k in labels if labels[k]),
-                        key=lambda item: -item[1])
-                    query_rt["ranks"] = [k for k, _ in ranked[:10]]
-                else:
-                    query_rt["ranks"] = []
-                query_rt["status"] = ""
-                query_rt["pending"] = None
+                query_rt["native_result"] = {
+                    "id": request_id,
+                    "mode": mode,
+                    "labels": dict(zip(payload.get("keys") or [], payload.get("labels") or [])),
+                    "scores": dict(zip(payload.get("keys") or [], payload.get("scores") or [])),
+                }
             except Exception as exc:
                 if query_rt["pending"] == request_id:
-                    query_rt["status"] = str(exc)
-                    query_rt["pending"] = None
+                    query_rt["native_result"] = {"id": request_id, "error": str(exc)}
             finally:
+                if query_rt.get("openins") is proc:
+                    query_rt["openins"] = None
                 try:
                     os.unlink(out_json)
                 except OSError:
@@ -1537,6 +1940,30 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
 
         import threading
         threading.Thread(target=work, daemon=True).start()
+
+    def _apply_native_query_response(msg):
+        if not msg or msg.get("id") != query_rt.get("pending"):
+            return False
+        error = msg.get("error")
+        if error:
+            query_rt["status"] = error
+            query_rt["pending"] = None
+            return True
+        labels = msg.get("labels") or {}
+        query_rt["labels"] = labels
+        query_rt["scores"] = {
+            key: float(value) for key, value in (msg.get("scores") or {}).items()
+        }
+        if msg.get("mode") == QUERY_SEARCH:
+            ranked = sorted(
+                ((key, query_rt["scores"].get(key, 0.0)) for key in labels if labels[key]),
+                key=lambda item: -item[1])
+            query_rt["ranks"] = [key for key, _score in ranked[:10]]
+        else:
+            query_rt["ranks"] = []
+        query_rt["status"] = ""
+        query_rt["pending"] = None
+        return True
 
     def _submit_query(text):
         mode = state["query_mode"]
@@ -1557,7 +1984,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         spec = _spec(pred["label_set"])
         root = submission_dir(spec, pred["run_id"], pred["model"], scannet_root)
         payload = {
-            "op": "image" if mode == QUERY_IMAGE else ("relabel" if mode == QUERY_RELABEL else "search"),
+            "op": "image" if mode == QUERY_IMAGE else "search",
             "features_path": clip_features_path(
                 spec, pred["run_id"], pred["model"], session["id"], scannet_root),
             "index_path": os.path.join(root, session["id"] + ".txt"),
@@ -1584,14 +2011,9 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             query_rt["pending"] = None
             return True
         keys = msg.get("keys") or []
-        if msg.get("op") == "relabel":
-            query_rt["labels"] = dict(zip(keys, msg.get("labels") or []))
-            query_rt["scores"] = dict(zip(keys, msg.get("scores") or []))
-            query_rt["ranks"] = []
-        else:
-            query_rt["ranks"] = keys
-            query_rt["scores"] = dict(zip(keys, msg.get("scores") or []))
-            query_rt["labels"] = {}
+        query_rt["ranks"] = keys
+        query_rt["scores"] = dict(zip(keys, msg.get("scores") or []))
+        query_rt["labels"] = {}
         query_rt["status"] = ""
         query_rt["pending"] = None
         return True
@@ -1617,6 +2039,8 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             return _opts(["mesh", "pointcloud"])
         if row == "boxes":
             return _opts([True, False])
+        if row == "labels":
+            return _opts(["off", "small", "large"])
         if row == "ceiling":
             return _opts([False, True])
         if row == "cad":
@@ -1624,18 +2048,28 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         if row == "query":
             pred = _pred()
             model = pred["model"] if pred else None
+            has_features = query_rt.get("features") is not None
+            if not has_features and pred is not None and session is not None:
+                has_features = clip_path_ready(clip_features_path(
+                    _spec(pred["label_set"]), pred["run_id"], pred["model"],
+                    session["id"], scannet_root))
             modes = query_modes_for(
-                model, has_features=query_rt.get("features") is not None,
+                model, has_features=has_features,
                 has_snap=bool(pred) and openins_snap_complete(pred["run_id"], pred["scene_id"]),
                 source_pred=state["source_mode"] == SOURCE_PRED)
             enabled = {QUERY_OFF: True, QUERY_SEARCH: QUERY_SEARCH in modes,
-                       QUERY_RELABEL: QUERY_RELABEL in modes, QUERY_IMAGE: QUERY_IMAGE in modes}
-            return _opts([QUERY_OFF, QUERY_SEARCH, QUERY_RELABEL, QUERY_IMAGE], enabled)
-        if row == "camera":
+                       QUERY_IMAGE: QUERY_IMAGE in modes}
+            return _opts([QUERY_OFF, QUERY_SEARCH, QUERY_IMAGE], enabled)
+        if row == "view":
             has_frames = camera_rt["sequence"] is not None and bool(camera_rt["sequence"]["rgb_ids"])
+            pred = _pred()
+            can_replay, _reason = replay2d.available(pred, camera_rt["sequence"])
             return _opts(
-                [CAMERA_OFF, CAMERA_PATH, CAMERA_REPLAY],
-                {CAMERA_OFF: True, CAMERA_PATH: has_frames, CAMERA_REPLAY: has_frames})
+                [VIEW_CLASSES, VIEW_PIPELINE, VIEW_PATH, VIEW_REPLAY],
+                {VIEW_CLASSES: True,
+                 VIEW_PIPELINE: bool(pred and pred["model"] in MODEL_PIPELINE),
+                 VIEW_PATH: has_frames,
+                 VIEW_REPLAY: bool(has_frames and can_replay)})
         return []
 
     def _option_lists():
@@ -1654,15 +2088,17 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             return {"mesh": "Mesh", "pointcloud": "Points"}[value]
         if row == "boxes":
             return "On" if value else "Off"
+        if row == "labels":
+            return {"off": "Off", "small": "Small", "large": "Large"}[value]
         if row == "ceiling":
             return "Hidden" if value else "Visible"
         if row == "cad":
             return "Open" if value else "Closed"
         if row == "query":
-            return {QUERY_OFF: "Off", QUERY_SEARCH: "Search", QUERY_RELABEL: "Relabel",
-                    QUERY_IMAGE: "Image"}[value]
-        if row == "camera":
-            return {CAMERA_OFF: "Off", CAMERA_PATH: "Path", CAMERA_REPLAY: "Replay"}[value]
+            return {QUERY_OFF: "Off", QUERY_SEARCH: "Search", QUERY_IMAGE: "Image"}[value]
+        if row == "view":
+            return {VIEW_CLASSES: "Classes", VIEW_PIPELINE: "Pipeline",
+                    VIEW_PATH: "Path", VIEW_REPLAY: "Replay"}.get(value, str(value))
         return value
 
     def _tree_rows():
@@ -1714,8 +2150,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         return status
 
     def _load_source():
-        nonlocal objects, label_cam
-        label_cam = reset_camera_label_state()
+        nonlocal objects
         if overlay["pcd"] is not None:
             if overlay["pcd"] in displayed["objs"]:
                 vis.remove_geometry(overlay["pcd"], reset_bounding_box=False)
@@ -1731,6 +2166,9 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         cache = session["source_cache"]
         if key in cache:
             objects, state["status"] = cache[key]
+            _load_query_features()
+            if state["camera_mode"] == CAMERA_REPLAY:
+                _start_replay_cache()
             return
         if state["source_mode"] == SOURCE_SCENE:
             objects = []
@@ -1765,7 +2203,8 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                     state["status"] = _score_predictions(data, root, pred)
         cache[key] = (objects, state["status"])
         _load_query_features()
-        _rebuild_owners()
+        if state["camera_mode"] == CAMERA_REPLAY:
+            _render_replay_frame()
 
     def _variant():
         kind = "mesh" if state["geometry"] == "mesh" else "pointcloud"
@@ -1830,14 +2269,42 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             want_objs = {objects[i]["pcd"] for i in keep}
         want_boxes = set()
         want_labels = set()
-        if state["boxes"]:
+        want_box = bool(state["boxes"])
+        label_height = LABEL_WORLD.get(state.get("labels", "off"), 0.0)
+        want_text = state.get("labels", "off") != "off"
+        # Face new labels toward the live camera once; never touch them again.
+        try:
+            _params = vis.get_view_control().convert_to_pinhole_camera_parameters()
+            _ext = np.asarray(_params.extrinsic)
+            _cam = -_ext[:3, :3].T @ _ext[:3, 3]
+        except Exception:
+            _cam = None
+        if _cam is not None and np.linalg.norm(_cam) > 1e-6:
+            _to_cam = _cam - session["scene_pts"].mean(0)
+            _to_cam[session["up_axis"]] = 0.0
+            if np.linalg.norm(_to_cam) < 1e-6:
+                _to_cam = np.array([1.0, 0.0, 0.0])
+                _to_cam[session["up_axis"]] = 0.0
+            _to_cam /= np.linalg.norm(_to_cam)
+            _x_dir = np.cross(session["up_vec"], _to_cam)
+            if np.linalg.norm(_x_dir) < 1e-6:
+                _x_dir = np.array([1.0, 0.0, 0.0])
+            _x_dir /= np.linalg.norm(_x_dir)
+        else:
+            _x_dir = np.array([1.0, 0.0, 0.0])
+            _x_dir[session["up_axis"]] = 0.0
+            _x_dir /= max(np.linalg.norm(_x_dir), 1e-9)
+        if want_box or want_text:
             for i in keep:
                 obj = objects[i]
                 ensure_object_decorations(
                     obj, _object_color(i, obj),
-                    session["label_x_dir"], session["label_y_dir"], session["up_axis"])
-                want_boxes.add(obj["box"])
-                want_labels.add(obj["label"]["mesh"])
+                    _x_dir, session["up_vec"], session["up_axis"],
+                    label_height=label_height, want_box=want_box, want_label=want_text)
+                if want_box and obj.get("box") is not None:
+                    want_boxes.add(obj["box"])
+                if want_text and obj.get("label") is not None:
+                    want_labels.add(obj["label"]["mesh"])
         return want_objs, want_boxes, want_labels
 
     def _apply_diff(displayed_set, wanted_set):
@@ -1847,45 +2314,11 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             vis.add_geometry(g, reset_bounding_box=False)
         return wanted_set
 
-    def _update_labels(_vis):
-        params = vis.get_view_control().convert_to_pinhole_camera_parameters()
-        extrinsic = np.asarray(params.extrinsic)
-        cam_pos = -extrinsic[:3, :3].T @ extrinsic[:3, 3]
-        fy = params.intrinsic.get_focal_length()[1]
-        if not camera_label_update(label_cam, extrinsic, fy, time.monotonic()):
-            return False
-        updated = False
-        for o in objects:
-            lab = o.get("label")
-            if not lab or lab["mesh"] not in displayed["labels"]:
-                continue
-            to_cam = cam_pos - lab["anchor"]
-            to_cam[session["up_axis"]] = 0.0
-            dist = np.linalg.norm(to_cam)
-            if dist < 1e-6:
-                continue
-            to_cam /= dist
-            x_dir = np.cross(session["up_vec"], to_cam)
-            x_norm = np.linalg.norm(x_dir)
-            if x_norm < 1e-6:
-                continue
-            x_dir /= x_norm
-            char_size = TARGET_LABEL_PX * dist / fy
-            _place_label(lab["mesh"], lab["base"], lab["anchor"], char_size,
-                         x_dir, session["up_vec"])
-            vis.update_geometry(lab["mesh"])
-            updated = True
-        return updated
-
     def _sync():
-        nonlocal label_cam
-        prev_labels = displayed["labels"]
         want_objs, want_boxes, want_labels = _wanted()
         displayed["objs"] = _apply_diff(displayed["objs"], want_objs)
         displayed["boxes"] = _apply_diff(displayed["boxes"], want_boxes)
         displayed["labels"] = _apply_diff(displayed["labels"], want_labels)
-        if displayed["labels"] - prev_labels:
-            label_cam = reset_camera_label_state()
 
     def _object_color(idx, o):
         if state["color_mode"] == COLOR_QUERY:
@@ -1893,9 +2326,15 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             t = max(0.0, min(1.0, (score + 1.0) * 0.5))
             return colormaps["plasma"](t)[:3]
         if state["color_mode"] == COLOR_TPGT:
-            return TP_COLOR if o["verdict"] == "tp" else FP_COLOR
+            if o["verdict"] == "tp":
+                return TP_COLOR
+            if o["verdict"] == "fp":
+                return FP_COLOR
+            if o["verdict"] == "ignored":
+                return IGNORED_COLOR
+            return _class_color(o.get("query_label") or o["class_name"], nyu40map, palette)
         if state["color_mode"] == COLOR_INSTANCE:
-            return colormaps["turbo"](idx / max(len(objects), 1))[:3]
+            return instance_color(idx)
         name = o.get("query_label") or o["class_name"]
         return _class_color(name, nyu40map, palette)
 
@@ -1918,8 +2357,6 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                     vis.update_geometry(lab["mesh"])
 
     def _detach_all():
-        nonlocal label_cam
-        label_cam = reset_camera_label_state()
         overlay["pcd"] = None
         clear_tracked(vis, displayed, "objs")
         clear_tracked(vis, displayed, "boxes")
@@ -1934,18 +2371,42 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
 
     def _hud_payload():
         counts = _instance_counts(objects) if objects else Counter()
-        gt_counts = session["gt_counts"] if session else Counter()
-        classes = sorted(set(gt_counts) | set(counts))
+        eligible_gt = _eligible_scene_gt_counts()
+        if eligible_gt is not None:
+            presence = eligible_gt
+        elif state["source_mode"] == SOURCE_PRED:
+            presence = counts
+        elif session and session["gt_counts"]:
+            presence = session["gt_counts"]
+        else:
+            presence = counts
+        classes = sorted(presence)
+        class_stats = {}
+        if state["source_mode"] == SOURCE_PRED and eligible_gt is not None:
+            class_stats = class_count_stats(objects, classes, eligible_gt)
         png = _cad_png()
         pred = _pred()
+        masks = None
+        if state["source_mode"] == SOURCE_PRED and objects:
+            masks = {
+                "pred": len(objects),
+                "gt": sum(eligible_gt.values()) if eligible_gt else None,
+                "tp": sum(1 for o in objects if o.get("verdict") == "tp"),
+                "fp": sum(1 for o in objects if o.get("verdict") == "fp"),
+                "ignored": sum(1 for o in objects if o.get("verdict") == "ignored"),
+            }
         return {
             "status": state["status"],
             "settings": settings_payload(state, _option_lists(), _display_value),
             "info": information_payload(
                 session["id"] if session else None, pred, scores, run_metrics,
-                recon_times, pred_times),
+                recon_times, pred_times, masks),
+            "pipeline": (
+                {"method": pred["model"], "text": MODEL_PIPELINE[pred["model"]]}
+                if pred and pred["model"] in MODEL_PIPELINE else None),
             "classes": classes,
             "colors": {name: tuple(_class_color(name, nyu40map, palette)) for name in classes},
+            "class_stats": class_stats,
             "focus": state["focus"],
             "tree": tree_payload_rows(
                 _tree_rows(), state["cursor_id"], state["active_pred"],
@@ -1956,6 +2417,12 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                 "status": query_rt["status"],
                 "input": query_rt["input"],
                 "reset_id": query_rt["reset_id"],
+                "can_search": any(
+                    opt["value"] == QUERY_SEARCH and opt.get("enabled", True)
+                    for opt in _option_list("query")),
+                "can_image": any(
+                    opt["value"] == QUERY_IMAGE and opt.get("enabled", True)
+                    for opt in _option_list("query")),
                 "results": query_result_lines(
                     state["query_mode"], query_rt["ranks"],
                     [query_rt["scores"].get(k, 0.0) for k in query_rt["ranks"]],
@@ -1964,26 +2431,31 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             "camera": {
                 "mode": state["camera_mode"],
                 "frame": camera_rt["frame"],
-                "count": len(camera_rt["sequence"]["rgb_ids"]) if camera_rt["sequence"] else 0,
+                "count": _replay_frame_count(),
                 "playing": camera_rt["playing"],
-                "live_tp": len(camera_rt["seen_tp"]) if state["camera_mode"] == CAMERA_REPLAY and state["query_mode"] != QUERY_RELABEL else None,
-                "live_gt": (scores.get(run_node_id(session["id"], pred), {}) or {}).get("gt") if pred and session else None,
+                "status": camera_rt.get("status") or "",
+                "caption": _replay_caption(),
+                "phase": camera_rt.get("phase") or "idle",
+                "done": len(camera_rt.get("cache") or {}),
+                "total": len(camera_rt.get("ids") or []),
+                "elapsed": (time.monotonic() - camera_rt["cache_t0"]
+                            if camera_rt.get("cache_t0") else 0.0),
+                "replay_index": int(state.get("replay_index", 1)) % len(REPLAY_TRANSPORT),
             },
             "video": None if state.get("cad_open") else camera_rt.get("video"),
+            "panel": state.get("panel", PANEL_CLASSES),
         }
 
     def _update_hud():
         payload = _hud_payload()
         publish_left({"tree": payload["tree"]})
         publish_right({k: payload[k] for k in (
-            "settings", "classes", "colors", "status", "focus", "cad_overlay", "info",
-            "query", "camera", "video")})
+            "settings", "classes", "colors", "class_stats", "status", "focus", "cad_overlay", "info",
+            "query", "camera", "video", "pipeline", "panel")})
 
     def _normalize_color():
         if state["source_mode"] == SOURCE_SCENE:
             return
-        if state["query_mode"] == QUERY_RELABEL and state["color_mode"] == COLOR_TPGT:
-            state["color_mode"] = COLOR_CLASS
         if state["color_mode"] == COLOR_QUERY and state["query_mode"] not in (
                 QUERY_SEARCH, QUERY_IMAGE):
             state["color_mode"] = COLOR_CLASS
@@ -1993,6 +2465,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
 
     def _apply(row, value):
         need_reload = False
+        recolor_replay = False
         if row == "benchmark":
             if value == state["benchmark"]:
                 return
@@ -2017,6 +2490,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             if value == state["color_mode"]:
                 return
             state["color_mode"] = value
+            recolor_replay = True
         elif row == "geometry":
             if value == state["geometry"]:
                 return
@@ -2024,6 +2498,8 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             _swap_scene()
         elif row == "boxes":
             state["boxes"] = value
+        elif row == "labels":
+            state["labels"] = value
         elif row == "ceiling":
             if value == state["ceiling_hidden"]:
                 return
@@ -2037,25 +2513,35 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             _update_hud()
             return
         elif row == "query":
-            if value == state["query_mode"]:
-                return
+            if value == QUERY_OFF:
+                _close_query_prompt()
             state["query_mode"] = value
             _clear_query()
             if value in (QUERY_SEARCH, QUERY_IMAGE):
                 state["color_mode"] = COLOR_QUERY
+                _launch_query_prompt(value)
             elif state["color_mode"] == COLOR_QUERY:
                 state["color_mode"] = COLOR_CLASS
-        elif row == "camera":
-            if value == state["camera_mode"]:
+            recolor_replay = True
+        elif row == "view":
+            if value == state.get("view", VIEW_CLASSES):
                 return
-            state["camera_mode"] = value
+            camera_value = {
+                VIEW_REPLAY: CAMERA_REPLAY, VIEW_PATH: CAMERA_PATH,
+            }.get(value, CAMERA_OFF)
+            if state["camera_mode"] == CAMERA_REPLAY:
+                _close_replay()
+            state["view"] = value
+            state["camera_mode"] = camera_value
+            state["panel"] = {
+                VIEW_REPLAY: PANEL_PREVIEW, VIEW_PIPELINE: PANEL_PIPELINE,
+            }.get(value, PANEL_CLASSES)
             camera_rt["frame"] = 0
             camera_rt["last_tick"] = None
-            camera_rt["seen_tp"] = set()
-            camera_rt["playing"] = value == CAMERA_REPLAY
+            camera_rt["playing"] = False
             _rebuild_camera_path()
-            if value == CAMERA_REPLAY:
-                _render_replay_frame()
+            if camera_value == CAMERA_REPLAY:
+                _start_replay_cache()
             else:
                 camera_rt["video"] = None
         _normalize_color()
@@ -2066,6 +2552,8 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             _load_source()
         _paint()
         _sync()
+        if recolor_replay and state["camera_mode"] == CAMERA_REPLAY:
+            _invalidate_replay_cache()
         _update_hud()
 
     def _bind_session(recon_id):
@@ -2085,6 +2573,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         session = bundle
         objects = []
         state["cad_open"] = False
+        _close_query_prompt()
         state["query_mode"] = QUERY_OFF
         _clear_query()
         _load_camera_sequence()
@@ -2148,40 +2637,54 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
 
     def _sync_query_objects():
         for obj in objects:
-            key = obj.get("key")
-            obj["query_label"] = query_rt["labels"].get(key) if state["query_mode"] == QUERY_RELABEL else None
-            if state["query_mode"] == QUERY_RELABEL:
-                obj["label"] = None
-        _rebuild_owners()
+            obj["query_label"] = None
         _paint()
         _sync()
+        if state["camera_mode"] == CAMERA_REPLAY:
+            _invalidate_replay_cache()
+
+    def _replay_ids():
+        if state["camera_mode"] != CAMERA_REPLAY:
+            return []
+        return list(camera_rt.get("ids") or [])
+
+    def _exec_replay_transport(option):
+        """Execute a confirmed Back / Pause-Play / Forward action."""
+        if (state["camera_mode"] != CAMERA_REPLAY
+                or camera_rt.get("phase") != "ready"):
+            return
+        ids = camera_rt.get("ids") or []
+        if not ids:
+            return
+        if option == "toggle":
+            camera_rt["playing"] = not camera_rt["playing"]
+            camera_rt["last_tick"] = None
+        elif option in ("back", "forward"):
+            delta = -1 if option == "back" else 1
+            camera_rt["frame"] = step_replay_frame(
+                camera_rt["frame"], len(ids), delta)
+            camera_rt["playing"] = False
+            camera_rt["last_tick"] = None
+            _show_cached_frame(camera_rt["frame"])
+        else:
+            return
+        _update_hud()
 
     def _handle_hud_action(action):
         kind = action.get("type")
-        if kind == "query_apply":
-            _submit_query(action.get("text") or "")
-            _update_hud()
-            return
-        if kind == "query_clear":
-            _clear_query()
-            if state["query_mode"] != QUERY_OFF and state["color_mode"] == COLOR_QUERY:
-                state["color_mode"] = COLOR_CLASS
-            _sync_query_objects()
-            _update_hud()
-            return
         if kind == "replay_toggle":
-            if state["camera_mode"] == CAMERA_REPLAY:
-                camera_rt["playing"] = not camera_rt["playing"]
-                camera_rt["last_tick"] = None
-                _update_hud()
+            _exec_replay_transport("toggle")
+            return
+        if kind == "replay_transport":
+            _exec_replay_transport(action.get("option"))
             return
         if kind == "replay_frame":
-            seq = camera_rt["sequence"]
-            count = len(seq["rgb_ids"]) if seq else 0
-            if count:
+            count = len(_replay_ids())
+            if count and camera_rt.get("phase") == "ready":
                 camera_rt["frame"] = min(max(0, int(action.get("frame") or 0)), count - 1)
                 camera_rt["playing"] = False
-                _render_replay_frame()
+                camera_rt["last_tick"] = None
+                _show_cached_frame(camera_rt["frame"])
                 _update_hud()
 
     def _dispatch(key):
@@ -2204,6 +2707,9 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         if action.get("apply"):
             _apply(*action["apply"])
             return
+        if action.get("transport"):
+            _exec_replay_transport(action["transport"])
+            return
         clamp_cursor(state, _tree_rows())
         _update_hud()
 
@@ -2221,26 +2727,44 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
 
     def _tick(_vis):
         _drain_keys()
+        _poll_query_prompt()
+        native = query_rt.get("native_result")
+        if native is not None:
+            query_rt["native_result"] = None
+            if _apply_native_query_response(native):
+                _sync_query_objects()
+                _update_hud()
         msg = query_client.poll()
         if msg and _apply_query_response(msg):
             _sync_query_objects()
             _update_hud()
         updated = False
-        if state["camera_mode"] == CAMERA_REPLAY and camera_rt["sequence"] and not state.get("cad_open"):
-            ids = camera_rt["sequence"]["rgb_ids"]
-            nxt, last = advance_playback(
-                camera_rt["playing"], camera_rt["frame"], len(ids),
-                camera_rt["last_tick"], time.monotonic(), REPLAY_FPS)
-            if nxt != camera_rt["frame"] or camera_rt["video"] is None:
-                camera_rt["frame"] = nxt
-                camera_rt["last_tick"] = last
-                _render_replay_frame()
-                _update_hud()
-                updated = True
-            else:
-                camera_rt["last_tick"] = last
-        if displayed["labels"]:
-            return _update_labels(_vis) or updated
+        if (state["camera_mode"] == CAMERA_REPLAY and camera_rt["sequence"]
+                and not state.get("cad_open")):
+            if camera_rt.get("phase") == "loading":
+                # Prefetch every frame into RAM first; playback starts only
+                # once the whole video is cached.
+                if _pump_replay_cache():
+                    _update_hud()
+                    updated = True
+            elif camera_rt.get("phase") == "ready":
+                adapter = camera_rt.get("replay")
+                fps = getattr(adapter, "fps", REPLAY_FPS) if adapter else REPLAY_FPS
+                ids = _replay_ids()
+                if ids:
+                    # The full video is cached: stepping is a dict lookup,
+                    # never disk, worker, or PIL work.
+                    nxt, last = advance_playback(
+                        camera_rt["playing"], camera_rt["frame"], len(ids),
+                        camera_rt["last_tick"], time.monotonic(), fps)
+                    if nxt != camera_rt["frame"]:
+                        camera_rt["frame"] = nxt
+                        camera_rt["last_tick"] = last
+                        _show_cached_frame(nxt)
+                        _update_hud()
+                        updated = True
+                    else:
+                        camera_rt["last_tick"] = last
         return updated
 
     def _key_action(key, handler):
@@ -2269,6 +2793,8 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     vis.register_animation_callback(_tick)
     print("Keys: Tab HUD, arrows, Enter, mouse view, Esc/Q quit")
     vis.run()
+    _close_replay()
+    _close_query_prompt()
     query_client.close()
     proc = query_rt.get("openins")
     if proc is not None:
