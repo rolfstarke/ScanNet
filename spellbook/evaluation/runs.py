@@ -329,7 +329,10 @@ def read_evaluator_csv(path):
         raise ValueError(f"empty evaluator csv: {path}")
     metrics = {}
     for metric in METRICS:
-        metrics[metric] = _mean([_parse_metric(row[metric]) for row in rows])
+        values = [_parse_metric(row[metric]) for row in rows]
+        metrics[metric] = _mean(values)
+        metrics[f"{metric}_count"] = sum(
+            1 for value in values if value is not None and math.isfinite(value))
         if metrics[metric] is None:
             raise ValueError(f"no finite {metric} values in {path}")
     return metrics
@@ -388,16 +391,13 @@ def _assign_ranks(rows):
     for key in sorted(groups):
         members = groups[key]
         for metric in METRICS:
-            if metric == "ap":
-                ordered = sorted(members, key=lambda row: (-row["ap"], -row["ap50"], row["run_id"]))
-            else:
-                ordered = sorted(members, key=lambda row: (-row[metric], row["run_id"]))
+            ordered = sorted(members, key=lambda row: (-row[metric], row["run_id"]))
             lookup = {row["run_id"]: index for index, row in enumerate(ordered, start=1)}
             for row in members:
                 row[f"rank_{metric}"] = lookup[row["run_id"]]
         ranked.extend(members)
     ranked.sort(key=lambda row: (row["method"], ";".join(row["scenes"]),
-                                 -row["ap"], -row["ap50"], row["run_id"]))
+                                 -row["ap"], row["run_id"]))
     return ranked
 
 

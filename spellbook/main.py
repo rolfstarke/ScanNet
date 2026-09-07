@@ -45,7 +45,37 @@ def main():
     parser.add_argument("--scene", nargs="+",
                         help="scene numbers (e.g., 0046_00 or 9004 9009); explicit "
                              "prediction subsets are non-comparable")
+    parser.add_argument("--compare", action="store_true",
+                        help="generate the offline numerical comparison dashboard "
+                             "from existing artifacts and open it in the browser")
     args = parser.parse_args()
+
+    if args.compare:
+        conflicts = [name for name, present in (
+            ("--visualize", args.visualize),
+            ("--predict", args.predict),
+            ("--gpu-check", args.gpu_check),
+            ("--engine", args.engine),
+            ("--extract-frames", args.extract_frames),
+            ("--replace", args.replace),
+            ("--scene", args.scene),
+            ("--models", args.models),
+            ("--classes", args.classes),
+            ("--benchmark", args.benchmark),
+            ("--run-id", args.run_id),
+            ("--run-parameters", args.run_parameters),
+            ("--issue", args.issue),
+        ) if present]
+        if conflicts:
+            parser.error("--compare is exclusive with " + ", ".join(conflicts))
+        from evaluation.benchmark import load_settings
+        from evaluation.comparison import generate_report, open_report
+        root = load_settings()["scannet_root"]
+        path = generate_report(root)
+        print(f"comparison -> {path}")
+        if not open_report(path):
+            print("no display or browser found; open the file above manually")
+        return
 
     from evaluation.benchmark import (
         PREDICTION_EVALUATION_SCENES, load_settings, resolve_benchmark,
@@ -61,8 +91,8 @@ def main():
             parser.error("--issue must be a positive integer")
 
     if args.gpu_check:
-        if args.visualize or args.predict or args.extract_frames:
-            parser.error("--gpu-check is exclusive with --visualize/--predict/--extract-frames")
+        if args.visualize or args.predict or args.extract_frames or args.compare:
+            parser.error("--gpu-check is exclusive with --visualize/--predict/--extract-frames/--compare")
         if args.scene:
             parser.error("--gpu-check does not use --scene")
         import sys as _sys
@@ -74,8 +104,8 @@ def main():
         from gpu_check import main as gpu_check_main
         gpu_check_main()
     elif args.extract_frames:
-        if args.visualize or args.predict or args.engine:
-            parser.error("--extract-frames is exclusive with --visualize/--predict/--engine")
+        if args.visualize or args.predict or args.engine or args.compare:
+            parser.error("--extract-frames is exclusive with --visualize/--predict/--engine/--compare")
         if not args.scene:
             parser.error("--extract-frames requires --scene")
         from reconstruct.extract import extract_scenes

@@ -217,7 +217,7 @@ class Evaluator:
         for label in self.CLASS_LABELS:
             pred2gt[label] = []
         num_pred_instances = 0
-        bool_void = np.logical_not(np.in1d(gt_ids // 1000, self.VALID_CLASS_IDS))
+        bool_void = np.logical_not(np.isin(gt_ids // 1000, self.VALID_CLASS_IDS))
 
         for instance_id in self.pred_instances[scene_id]:
             label_id = int(self.pred_instances[scene_id][instance_id]['label_id'])
@@ -317,14 +317,197 @@ class Evaluator:
         return avgs
 
 
-def scene_instance_summary(gt_ids, pred_instances, spec, scene_id, overlap_th=0.5):
-    """Per-scene AP50 verdicts using Evaluator.assign_instances_for_scan.
+THRESHOLD_IOU = 0.5
+THRESHOLD_OBJECTIVE = "f1"
 
-    Returns {"verdicts": {relative_or_raw_key: "tp"|"fp"|"ignored"}, "tp": int, "gt": int}.
-    Keys are evaluator filenames with the ``scene_id/`` prefix stripped. Eligible GT
-    counts valid-class instances with instance_id >= 1000 and vert_count >= 100.
-    IoU must be strictly greater than overlap_th (official AP50 uses 0.5).
+
+def _iou(vert_gt, vert_pred, intersection):
+    denom = vert_gt + vert_pred - intersection
+    if denom <= 0:
+        return 0.0
+    return float(intersection) / float(denom)
+
+
+def _eligible_gt_for_class(gt_list, min_region_size):
+    eligible = [g for g in gt_list
+                if g["instance_id"] >= 1000 and g["vert_count"] >= min_region_size]
+    eligible.sort(key=lambda g: int(g["instance_id"]))
+    return eligible
+
+
+def _match_class_predictions(eligible_gt, pred_list, overlap_th=0.5, min_region_size=100):
+    """Deterministic IoU matching for one class.
+
+    Predictions are consumed in descending confidence order with filename as a
+    stable tie-breaker, so the highest-confidence duplicate wins. A prediction
+    overlapping an unmatched eligible GT with IoU strictly greater than
+    ``overlap_th`` is TP; overlapping only already-matched GTs is FP; otherwise
+    the official void-ignore ratio decides FP vs ignored.
     """
+    gt_by_id = {}
+    for index, gt in enumerate(eligible_gt):
+        gt_by_id[int(gt["instance_id"])] = (index, int(gt["vert_count"]))
+    eligible_ids = set(gt_by_id)
+    ordered = sorted(pred_list,
+                     key=lambda p: (-float(p["confidence"]), str(p["filename"])))
+    verdicts = {}
+    matched_gt = {}
+    matched = set()
+    tp = 0
+    for pred in ordered:
+        filename = pred["filename"]
+        pred_verts = int(pred["vert_count"])
+        best_id = None
+        best_iou = 0.0
+        for gt in pred.get("matched_gt") or []:
+            gid = int(gt["instance_id"])
+            if gid not in eligible_ids:
+                continue
+            iou = _iou(int(gt["vert_count"]), pred_verts, int(gt["intersection"]))
+            if iou > overlap_th and (iou > best_iou or (
+                    iou == best_iou and (best_id is None or gid < best_id))):
+                best_iou = iou
+                best_id = gid
+        if best_id is not None:
+            if best_id not in matched:
+                matched.add(best_id)
+                verdicts[filename] = "tp"
+                matched_gt[filename] = int(best_id)
+                tp += 1
+            else:
+                verdicts[filename] = "fp"
+            continue
+        num_ignore = int(pred.get("void_intersection", 0))
+        for gt in pred.get("matched_gt") or []:
+            if int(gt["instance_id"]) < 1000:
+                num_ignore += int(gt["intersection"])
+            if int(gt["vert_count"]) < min_region_size:
+                num_ignore += int(gt["intersection"])
+        ratio = float(num_ignore) / float(pred_verts) if pred_verts > 0 else 0.0
+        verdicts[filename] = "ignored" if ratio > overlap_th else "fp"
+    return {"verdicts": verdicts, "matched_gt": matched_gt, "tp": int(tp)}
+
+
+def _class_match_inputs(eligible_gt, pred_list, overlap_th=0.5, min_region_size=100):
+    """Single full-list match plus confidence-ordered sweep entries.
+
+    Returns {"eligible_ids": [...], "entries": [(confidence, filename, verdict,
+    matched_gt_id_or_None)]} with entries ordered by descending confidence then
+    filename. Any confidence threshold keeps a prefix of this order (including
+    the complete equal-confidence group), so verdicts from the full-list match
+    stay valid for every swept threshold.
+    """
+    matched = _match_class_predictions(
+        eligible_gt, pred_list, overlap_th=overlap_th,
+        min_region_size=min_region_size)
+    ordered = sorted(pred_list,
+                     key=lambda p: (-float(p["confidence"]), str(p["filename"])))
+    entries = []
+    for pred in ordered:
+        filename = str(pred["filename"])
+        verdict = matched["verdicts"][filename]
+        entries.append((float(pred["confidence"]), filename, verdict,
+                        matched["matched_gt"].get(filename)))
+    return {"eligible_ids": [int(g["instance_id"]) for g in eligible_gt],
+            "entries": entries}
+
+
+def compute_global_thresholds(scene_inputs, class_labels, overlap_th=0.5):
+    """Pooled micro-F1 thresholds: one confidence per class over all scenes.
+
+    ``scene_inputs`` is a list of {"scene_id": str, "classes": {label:
+    _class_match_inputs(...)}}. Matching stays scene-local; only counts are
+    pooled. At each unique observed confidence (descending), predictions with
+    ``confidence >= threshold`` are retained as a group and micro-F1
+    ``2*TP/(2*TP+FP+FN)`` is computed over pooled instances. Equal maxima keep
+    the higher threshold. Classes with no eligible GT or no predictions are
+    omitted. Returns {label: {"confidence", "f1", "tp", "fp", "fn", "gt"}}.
+    """
+    pooled = {label: {"gt": 0, "entries": []} for label in class_labels}
+    for scene in scene_inputs:
+        scene_id = str(scene["scene_id"])
+        for label in class_labels:
+            data = (scene.get("classes") or {}).get(label)
+            if not data:
+                continue
+            pooled[label]["gt"] += len(data["eligible_ids"])
+            for conf, filename, verdict, gid in data["entries"]:
+                pooled[label]["entries"].append(
+                    (float(conf), scene_id, str(filename), verdict,
+                     None if gid is None else int(gid)))
+    out = {}
+    for label in class_labels:
+        total_gt = int(pooled[label]["gt"])
+        entries = pooled[label]["entries"]
+        if total_gt <= 0 or not entries:
+            continue
+        entries.sort(key=lambda e: (-e[0], e[1], e[2]))
+        candidates = sorted({e[0] for e in entries}, reverse=True)
+        best_f1 = -1.0
+        best = None
+        for thr in candidates:
+            tp = 0
+            fp = 0
+            seen = set()
+            for conf, scene_id, filename, verdict, gid in entries:
+                if conf < thr:
+                    break
+                if verdict == "tp":
+                    key = (scene_id, gid)
+                    if key not in seen:
+                        seen.add(key)
+                        tp += 1
+                    else:
+                        fp += 1
+                elif verdict == "fp":
+                    fp += 1
+            fn = total_gt - tp
+            denom = 2 * tp + fp + fn
+            f1 = (2.0 * tp / denom) if denom > 0 else 0.0
+            if f1 > best_f1:
+                best_f1 = f1
+                best = {"confidence": float(thr), "f1": float(f1),
+                        "tp": int(tp), "fp": int(fp), "fn": int(fn),
+                        "gt": int(total_gt)}
+        if best is not None:
+            out[label] = best
+    return out
+
+
+def scene_sweep_inputs(gt_ids, pred_instances, spec, scene_id, overlap_th=THRESHOLD_IOU):
+    """Per-scene matching inputs for global threshold fitting.
+
+    One ``assign_instances_for_scan`` call; returns {"scene_id": str,
+    "classes": {label: _class_match_inputs(...)}} covering every benchmark
+    class with eligible GT or predictions.
+    """
+    evaluator = Evaluator(spec.class_labels, spec.valid_ids)
+    evaluator.add_gt(gt_ids, scene_id)
+    evaluator.add_prediction(pred_instances, scene_id)
+    gt2pred, pred2gt = evaluator.assign_instances_for_scan(scene_id)
+    min_region_size = int(evaluator.min_region_sizes[0])
+    classes = {}
+    for label in spec.class_labels:
+        eligible = _eligible_gt_for_class(gt2pred[label], min_region_size)
+        preds = list(pred2gt[label])
+        if eligible or preds:
+            classes[label] = _class_match_inputs(
+                eligible, preds, overlap_th=overlap_th,
+                min_region_size=min_region_size)
+    return {"scene_id": str(scene_id), "classes": classes}
+
+
+def scene_evaluation_summary(gt_ids, pred_instances, spec, scene_id, overlap_th=THRESHOLD_IOU):
+    """Strict scene AP plus IoU-0.5 verdicts with TP-to-GT identity.
+
+    Reuses one ``assign_instances_for_scan`` call. AP is unthresholded over the
+    full submission. Verdicts and matched GT ids come from the shared
+    ``_match_class_predictions`` helper so they cannot drift from the official
+    assignment. Confidence thresholds are fitted globally (see
+    ``compute_global_thresholds``), never per scene.
+    """
+    import math
+
     evaluator = Evaluator(spec.class_labels, spec.valid_ids)
     evaluator.add_gt(gt_ids, scene_id)
     evaluator.add_prediction(pred_instances, scene_id)
@@ -337,54 +520,68 @@ def scene_instance_summary(gt_ids, pred_instances, spec, scene_id, overlap_th=0.
             return filename[len(prefix):]
         return filename
 
+    matches = {scene_id: {"gt": gt2pred, "pred": pred2gt}}
+    ap_scores = evaluator.evaluate_matches(matches)
+    avgs = evaluator.compute_averages(ap_scores)
+    raw_ap = avgs.get("all_ap")
+    try:
+        scene_ap = float(raw_ap)
+    except (TypeError, ValueError):
+        scene_ap = float("nan")
+    if not math.isfinite(scene_ap):
+        scene_ap = None
+    ap_class_count = 0
+    for label_name in spec.class_labels:
+        try:
+            value = float(avgs["classes"][label_name]["ap"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            ap_class_count += 1
+
     verdicts = {}
-    pred_visited = set()
-    eligible_gt = 0
+    matched_gt = {}
+    eligible_gt_total = 0
+    eligible_gt_by_class = {}
+    sweep = scene_sweep_inputs(
+        gt_ids, pred_instances, spec, scene_id, overlap_th=overlap_th)
     for label in spec.class_labels:
-        gt_instances = [g for g in gt2pred[label]
-                        if g["instance_id"] >= 1000 and g["vert_count"] >= min_region_size]
-        eligible_gt += len(gt_instances)
-        cur_match = [False] * len(gt_instances)
-        cur_score = [-float("inf")] * len(gt_instances)
-        tp_keys = [None] * len(gt_instances)
-        for gti, gt in enumerate(gt_instances):
-            for pred in gt["matched_pred"]:
-                if pred["filename"] in pred_visited:
-                    continue
-                overlap = float(pred["intersection"]) / (
-                    gt["vert_count"] + pred["vert_count"] - pred["intersection"])
-                if overlap > overlap_th:
-                    if cur_match[gti]:
-                        cur_score[gti] = max(cur_score[gti], pred["confidence"])
-                        verdicts[_key(pred["filename"])] = "fp"
-                    else:
-                        cur_match[gti] = True
-                        cur_score[gti] = pred["confidence"]
-                        tp_keys[gti] = _key(pred["filename"])
-                        pred_visited.add(pred["filename"])
-        for gti, matched in enumerate(cur_match):
-            if matched:
-                verdicts[tp_keys[gti]] = "tp"
-        for pred in pred2gt[label]:
-            found_gt = any(
-                float(gt["intersection"]) / (
-                    gt["vert_count"] + pred["vert_count"] - gt["intersection"]) > overlap_th
-                for gt in pred["matched_gt"])
-            if found_gt:
-                continue
-            num_ignore = pred["void_intersection"]
-            for gt in pred["matched_gt"]:
-                if gt["instance_id"] < 1000:
-                    num_ignore += gt["intersection"]
-                if gt["vert_count"] < min_region_size:
-                    num_ignore += gt["intersection"]
-            key = _key(pred["filename"])
-            if float(num_ignore) / pred["vert_count"] <= overlap_th:
-                verdicts[key] = "fp"
-            else:
-                verdicts[key] = "ignored"
+        data = sweep["classes"].get(label)
+        count = len(data["eligible_ids"]) if data else 0
+        eligible_gt_total += count
+        eligible_gt_by_class[label] = int(count)
+        if not data:
+            continue
+        for conf, filename, verdict, gid in data["entries"]:
+            verdicts[_key(filename)] = verdict
+            if verdict == "tp":
+                matched_gt[_key(filename)] = int(gid)
     tp = sum(1 for value in verdicts.values() if value == "tp")
-    return {"verdicts": verdicts, "tp": int(tp), "gt": int(eligible_gt)}
+    return {
+        "verdicts": verdicts,
+        "matched_gt": matched_gt,
+        "tp": int(tp),
+        "gt": int(eligible_gt_total),
+        "eligible_gt_by_class": eligible_gt_by_class,
+        "ap": scene_ap,
+        "ap_class_count": int(ap_class_count),
+    }
+
+
+def scene_instance_summary(gt_ids, pred_instances, spec, scene_id, overlap_th=0.5):
+    """Per-scene verdicts using Evaluator.assign_instances_for_scan.
+
+    Returns {"verdicts": {relative_or_raw_key: "tp"|"fp"|"ignored"}, "tp": int, "gt": int,
+    "matched_gt": {key: gt_instance_id}, "eligible_gt_by_class": {class: count}}.
+    Keys are evaluator filenames with the ``scene_id/`` prefix stripped. Eligible GT
+    counts valid-class instances with instance_id >= 1000 and vert_count >= 100.
+    IoU must be strictly greater than overlap_th (official AP50 uses 0.5).
+    """
+    summary = scene_evaluation_summary(
+        gt_ids, pred_instances, spec, scene_id, overlap_th=overlap_th)
+    return {"verdicts": summary["verdicts"], "matched_gt": summary["matched_gt"],
+            "tp": summary["tp"], "gt": summary["gt"],
+            "eligible_gt_by_class": summary["eligible_gt_by_class"]}
 
 
 def write_result_file(evaluator, avgs, filename):

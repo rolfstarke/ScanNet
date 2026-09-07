@@ -107,35 +107,93 @@ def _draw_left(imgui, payload, height, width, view_start):
     imgui.end()
 
 
-def _draw_class_row(imgui, name, color, stats=None):
+TP_TEXT = (0.10, 0.55, 0.25)
+ERR_LIGHT = (1.0, 0.72, 0.68)
+ERR_DARK = (0.62, 0.08, 0.08)
+
+
+def _err_shade(count, scale):
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        return None
+    if count <= 0:
+        return None
+    t = min(1.0, count / max(1, int(scale)))
+    return tuple(round(l + (d - l) * t, 3) for l, d in zip(ERR_LIGHT, ERR_DARK))
+
+
+def _draw_class_row(imgui, name, color, stats=None, scale=1, track=None,
+                    selected=False):
+    """Text-only class row with a colored [TP/FP/FN] confusion suffix.
+
+    ``stats`` holds {"pred", "gt", "tp", "fp", "fn"}; TP renders green, FP/FN
+    render in a white-to-dark-red shade shared across rows (light red = few
+    errors, dark red = many). ``track`` is an optional {"fitted",
+    "effective", "is_manual"} threshold shown as trailing ``t`` text.
+    """
     draw = imgui.get_window_draw_list()
     x, y = imgui.get_cursor_screen_pos()
-    text = imgui.get_color_u32_rgba(0.08, 0.08, 0.08, 1.0)
+    dark = imgui.get_color_u32_rgba(0.08, 0.08, 0.08, 1.0)
     swatch = imgui.get_color_u32_rgba(*color, 1.0)
     draw.add_rect_filled(x, y + 2, x + 11, y + 13, swatch, 2)
-    label = name
-    if stats and stats.get("gt") is not None:
-        label += f" [{stats.get('pred', 0)}/{stats['gt']}]"
-    draw.add_text(x + 17, y, text, label)
-    if not stats or stats.get("gt") is None:
-        imgui.dummy(315, 17)
-        return
-    bar_x, bar_y, bar_w, bar_h = x + 17, y + 18, 270.0, 6.0
-    scale = max(1, int(stats.get("pred") or 0), int(stats.get("gt") or 0))
-    draw.add_rect_filled(
-        bar_x, bar_y, bar_x + bar_w, bar_y + bar_h,
-        imgui.get_color_u32_rgba(0.88, 0.88, 0.88, 1.0), 1)
-    cursor = bar_x
-    width = max(0.0, min(
-        bar_x + bar_w - cursor,
-        bar_w * max(0, int(stats.get("pred") or 0)) / scale))
-    if width:
-        draw.add_rect_filled(
-            cursor, bar_y, cursor + width, bar_y + bar_h,
-            imgui.get_color_u32_rgba(*color, 1.0), 0)
-    marker_x = min(bar_x + bar_w - 1, bar_x + bar_w * int(stats["gt"]) / scale)
-    draw.add_line(marker_x, bar_y - 3, marker_x, bar_y + bar_h + 3, text, 2.0)
-    imgui.dummy(315, 30)
+    pred = int((stats or {}).get("pred") or 0)
+    gt = None if stats is None else stats.get("gt")
+    head = ("> " if selected else "") + f"{name}  P {pred}  "
+    head += f"G {int(gt)}  [" if gt is not None else "G -"
+    cx = x + 17
+    for text, rgb in _row_segments(head, stats, scale):
+        draw.add_text(cx, y, imgui.get_color_u32_rgba(*rgb, 1.0), text)
+        try:
+            cx += imgui.calc_text_size(text).x
+        except Exception:
+            cx += 8.0 * len(text)
+    tail = ""
+    if track is not None:
+        eff = track.get("effective")
+        if eff is not None:
+            tail = f"  t {float(eff):.2f}{'*' if track.get('is_manual') else ''}"
+        else:
+            tail = "  t n/a"
+    if tail:
+        draw.add_text(cx, y, dark, tail)
+    imgui.dummy(315, 17)
+
+
+def _row_segments(head, stats, scale):
+    """(text, rgb) segments for one class row."""
+    dark = (0.08, 0.08, 0.08)
+    segments = [(head, dark)]
+    if stats is None or stats.get("gt") is None:
+        return segments
+    try:
+        tp = int(stats.get("tp") or 0)
+    except (TypeError, ValueError):
+        tp = 0
+    segments.append((f"TP {tp}", TP_TEXT if tp else dark))
+    segments.append((" / ", dark))
+    try:
+        fp = int(stats.get("fp") or 0)
+    except (TypeError, ValueError):
+        fp = 0
+    segments.append((f"FP {fp}", _err_shade(fp, scale) or dark))
+    segments.append((" / ", dark))
+    fn = stats.get("fn")
+    try:
+        fn = int(fn)
+    except (TypeError, ValueError):
+        fn = None
+    if fn is None:
+        segments.append(("FN -", dark))
+    else:
+        segments.append((f"FN {fn}", _err_shade(fn, scale) or dark))
+    segments.append(("]", dark))
+    return segments
+
+
+def _draw_threshold_track(imgui, track):
+    # Retained for API compatibility; the track is now trailing text.
+    return
 
 
 def _draw_setting_row(imgui, row, width, settings_focus):
@@ -146,8 +204,7 @@ def _draw_setting_row(imgui, row, width, settings_focus):
     first = True
     max_x = x + width - 12
     for opt in row.get("options") or []:
-        if not opt.get("enabled", True) or opt.get("kind") == "disabled":
-            continue
+        disabled = not opt.get("enabled", True)
         token = opt["text"] if first else f" | {opt['text']}"
         tw = imgui.calc_text_size(token).x
         cx, cy = imgui.get_cursor_screen_pos()
@@ -161,11 +218,15 @@ def _draw_setting_row(imgui, row, width, settings_focus):
             imgui.same_line()
             cx, cy = imgui.get_cursor_screen_pos()
         first = False
-        if opt.get("sel") and focused:
+        if opt.get("sel") and focused and not disabled:
             draw.add_rect(cx - 3, cy - 2, cx + tw + 3, cy + 16,
                           imgui.get_color_u32_rgba(0.08, 0.08, 0.08, 1.0))
         active = opt.get("kind") in ("applied", "pending")
-        if active:
+        if disabled:
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.70, 0.70, 0.70, 1.0)
+            imgui.text(token)
+            imgui.pop_style_color()
+        elif active:
             imgui.text(token)
         else:
             imgui.push_style_color(imgui.COLOR_TEXT, 0.55, 0.55, 0.55, 1.0)
@@ -202,6 +263,13 @@ def _draw_query_block(imgui, payload, hud_state, keys_out):
     if not can_search:
         return
     imgui.text("Query")
+    prompt = query.get("input") or ""
+    if mode != "off" and prompt:
+        try:
+            count = int(query.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        imgui.text(f"'{prompt}'  {count} masks")
     if query.get("status"):
         imgui.text(query["status"])
     results = query.get("results") or []
@@ -277,6 +345,20 @@ def _draw_pipeline_block(imgui, payload):
     imgui.separator()
 
 
+def _filter_status_line(payload):
+    filt = payload.get("filter") or {}
+    mode = filt.get("mode", "off")
+    if mode != "on":
+        reason = filt.get("reason") or ""
+        return f"Filter: Off ({reason})" if reason else "Filter: Off"
+    if filt.get("paused_by_query"):
+        return "Filter: On (paused by Query)"
+    if not filt.get("active"):
+        reason = filt.get("reason") or "unavailable"
+        return f"Filter: On ({reason})"
+    return "Filter: On"
+
+
 def _draw_right(imgui, payload, height, width, overlay=None, hud_state=None, keys_out=None):
     interactive = not payload.get("cad_overlay")
     flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
@@ -313,27 +395,39 @@ def _draw_right(imgui, payload, height, width, overlay=None, hud_state=None, key
         prediction = format_elapsed(info.get("prediction_s"))
         if prediction:
             imgui.text(f"Prediction {prediction}")
-        ap_line = (
-            f"AP {format_metric(info.get('ap'))} · "
-            f"AP50 {format_metric(info.get('ap50'))} · "
-            f"AP25 {format_metric(info.get('ap25'))}")
-        imgui.text(ap_line)
-        if info.get("masks_pred") is not None:
-            gt_txt = "-" if info.get("masks_gt") is None else str(info["masks_gt"])
-            tp_txt = "-" if info.get("tp") is None else str(info["tp"])
-            fp_txt = "-" if info.get("fp") is None else str(info["fp"])
-            line = (f"Masks [{info['masks_pred']}/{gt_txt}] · "
-                    f"TP {tp_txt} · FP {fp_txt}")
-            if info.get("ignored") is not None:
-                line += f" · ignored {info['ignored']}"
-            imgui.text(line)
+        scene_ap = info.get("scene_ap")
+        scene_classes = info.get("scene_ap_classes")
+        if scene_ap is None:
+            imgui.text("Scene AP -")
         else:
-            tp, gt, fp = info.get("tp"), info.get("gt"), info.get("fp")
-            if tp is None or gt is None:
-                imgui.text("TP/GT -")
+            try:
+                n = int(scene_classes)
+            except (TypeError, ValueError):
+                n = 0
+            imgui.text(f"Scene AP {format_metric(scene_ap)} ({n} evaluated classes)")
+        run_ap = info.get("run_ap")
+        run_classes = info.get("run_ap_classes")
+        run_scenes = info.get("run_scenes")
+        if run_ap is None:
+            imgui.text("Run AP -")
+        else:
+            try:
+                rn = int(run_scenes) if run_scenes is not None else None
+            except (TypeError, ValueError):
+                rn = None
+            try:
+                rc = int(run_classes) if run_classes is not None else None
+            except (TypeError, ValueError):
+                rc = None
+            if rn is not None and rc is not None:
+                imgui.text(f"Run AP {format_metric(run_ap)} ({rn} scenes, {rc} evaluated classes)")
             else:
-                fp_text = "-" if fp is None else str(fp)
-                imgui.text(f"TP/GT {tp}/{gt} · FP {fp_text}")
+                imgui.text(f"Run AP {format_metric(run_ap)}")
+        visible = info.get("visible_pred")
+        eligible = info.get("eligible_gt")
+        visible_txt = "-" if visible is None else str(visible)
+        eligible_txt = "-" if eligible is None else str(eligible)
+        imgui.text(f"Visible predictions {visible_txt} | Eligible GT {eligible_txt}")
     imgui.separator()
 
     imgui.text("Settings")
@@ -350,17 +444,54 @@ def _draw_right(imgui, payload, height, width, overlay=None, hud_state=None, key
     elif panel == "pipeline":
         _draw_pipeline_block(imgui, payload)
     else:
-        imgui.text("Classes")
+        imgui.text(_filter_status_line(payload))
+        if payload.get("color_mode") == "tp_fn":
+            imgui.text("TP green | FP dark red | FN light red")
+        query = payload.get("query") or {}
+        query_mode = query.get("mode") or "off"
+        if query_mode in ("search", "image"):
+            prompt = query.get("input") or ""
+            try:
+                count = int(query.get("count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            imgui.text(f"Query '{prompt}'  P {count}  G -")
+            if query.get("status"):
+                imgui.text(query["status"])
+            imgui.end()
+            return
+        imgui.text("Classes   P prediction   G eligible GT   [TP green / errors red]")
         classes = payload.get("classes") or []
         if classes:
             class_stats = payload.get("class_stats") or {}
-            if class_stats:
-                imgui.text("[Pred/GT]   class color = predicted   | GT")
-            imgui.columns(2, "class_columns", border=False)
+            filt = payload.get("filter") or {}
+            rows = {row.get("name"): row for row in filt.get("rows") or []}
+            selected = filt.get("selected")
+            scale = 1
             for name in classes:
-                _draw_class_row(imgui, name, payload["colors"][name], class_stats.get(name))
-                imgui.next_column()
-            imgui.columns(1)
+                stats = class_stats.get(name)
+                if stats is not None:
+                    for key in ("fp", "fn"):
+                        try:
+                            value = int(stats.get(key) or 0)
+                        except (TypeError, ValueError):
+                            value = 0
+                        scale = max(scale, value)
+            for name in classes:
+                row = rows.get(name) or {}
+                track = None
+                if filt.get("mode") == "on":
+                    track = {
+                        "fitted": row.get("fitted"),
+                        "effective": row.get("effective")
+                        if row.get("is_fitted") or row.get("is_manual") else None,
+                        "is_manual": bool(row.get("is_manual")),
+                    }
+                _draw_class_row(imgui, name, payload["colors"][name],
+                                class_stats.get(name), scale, track,
+                                selected=(selected is not None and name == selected))
+            if filt.get("mode") == "on" and not filt.get("paused_by_query"):
+                imgui.text("Up/Down select, Left/Right adjust, Enter reset")
     imgui.end()
 
 

@@ -2,7 +2,7 @@
 
 ## Project Goal
 
-Integrate open-vocabulary 3D instance segmentation models (Mosaic3D, OpenIns3D, OpenYOLO3D, Open3DIS, OpenMask3D) into the ScanNet repository structure, run them on a fixed 16-scene audit-focused official ScanNet validation set, and evaluate them with ScanNet's own benchmark protocol — 18-class NYU40 and ScanNet200 (198-class instance protocol). Comparable ranking uses ScanNet200 mean AP (IoU 0.50:0.95), with AP50 as tie-break. ScanNet itself must remain fully intact and operable.
+Integrate open-vocabulary 3D instance segmentation models (Mosaic3D, OpenIns3D, OpenYOLO3D, Open3DIS, OpenMask3D) into the ScanNet repository structure, run them on a fixed 16-scene audit-focused official ScanNet validation set, and evaluate them with ScanNet's own benchmark protocol — 18-class NYU40 and ScanNet200 (198-class instance protocol). Comparable ranking uses ScanNet200 mean AP (IoU 0.50:0.95), AP only. ScanNet itself must remain fully intact and operable.
 
 Second goal: turn ZED X `.svo2` recordings into byte-format-identical ScanNet v2 scans (`.sens`, `<id>.txt`, `_vh_clean*.ply`, `.segs.json`) under custom ids `scene90NN_MM` (9000-range = custom; tens digit = engine, units digit = run), so ScanNet's own tooling works on them unchanged. Scene9004 geometry quality is scored against CAD with mean bidirectional nearest-neighbour distance cm (`geometry_score.py`; lower better). CAD stays fixed; a temporary rigid recon→CAD transform is applied in memory only for scoring/views.
 
@@ -31,27 +31,34 @@ spellbook/
 ├── download_scans.py            # official v1/v2 restore: bounded parallelism, resume, size verification
 ├── environment.yaml             # 3disspellbook conda env (ZED SDK activation sets ZED_DIR/LD_LIBRARY_PATH)
 ├── PROJECT_STATUS.md            # this file
-├── tests/                        # headless visualizer + mask-cache + prediction-score + run-registry helpers
+├── tests/                        # headless visualizer + SceneWidget backend + mask-cache + prediction-score + run-registry helpers (216 OK)
 ├── tmp/                          # active scripts only (README); executed plans → archive/
 ├── evaluation/
 │   ├── benchmark.py             # BenchmarkSpec, PREDICTION_EVALUATION_SCENES (16 official val scans), PREDICTION_METHODS
-│   ├── evaluate.py              # GT export, run.json-scoped staging evaluator, score-sidecars CLI, TP/GT sidecars
-│   ├── runs.py                  # run.json manifests, AP-first ranking, dry-run prediction prune
+│   ├── evaluate.py              # GT export, run.json-scoped staging evaluator, score-sidecars CLI, AP + F1 sidecars
+│   ├── runs.py                  # run.json manifests, AP-only ranking, dry-run prediction prune
+│   ├── comparison.py            # offline comparison dashboard data + HTML renderer (`main.py --compare`)
 │   └── scannet200_evaluator.py  # Python-3 port of Rozenberszki ScanNet200 evaluator (198-class)
 ├── utils/
 │   ├── gpu.py                   # cross-process GPU leases (flock per pool index, pass_fds forwarding)
 │   ├── scan_lock.py             # frames / scene-engine / per-scan / prediction-index / per-method flock locks
-│   ├── visualize.py             # Open3D viewer + scene/scan/method/run tree (best comparable run = AP then AP50)
+│   ├── visualize.py             # Open3D SceneWidget viewer + scene/scan/method/run tree (best comparable run = AP only)
+│   ├── scene_widget.py          # SceneWidget backend: window/registry/materials/Label3D handles (open3d==0.19.0)
 │   ├── prediction_masks.py      # packed uint8 mask cache under derived/visualization/masks
 │   ├── compute_time.py          # reconstruction/prediction elapsed sidecars for the right HUD
-│   └── hud.py                   # left tree + right Information/Settings/Classes (CAD overlay)
+│   ├── query.py                 # hash-bound .clip.npz + physical-GPU-0 CLIP worker/client
+│   ├── camera_replay.py         # frame discovery, frustum pyramid, RAM cache pump, transport, playback
+│   ├── replay2d.py              # per-method 2D-stage Replay adapters (frames/fetch/close)
+│   ├── detect_replay.py         # warm detector worker client + box/mask drawing
+│   └── hud.py                   # left tree + right Information/Settings/Query/replay video (CAD overlay)
 └── predict/
     ├── runner.py                # one-method dispatch over gpu_pool; official classes only; Open3DIS serialized
     ├── frames.py                # .sens extraction via ScanNet's SensorData exporters (0..N-1), idempotent
     └── models/
-        ├── common.py            # decimate(), generation-safe write_scannet_submission, --run-id/--parameters-json
-        ├── _mosaic3d_run.py     # point-cloud only
+        ├── common.py            # decimate(), generation-safe write_scannet_submission_rows, --run-id/--parameters-json/--features-out
+        ├── _mosaic3d_run.py     # point-cloud only; Recap-CLIP instance features
         ├── _openins3d_run.py    # point-cloud only
+        ├── _openins3d_query.py  # Lookup-only child over cached Snap images + final masks
         ├── _openyolo3d_run.py   # needs frames
         ├── _open3dis_run.py     # needs frames; method lock before GPU lease
         └── _openmask3d_run.py   # needs frames; scratch isolated from submission root
@@ -90,7 +97,6 @@ Main checkout on `master`, plus plugin-owned linked worktrees under
 - `debug/prediction-{mosaic3d,openins3d,openyolo3d,open3dis,openmask3d}` — one method each,
   forked from the shared prediction base on `master`; tmux windows 8–12, session titles
   `mosaic3d` / `openins3d` / `openyolo3d` / `open3dis` / `openmask3d`.
-- `debug/visualizer` — visualizer feature work; tmux `hoenecker` window 14, session title `visualizer`.
 
 Shared prediction/evaluation core lands on `master` first. Method branches own only wrapper
 and method-specific changes. Reconstruction branches stay independent and are not reset by
@@ -116,7 +122,8 @@ prediction work.
 │   ├── ground_truth/<Benchmark>/<scene>.txt
 │   ├── evaluations/<Benchmark>/
 │   │   ├── ranking.csv                      # derived AP/AP50/AP25 table from run.json + CSVs
-│   │   └── <run-id>/                        # run.json, result CSVs, <model>.tasks, <model>/<scene>.tp50.json + .timing.json
+│   │   └── <run-id>/                        # run.json, result CSVs, <model>.tasks, <model>/<scene>.tp50.json + .timing.json + .clip.npz
+│   ├── evaluations/comparison.html          # offline dashboard via `main.py --compare` (predictions + reconstructions + custom scans)
 │   ├── reconstruction/frames/sceneNNNN/frames/   # shared SVO frame pools
 │   ├── visualization/masks/<Benchmark>/<run-id>/<model>/<scene>.npz  # disposable packed 0/1 caches
 │   └── locks/{gpus,reconstruction,scans}/  # GPU + scan/frame flock leases
@@ -178,7 +185,7 @@ Zed/open3d are local-pose baselines; multiroom drift and density remain tracked 
 5. **Benchmark protocol**: `settings.yaml` selects the default backend (ScanNet20 = official evaluator ported in place to Python 3; ScanNet200 = port of the benchmark author's evaluator, since ScanNet/ScanNet publishes no ScanNet200 instance evaluator). Comparable prediction always passes `--benchmark ScanNet200`, omits `--scene` (full 16-scene tuple) and rejects `--classes`. The audit-focused set covers 52/54 target classes across 11 room types and 16 physical scenes; all 25,734 `.sens` frames, canonical files, and both GT variants are locally verified.
 
    Active tuple: `scene0046_00`, `scene0084_01`, `scene0086_01`, `scene0100_02`, `scene0164_00`, `scene0207_02`, `scene0221_00`, `scene0251_00`, `scene0307_00`, `scene0334_00`, `scene0357_00`, `scene0535_00`, `scene0618_00`, `scene0644_00`, `scene0678_01`, `scene0699_00`.
-6. **GPU scheduling (automatic)**: `settings.yaml gpu_pool` (`[1,2,3,4]`) is the only managed GPU list; `utils/gpu.py` leases a pool GPU via persistent `flock` lock files under `<scannet_root>/derived/locks/gpus/`, held for the whole task (descriptor forwarded to GPU children with `pass_fds`, kernel-released on crash). **Physical GPU 0 is user-reserved — Spellbook never locks, selects, or initializes it.** No manual `--gpu` exists anywhere; Open3D's legacy TSDF is CPU-only and takes no lease. Custom SVO frame extraction uses the same pool via `--extract-frames`. The ZED reconstruction engine remains blocked until remapping is validated (#29).
+6. **GPU scheduling (automatic)**: `settings.yaml gpu_pool` (`[1,2,3,4]`) is the only managed GPU list; `utils/gpu.py` leases a pool GPU via persistent `flock` lock files under `<scannet_root>/derived/locks/gpus/`, held for the whole task (descriptor forwarded to GPU children with `pass_fds`, kernel-released on crash). **Physical GPU 0 is excluded from managed prediction/reconstruction workloads.** The visualizer's explicitly requested interactive workers are the sole exception: the Query encoder worker and the Replay 2D workers each select physical GPU 0 directly and take no lease. No manual `--gpu` exists; Open3D's legacy TSDF is CPU-only and takes no lease. Custom SVO frame extraction uses the same pool via `--extract-frames`. The ZED reconstruction engine remains blocked until remapping is validated (#29).
 7. **Adapter metadata**: each engine adapter declares `GPU_POLICY` (`managed`/`cpu`/`blocked`), `SERIAL`, `preflight()` (runtime presence check) and `gpu_check()` (native distribution probe); `batch.py` and `--gpu-check` consume these instead of duplicated constants.
 8. **Evaluation**: flat per-vertex GT encoding via `evaluate.py export-gt` (ScanNet's own export tool is inconsistent with its evaluator, see #8); evaluators ported to Python 3 with edge-case fix (#8); `evaluate.py evaluate` dispatches per benchmark with pre-flight validation (#11).
 9. **Custom scan ids**: `scene90NN_MM` (9000-range unused by ScanNet v2); tens digit = engine, units digit = run 0-9 (scene9004 keeps ten slots per engine with highest-`mean_bidirectional_distance_cm` eviction; other scenes replace run 0). SVO discovery by filename (`custom/raw/scene<NNNN>.svo2`).
@@ -190,8 +197,8 @@ Zed/open3d are local-pose baselines; multiroom drift and density remain tracked 
 15. **Custom SVO frame extraction**: main checkout only via `--extract-frames`; multi-GPU leases on pool 1-4; `sdk_gpu_id` never set; scene9004 frames are promoted from the existing complete set, not re-extracted. Worktrees consume the shared pool read-only. Official `.sens` prediction frames instead use the idempotent CPU `predict.frames.extract_frames()` path and are extracted automatically by frame-dependent prediction models.
 16. **Foreign-environment imports**: model subprocesses load `spellbook/evaluation/benchmark.py` by absolute `importlib` spec. Adding `spellbook/` to `sys.path` shadows model repositories' top-level packages such as OpenIns3D's `utils`.
 17. **Worktrees (convention)**: one `debug/reconstruction-<engine>` tree per engine and one `debug/prediction-<method>` tree per prediction method. Shared core stays on `master`. Each reconstruction branch may touch only its engine; each prediction branch may touch only its wrapper. The worktree plugin forks a session and launches a TUI from the tree; relocate via the control-plane move API (`moveChanges=false`), rename to the bare method/engine title, then relaunch. `worktree_delete` works only from the creating session, one tree at a time.
-18. **Prediction run registry**: each run writes `derived/evaluations/<Benchmark>/<run-id>/run.json` before GPU work (one method, protocol scenes, provenance). Ranking default is AP then AP50, and comparable ScanNet200 ranks require the exact current 16-scene tuple. Historical official-val manifests remain loadable but are automatically non-comparable. Run IDs are permanent; evaluated runs are immutable (`evaluate` refuses to replace an existing CSV). TP/GT sidecars bind to prediction-index and GT hashes. Method-improvement losers keep `run.json`, CSVs, tasks, and per-scene TP/GT sidecars and drop only heavy prediction artifacts (`runs.py prune`, dry-run default). Open3DIS scene tasks take a method lock before the GPU lease (#15).
-19. **Visualizer**: four-level tree `scene → scan → method → run`. Method default prefers a comparable 16-scene ScanNet200 run, then AP, then AP50; unlabeled fallback if none is comparable. Mode is Ground truth / Scene only / Prediction; Color is Classes / Instances / TP/GT. Scan Enter is scene-only; method/run Enter loads that prediction. Tree TP/GT and the right Information block read `.tp50.json` sidecars plus evaluator CSVs; TP/GT coloring is one overlay with TP green over FP red (#38). Official prediction text stays immutable; the viewer may write disposable packed mask caches under `derived/visualization/masks/` and builds boxes/labels only when Boxes is On. Reconstruction and prediction elapsed times come from `recon/timing.json` and `<scene>.timing.json`; missing files hide the HUD lines.
+18. **Prediction run registry**: each run writes `derived/evaluations/<Benchmark>/<run-id>/run.json` before GPU work (one method, protocol scenes, provenance). Ranking default is AP only, and comparable ScanNet200 ranks require the exact current 16-scene tuple. Historical official-val manifests remain loadable but are automatically non-comparable. Run IDs are permanent; evaluated runs are immutable (`evaluate` refuses to replace an existing CSV). AP sidecars bind to prediction-index and GT hashes. Method-improvement losers keep `run.json`, CSVs, tasks, and per-scene AP sidecars and drop only heavy prediction artifacts (`runs.py prune`, dry-run default). Open3DIS scene tasks take a method lock before the GPU lease (#15).
+19. **Visualizer**: four-level tree `scene → scan → method → run`. Method default prefers a comparable 16-scene ScanNet200 run, then AP; unlabeled fallback if none is comparable. Mode is Ground truth / Scene only / Prediction; Color is Classes / Instances / TP/FP/FN (TP green, FP dark red, FN light red light-red GT overlay). Settings also include Boxes, Labels (`Off/Small/Large` screen-space Label3D via SceneWidget, independent of Boxes), Query (`Off/Search/Image`), Filter (`Off/On`, paused while Query is active), and a single View setting (`Classes/Pipeline/Path/Replay`, exclusive bottom-right content; entering Replay prefetches the whole video into RAM behind a progress bar and starts playback only when every frame is cached; transport is Back / Pause-Play / Forward, arrow-selected and Enter-confirmed like the rest of navigation); unavailable options are hidden. Camera Replay is the method's own 2D stage: OpenYOLO3D replays live YOLO-World boxes on every 10th frame via a warm GPU-0 worker, Open3DIS replays cached Grounded-SAM masks instantly with no GPU, OpenIns3D/OpenMask3D adapters are deferred, and Mosaic3D has Replay disabled (no 2D stage). Search/Image opens a focused keyboard prompt, submits on Enter, closes, and returns focus to Settings. Scan Enter is scene-only; method/run Enter loads that prediction. Navigator and Information read schema-4 `.tp50.json` sidecars plus evaluator CSVs; navigator shows strict scene AP with evaluated-class count, Information shows Scene AP, Run AP, Visible predictions, and Eligible GT. Filter On keeps only prediction classes with eligible scene GT above the run/model/class micro-F1 threshold fitted over the run's available protocol scenes (`thresholds.f1.json`, population + manifest + sidecar hash-bound; missing/stale disables On with a visible reason); manual edits are process-local, selected with Up/Down and adjusted with Left/Right (±0.01, Enter restores fitted). Classes show `P G [TP green / FP red / FN red]` with error counts shaded light-to-dark red by the shared per-scene error scale. Query ranks existing proposal masks, applies the prompt as label, colors results with a min-max normalized plasma heatmap, and shows `P N  G -`; empty results render nothing with an explicit No-matches status. Geometry, counts, class rows, and panels derive from one view snapshot per state revision. The viewer keeps the official submission unchanged; AP stays the official unthresholded score. Every successful prediction run now auto-exports missing ground truth and evaluates itself (warn-only on failure). Center renderer is `gui.SceneWidget` backend + per-instance `Label3D` labels (`spellbook/utils/scene_widget.py`, `open3d==0.19.0`), replacing frozen mesh text.
 
 ---
 
@@ -214,7 +221,7 @@ python spellbook/evaluation/evaluate.py export-gt --scene 0046_00 --benchmark Sc
 python spellbook/evaluation/evaluate.py evaluate --benchmark ScanNet200 \
     --run-id baseline16-mosaic3d --models mosaic3d
 
-# TP/GT sidecars for existing predictions (visualizer tree counts)
+# AP sidecars + pooled global F1 thresholds (visualizer navigator + Filter)
 python spellbook/evaluation/evaluate.py score-sidecars --benchmark ScanNet200 \
     --run-id baseline16-mosaic3d --models mosaic3d --scenes 0046_00 --missing-only
 

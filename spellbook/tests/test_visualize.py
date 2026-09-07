@@ -16,24 +16,31 @@ from utils.hud import (  # noqa: E402
     _draw_class_row, _draw_pipeline_block, _draw_replay_block, _draw_right,
     ellipsize, format_metric)
 from utils.visualize import (  # noqa: E402
-    COLOR_CLASS, COLOR_TPGT, FOCUS_REPLAY, FOCUS_SETTINGS, FOCUS_TREE,
+    COLOR_CLASS, COLOR_TPFN, FILTER_OFF, FILTER_ON, FOCUS_REPLAY, FOCUS_SETTINGS, FOCUS_TREE,
     KEY_DOWN, KEY_ENTER,
     KEY_LEFT, KEY_RIGHT, KEY_TAB, KEY_UP, KIND_METHOD, KIND_RUN, KIND_SCAN,
-    MODEL_PIPELINE, SETTING_ROWS, SOURCE_GT, SOURCE_PRED, SOURCE_SCENE,
-    _place_label, apply_prediction_labels,
-    best_prediction, cad_report_png, capped_geometry,
-    class_count_stats, clamp_cursor, clear_tracked, collect_tp_scores,
+    LABEL_SCALE, MODEL_PIPELINE, SETTING_ROWS, SOURCE_GT, SOURCE_PRED, SOURCE_SCENE,
+    THRESHOLDS_OFF, THRESHOLDS_ON,
+    aabb_edges, apply_prediction_labels,
+    best_prediction, box_lineset, build_threshold_rows, cad_report_png, capped_geometry,
+    class_count_stats, clamp_cursor, clear_tracked, collect_scene_scores,
+    collect_tp_scores,
     colorize_detections, colorize_masks,
-    discover_reconstructions, eligible_gt_counts,
-    ensure_object_decorations,
-    flatten_tree, group_scenes, handle_navigation, handle_replay,
+    discover_reconstructions, effective_threshold, eligible_gt_counts,
+    ensure_object_box, ensure_object_decorations, fitted_thresholds,
+    filter_survives, derive_keep_indices, flatten_tree, group_scenes,
+    handle_navigation, handle_replay, handle_settings, apply_query_result,
+    normalize_query_scores,
     index_predictions,
     instance_color,
     collect_prediction_times, collect_reconstruction_times, information_payload,
-    load_cad_accuracy, merge_tp_gt_overlay, method_node_id,
-    object_bounds, prediction_artifact_mtime, render_object_fields,
-    require_scene, run_node_id, scan_node_id,
-    scene_node_id, settings_payload,
+    label_scale, label_text,
+    load_cad_accuracy, merge_tp_fn_overlay, merge_tp_gt_overlay, method_node_id,
+    object_bounds, prediction_artifact_mtime, remove_label_handle, render_object_fields,
+    require_scene, run_node_id, scan_node_id, scene_ap_text, eligible_gt_id_masks,
+    unmatched_gt_ids,
+    scene_node_id, settings_payload, sync_label, threshold_survives,
+    union_prediction_classes,
 )
 
 
@@ -147,28 +154,29 @@ class TreeTests(unittest.TestCase):
         pid = run_node_id("scene9004_10", pred)
         rows = flatten_tree(
             self.groups, {"scene0568_00": [], "scene9004_10": self.pred["scene0568_00"]},
-            expanded, {"scene9004_10": 21.876}, {pid: {"tp": 3, "gt": 57}},
+            expanded, {"scene9004_10": 21.876},
+            {pid: {"tp": 3, "gt": 57, "ap": 0.271, "ap_class_count": 5}},
             benchmark="ScanNet200")
         scan = next(r for r in rows if r["id"] == scan_node_id("scene9004_10"))
         self.assertEqual(scan["suffix"], "CAD acc 21.88 cm")
         method = next(r for r in rows if r["kind"] == KIND_METHOD and r["label"] == "mosaic3d")
-        self.assertEqual(method["suffix"], "TP/GT 3/57")
+        self.assertEqual(method["suffix"], "AP 0.271 (5 classes)")
         run = next(r for r in rows if r["kind"] == KIND_RUN)
-        self.assertEqual(run["suffix"], "TP/GT 3/57")
+        self.assertEqual(run["suffix"], "AP 0.271 (5 classes)")
 
-    def test_best_prediction_prefers_ap_then_ap50(self):
+    def test_best_prediction_prefers_ap_only(self):
         leaves = [
             {"model": "mosaic3d", "run_id": "old", "label_set": "ScanNet200", "mtime": 9},
             {"model": "mosaic3d", "run_id": "new", "label_set": "ScanNet200", "mtime": 1},
         ]
         metrics = {
-            ("ScanNet200", "old", "mosaic3d"): {"ap": 0.20, "ap50": 0.90},
-            ("ScanNet200", "new", "mosaic3d"): {"ap": 0.21, "ap50": 0.10},
+            ("ScanNet200", "old", "mosaic3d"): {"ap": 0.20},
+            ("ScanNet200", "new", "mosaic3d"): {"ap": 0.21},
         }
         self.assertEqual(best_prediction(leaves, metrics)["run_id"], "new")
         tied = {
-            ("ScanNet200", "old", "mosaic3d"): {"ap": 0.20, "ap50": 0.10},
-            ("ScanNet200", "new", "mosaic3d"): {"ap": 0.20, "ap50": 0.80},
+            ("ScanNet200", "old", "mosaic3d"): {"ap": 0.20},
+            ("ScanNet200", "new", "mosaic3d"): {"ap": 0.20},
         }
         self.assertEqual(best_prediction(leaves, tied)["run_id"], "new")
         self.assertEqual(best_prediction(leaves, {})["run_id"], "old")
@@ -207,7 +215,7 @@ class NavigationTests(unittest.TestCase):
             ],
             "color": [
                 {"value": COLOR_CLASS}, {"value": "instance"},
-                {"value": COLOR_TPGT, "enabled": False},
+                {"value": COLOR_TPFN, "enabled": False},
             ],
             "geometry": [{"value": "mesh"}, {"value": "pointcloud"}],
             "boxes": [{"value": True}, {"value": False}],
@@ -349,16 +357,21 @@ class NavigationTests(unittest.TestCase):
         ]
         rows = settings_payload(self.state, options, lambda _r, v: str(v))
         query = next(row for row in rows if row["key"] == "query")
-        self.assertEqual([opt["text"] for opt in query["options"]], ["off", "search"])
+        self.assertEqual([opt["text"] for opt in query["options"]],
+                         ["off", "search", "image"])
+        self.assertFalse(query["options"][2]["enabled"])
 
     def test_cad_row_hidden_without_png(self):
         rows = settings_payload(self.state, self.options, lambda _r, v: str(v))
         self.assertFalse(any(row["key"] == "cad" for row in rows))
         mode = next(row for row in rows if row["key"] == "mode")
         self.assertEqual([opt["text"] for opt in mode["options"]],
-                         [SOURCE_GT, SOURCE_SCENE])
+                         [SOURCE_GT, SOURCE_SCENE, SOURCE_PRED])
+        self.assertFalse(mode["options"][2]["enabled"])
         color = next(row for row in rows if row["key"] == "color")
-        self.assertFalse(any(opt["text"] == COLOR_TPGT for opt in color["options"]))
+        tpfn = [opt for opt in color["options"] if opt["text"] == COLOR_TPFN]
+        self.assertEqual(len(tpfn), 1)
+        self.assertFalse(tpfn[0]["enabled"])
 
 
 class CadPngTests(unittest.TestCase):
@@ -371,21 +384,25 @@ class CadPngTests(unittest.TestCase):
 
 
 class GeometryHelperTests(unittest.TestCase):
-    def test_box_cleanup_removes_untracked(self):
-        class Dummy:
+    def test_name_cleanup_removes_registered(self):
+        class FakeBackend:
             def __init__(self):
+                self.names = {"object/1/0": object(), "box/1/0": object()}
                 self.removed = []
 
-            def remove_geometry(self, geom, reset_bounding_box=False):
-                self.removed.append(geom)
+            def remove(self, name):
+                self.removed.append(name)
+                self.names.pop(name, None)
 
-        old_box, new_box = object(), object()
-        displayed = {"boxes": {old_box}}
-        vis = Dummy()
-        clear_tracked(vis, displayed, "boxes")
-        self.assertEqual(vis.removed, [old_box])
-        self.assertEqual(displayed["boxes"], set())
-        self.assertIsNot(new_box, old_box)
+        backend = FakeBackend()
+        names = {"object/1/0", "box/1/0"}
+        clear_tracked(backend, names)
+        self.assertEqual(names, set())
+        self.assertEqual(sorted(backend.removed),
+                         ["box/1/0", "object/1/0"])
+        # idempotent: clearing an empty set makes no backend calls
+        clear_tracked(backend, names)
+        self.assertEqual(len(backend.removed), 2)
 
 
 class CadReportTests(unittest.TestCase):
@@ -446,31 +463,41 @@ class SidecarTreeTests(unittest.TestCase):
             path = os.path.join(root, "derived", "evaluations", "ScanNet20",
                                 "run-a", "mosaic3d", "scene0568_00.tp50.json")
             write_score_sidecar(path, {
-                "schema": 2, "metric": "scannet_instance_ap50", "iou_threshold": 0.5,
+                "schema": 4, "metric": "scannet_instance_ap50", "iou_threshold": 0.5,
                 "min_region_size": 100, "scene_id": "scene0568_00", "label_set": "ScanNet20",
-                "run_id": "run-a", "model": "mosaic3d", "tp": 3, "gt": 57, "verdicts": {},
+                "run_id": "run-a", "model": "mosaic3d", "tp": 3, "gt": 3, "verdicts": {
+                    "a.txt": "tp", "b.txt": "tp", "c.txt": "tp"},
+                "matched_gt": {"a.txt": 3001, "b.txt": 3002, "c.txt": 3003},
+                "eligible_gt_by_class": {
+                    "cabinet": 0, "bed": 0, "chair": 0, "sofa": 3, "table": 0,
+                    "door": 0, "window": 0, "bookshelf": 0, "picture": 0,
+                    "counter": 0, "desk": 0, "curtain": 0, "refrigerator": 0,
+                    "shower curtain": 0, "toilet": 0, "sink": 0, "bathtub": 0,
+                    "otherfurniture": 0},
                 "index_sha256": "a" * 64, "gt_sha256": "b" * 64,
+                "ap": 0.271, "ap_class_count": 5,
             })
-            scores = collect_tp_scores(root, {"scene0568_00": [pred]})
-            self.assertEqual(scores[run_node_id("scene0568_00", pred)]["tp"], 3)
+            scores = collect_scene_scores(root, {"scene0568_00": [pred]})
+            key = run_node_id("scene0568_00", pred)
+            self.assertEqual(scores[key]["tp"], 3)
+            self.assertEqual(scores[key]["ap"], 0.271)
+            self.assertEqual(scene_ap_text(scores[key]), "AP 0.271 (5 classes)")
 
 
 class HudHelperTests(unittest.TestCase):
-    def test_class_row_draws_pred_gt_bar(self):
+    def test_class_row_confusion_suffix_colors(self):
         class FakeDraw:
             def __init__(self):
                 self.texts = []
-                self.rects = []
-                self.lines = []
 
             def add_text(self, *args):
-                self.texts.append(args[-1])
+                self.texts.append((args[-2], args[-1]))
 
             def add_rect_filled(self, *args):
-                self.rects.append(args)
+                pass
 
             def add_line(self, *args):
-                self.lines.append(args)
+                pass
 
         class FakeImgui:
             def __init__(self):
@@ -485,19 +512,46 @@ class HudHelperTests(unittest.TestCase):
             def get_color_u32_rgba(self, *rgba):
                 return rgba
 
+            def calc_text_size(self, text):
+                class _Size:
+                    x = 8.0 * len(text)
+                return _Size()
+
             def dummy(self, *_args):
                 pass
 
         imgui = FakeImgui()
         _draw_class_row(imgui, "chair", (0.2, 0.3, 0.4), {
-            "pred": 3, "gt": 2, "tp": 1, "fp": 1, "ignored": 1,
-        })
-        self.assertIn("chair [3/2]", imgui.draw.texts)
-        self.assertEqual(len(imgui.draw.lines), 1)
-        # swatch + background + single class-color fill (no TP/FP segments)
-        self.assertEqual(len(imgui.draw.rects), 3)
-        self.assertEqual(imgui.draw.rects[2][4], (0.2, 0.3, 0.4, 1.0))
+            "pred": 9, "gt": 12, "tp": 7, "fp": 5, "fn": 5, "ignored": 0,
+        }, scale=5)
+        texts = [t for _c, t in imgui.draw.texts]
+        colors = {t: c for c, t in imgui.draw.texts}
+        self.assertIn("TP 7", texts)
+        self.assertIn("FP 5", texts)
+        self.assertIn("FN 5", texts)
+        # TP green; max-scale errors fully dark red.
+        self.assertEqual(colors["TP 7"][:3], (0.10, 0.55, 0.25))
+        self.assertEqual(colors["FP 5"][:3], (0.62, 0.08, 0.08))
+        self.assertTrue(any(t.startswith("chair  P 9  G 12  [") for t in texts))
 
+    def test_class_row_light_red_for_few_errors(self):
+        from utils.hud import _row_segments
+        segs = dict(_row_segments("h", {"pred": 1, "gt": 4, "tp": 0,
+                                        "fp": 1, "fn": 4}, scale=4))
+        self.assertEqual(segs["TP 0"], (0.08, 0.08, 0.08))
+        fp = segs["FP 1"]
+        fn = segs["FN 4"]
+        # Few errors: closer to light red than dark red.
+        self.assertGreater(fp[0], 0.8)
+        self.assertEqual(fn, (0.62, 0.08, 0.08))
+
+    def test_class_row_zero_errors_no_red(self):
+        from utils.hud import _row_segments
+        segs = dict(_row_segments("h", {"pred": 2, "gt": 2, "tp": 2,
+                                        "fp": 0, "fn": 0}, scale=4))
+        self.assertNotIn("FN -", segs)
+        self.assertEqual(segs["FP 0"], (0.08, 0.08, 0.08))
+        self.assertEqual(segs["FN 0"], (0.08, 0.08, 0.08))
     def test_ellipsize(self):
         self.assertEqual(ellipsize("abcdefghij", 5, len), "ab...")
         self.assertEqual(ellipsize("ok", 10, len), "ok")
@@ -530,20 +584,24 @@ class HudHelperTests(unittest.TestCase):
             "scene": "scene0568_01",
             "method": "openyolo3d",
             "run": "baseline-openyolo3d",
-            "ap": 0.3699671793,
-            "ap50": 0.4863713529,
-            "ap25": 0.5384671658,
-            "tp": 15,
-            "gt": 25,
-            "fp": 293,
+            "scene_ap": 0.271,
+            "scene_ap_classes": 5,
+            "run_ap": 0.3699671793,
+            "run_ap_classes": 53,
+            "run_scenes": 10,
+            "visible_pred": 42,
+            "eligible_gt": 22,
             "reconstruction_s": 1575.8,
             "prediction_s": 825.0,
         }}, 1080, 680)
         self.assertIn("openyolo3d / baseline-openyolo3d", imgui.texts)
         self.assertIn("Reconstruction 26m 16s", imgui.texts)
         self.assertIn("Prediction 13m 45s", imgui.texts)
-        self.assertIn("AP 0.370 · AP50 0.486 · AP25 0.538", imgui.texts)
-        self.assertIn("TP/GT 15/25 · FP 293", imgui.texts)
+        self.assertIn("Scene AP 0.271 (5 evaluated classes)", imgui.texts)
+        self.assertIn("Run AP 0.370 (10 scenes, 53 evaluated classes)", imgui.texts)
+        self.assertIn("Visible predictions 42 | Eligible GT 22", imgui.texts)
+        for banned in ("AP50", "AP25", "ignored", "Masks", "TP/GT", "22/29"):
+            self.assertFalse(any(banned in text for text in imgui.texts))
 
     def test_query_block_shows_when_search_available(self):
         class FakeImgui:
@@ -593,7 +651,7 @@ class InformationTests(unittest.TestCase):
         ]
         stats = class_count_stats(objects, sorted(counts), counts)
         self.assertEqual(stats["chair"], {
-            "pred": 4, "gt": 1, "tp": 1, "fp": 1, "ignored": 1,
+            "pred": 4, "gt": 1, "tp": 1, "fp": 1, "fn": 0, "ignored": 1,
         })
         self.assertNotIn("lamp", stats)
 
@@ -610,16 +668,22 @@ class InformationTests(unittest.TestCase):
             "run_id": "baseline-openyolo3d",
             "model": "openyolo3d",
         }
-        score = {"tp": 1, "gt": 2, "verdicts": {"a": "fp", "b": "tp"}}
+        score = {"tp": 1, "gt": 2, "verdicts": {"a": "fp", "b": "tp"},
+                 "ap": 0.271, "ap_class_count": 2}
         metrics = {("ScanNet200", "baseline-openyolo3d", "openyolo3d"): {
-            "ap": 0.3, "ap50": 0.4, "ap25": 0.5,
+            "ap": 0.3, "ap_count": 53, "scene_count": 10,
         }}
         run_key = run_node_id("scene0568_01", pred)
         info = information_payload(
             "scene0568_01", pred, {run_key: score}, metrics,
-            recon_times={"scene0568_01": 88.0}, pred_times={run_key: 12.4})
-        self.assertEqual((info["tp"], info["gt"], info["fp"]), (1, 2, 1))
-        self.assertEqual((info["ap"], info["ap50"], info["ap25"]), (0.3, 0.4, 0.5))
+            recon_times={"scene0568_01": 88.0}, pred_times={run_key: 12.4},
+            visible_pred=2, eligible_gt=2)
+        self.assertEqual((info["scene_ap"], info["scene_ap_classes"]), (0.271, 2))
+        self.assertEqual((info["run_ap"], info["run_ap_classes"], info["run_scenes"]),
+                         (0.3, 53, 10))
+        self.assertEqual((info["visible_pred"], info["eligible_gt"]), (2, 2))
+        self.assertNotIn("ap50", info)
+        self.assertNotIn("ap25", info)
         self.assertEqual(info["reconstruction_s"], 88.0)
         self.assertEqual(info["prediction_s"], 12.4)
         hidden = information_payload("scene0568_01", None, {}, {})
@@ -633,8 +697,46 @@ class InformationTests(unittest.TestCase):
         ]
         kept, colors = merge_tp_gt_overlay(points, objects)
         np.testing.assert_array_equal(kept, points[:3])
-        np.testing.assert_array_equal(colors[0], [0.90, 0.15, 0.15])
+        np.testing.assert_array_equal(colors[0], [0.55, 0.08, 0.08])
         np.testing.assert_array_equal(colors[1:], [[0.10, 0.80, 0.20]] * 2)
+
+    def test_tp_fn_overlay_precedence_tp_fn_fp(self):
+        points = np.arange(12, dtype=float).reshape(4, 3)
+        objects = [
+            {"verdict": "fp", "sel": [True, True, True, True]},
+            {"verdict": "tp", "sel": [False, True, False, False]},
+            {"verdict": "ignored", "sel": [False, False, False, True]},
+        ]
+        fn = [np.array([False, False, True, False])]
+        kept, colors = merge_tp_fn_overlay(points, objects, fn)
+        np.testing.assert_array_equal(kept, points)
+        # index 0: FP only; index 1: TP wins over FP; index 2: FN wins over
+        # FP; index 3: FP only (ignored selection paints nothing).
+        np.testing.assert_array_equal(colors[0], [0.55, 0.08, 0.08])
+        np.testing.assert_array_equal(colors[1], [0.10, 0.80, 0.20])
+        np.testing.assert_array_equal(colors[2], [0.95, 0.55, 0.50])
+        np.testing.assert_array_equal(colors[3], [0.55, 0.08, 0.08])
+
+    def test_unmatched_gt_ids(self):
+        eligible = {"chair": [3001, 3002], "table": [5001]}
+        out = unmatched_gt_ids(eligible, [3001], ["chair", "table"])
+        self.assertEqual(out, {"chair": [3002], "table": [5001]})
+        self.assertEqual(unmatched_gt_ids(eligible, [3001, 3002, 5001], ["chair"]),
+                         {})
+
+    def test_eligible_gt_id_masks(self):
+        from evaluation.benchmark import BENCHMARKS
+        spec = BENCHMARKS["ScanNet20"]
+        label = spec.valid_ids[0]
+        gt = np.zeros(250, dtype=np.int32)
+        gt[:100] = label * 1000 + 1
+        gt[100:200] = label * 1000 + 2
+        gt[200:250] = 7
+        name = spec.class_labels[0]
+        masks = eligible_gt_id_masks(gt, spec)
+        self.assertEqual(sorted(masks[name]), [label * 1000 + 1, label * 1000 + 2])
+        self.assertTrue(masks[name][label * 1000 + 1][:100].all())
+        self.assertFalse(masks[name][label * 1000 + 1][100:].any())
 
 
 class LazyHelperTests(unittest.TestCase):
@@ -653,49 +755,22 @@ class LazyHelperTests(unittest.TestCase):
         self.assertEqual(stub["key"], "predicted_masks/a.txt")
         self.assertEqual(stub["score"], 0.8)
 
-    def test_static_labels_use_world_height(self):
-        from utils.visualize import LABEL_FONT_UNITS, LABEL_WORLD
-        up = np.array([0.0, 0.0, 1.0])
-        x = np.array([1.0, 0.0, 0.0])
-
-        def _obj():
-            return {"class_name": "chair",
-                    "bounds": {"anchor": np.array([1.0, 2.0, 3.0])},
-                    "box": None, "label": None, "pcd": None}
-
-        small = _obj()
-        ensure_object_decorations(
-            small, (1.0, 0.0, 0.0), x, up, 2,
-            label_height=LABEL_WORLD["small"],
-            want_box=False, want_label=True)
-        v = np.asarray(small["label"]["mesh"].vertices)
-        # cap height is 10 font units -> world height equals label_height
-        self.assertAlmostEqual(
-            float(v[:, 2].max() - v[:, 2].min()), 0.05, places=6)
-        self.assertAlmostEqual(
-            float(v[:, 0].max() + v[:, 0].min()) / 2.0, 1.0, places=6)
-        self.assertGreater(LABEL_FONT_UNITS, 0.0)
-        # cap faces the camera side (a third of the triangles), so glyphs
-        # survive back-face culling instead of rendering as hollow outlines
-        normals = np.asarray(small["label"]["mesh"].triangle_normals)
-        facing = float((normals @ np.array([0.0, -1.0, 0.0]) > 0.9).mean())
-        self.assertAlmostEqual(facing, 1.0 / 3.0, places=2)
-        # static: re-decoration never rewrites placed vertices (zoom-proof)
-        before = v.copy()
-        ensure_object_decorations(
-            small, (0.0, 1.0, 0.0), -x, up, 2,
-            label_height=LABEL_WORLD["large"],
-            want_box=False, want_label=True)
-        np.testing.assert_array_equal(
-            np.asarray(small["label"]["mesh"].vertices), before)
-        large = _obj()
-        ensure_object_decorations(
-            large, (1.0, 0.0, 0.0), x, up, 2,
-            label_height=LABEL_WORLD["large"],
-            want_box=False, want_label=True)
-        w = np.asarray(large["label"]["mesh"].vertices)
-        self.assertAlmostEqual(
-            float(w[:, 2].max() - w[:, 2].min()), 0.09, places=6)
+    def test_box_lineset_cached_from_bounds(self):
+        pts, lines = aabb_edges([0.0, 1.0, 2.0], [4.0, 3.0, 8.0])
+        self.assertEqual(pts.shape, (8, 3))
+        self.assertEqual(lines.shape, (12, 2))
+        np.testing.assert_array_equal(pts.min(0), [0.0, 1.0, 2.0])
+        np.testing.assert_array_equal(pts.max(0), [4.0, 3.0, 8.0])
+        obj = {"bounds": {"min": np.array([0.0, 1.0, 2.0]),
+                          "max": np.array([4.0, 3.0, 8.0])},
+               "box": None}
+        first = ensure_object_box(obj)
+        self.assertIsNotNone(first)
+        # cached: second call returns the same LineSet, no rebuild
+        self.assertIs(ensure_object_box(obj), first)
+        via_decor = ensure_object_decorations(
+            {"bounds": obj["bounds"], "box": None}, want_box=True)
+        self.assertIsNotNone(via_decor["box"])
 
     def test_capped_geometry_created_once(self):
         session = {
@@ -720,6 +795,147 @@ class LazyHelperTests(unittest.TestCase):
         self.assertIsNone(session["pointcloud_capped"])
 
 
+class LabelHandleTests(unittest.TestCase):
+    class _Backend:
+        def __init__(self):
+            self.adds = []
+            self.updates = []
+            self.removes = []
+
+        def add_label(self, pos, text, color=(1, 1, 1, 1), scale=1.0):
+            handle = SimpleNamespace(
+                position=np.asarray(pos, dtype=float), text=text,
+                color=tuple(color), scale=float(scale))
+            self.adds.append(handle)
+            return handle
+
+        def update_label(self, handle, pos=None, text=None, color=None,
+                         scale=None):
+            self.updates.append(handle)
+            if pos is not None:
+                handle.position = np.asarray(pos, dtype=float)
+            if text is not None:
+                handle.text = text
+            if color is not None:
+                handle.color = tuple(color)
+            if scale is not None:
+                handle.scale = float(scale)
+
+        def remove_label(self, handle):
+            self.removes.append(handle)
+
+    def _obj(self, **extra):
+        obj = {"class_name": "chair", "query_label": None,
+               "bounds": {"anchor": np.array([1.0, 2.0, 3.0])},
+               "label_handle": None, "label_state": None}
+        obj.update(extra)
+        return obj
+
+    def test_create_once_then_idempotent(self):
+        backend = self._Backend()
+        obj = self._obj()
+        first = sync_label(backend, obj, True, "small",
+                           color=(1.0, 0.0, 0.0))
+        self.assertIsNotNone(first)
+        self.assertEqual(len(backend.adds), 1)
+        # repeated sync with unchanged state makes no backend calls
+        second = sync_label(backend, obj, True, "small",
+                            color=(1.0, 0.0, 0.0))
+        self.assertIs(second, first)
+        self.assertEqual(len(backend.adds), 1)
+        self.assertEqual(backend.updates, [])
+
+    def test_scale_color_text_mutation(self):
+        backend = self._Backend()
+        obj = self._obj()
+        handle = sync_label(backend, obj, True, "small",
+                            color=(1.0, 0.0, 0.0))
+        sync_label(backend, obj, True, "large", color=(1.0, 0.0, 0.0))
+        self.assertAlmostEqual(handle.scale, 1.4)
+        sync_label(backend, obj, True, "large", color=(0.0, 1.0, 0.0))
+        self.assertEqual(handle.color, (0.0, 1.0, 0.0))
+        # query relabel mutates text on the same handle
+        obj["query_label"] = "armchair"
+        sync_label(backend, obj, True, "large", color=(0.0, 1.0, 0.0))
+        self.assertEqual(handle.text, "armchair")
+        self.assertEqual(len(backend.adds), 1)
+        self.assertEqual(len(backend.updates), 3)
+
+    def test_hidden_or_off_removes_handle(self):
+        backend = self._Backend()
+        obj = self._obj()
+        handle = sync_label(backend, obj, True, "small")
+        sync_label(backend, obj, False, "small")
+        self.assertIsNone(obj["label_handle"])
+        self.assertEqual(backend.removes, [handle])
+        # off setting removes as well; double removal is a no-op
+        handle2 = sync_label(backend, obj, True, "small")
+        sync_label(backend, obj, True, "off")
+        self.assertIsNone(obj["label_handle"])
+        self.assertEqual(backend.removes, [handle, handle2])
+        remove_label_handle(backend, obj)
+        self.assertEqual(backend.removes, [handle, handle2])
+
+    def test_per_instance_handles(self):
+        backend = self._Backend()
+        objs = [self._obj() for _ in range(3)]
+        handles = [sync_label(backend, obj, True, "small") for obj in objs]
+        self.assertEqual(len({id(h) for h in handles}), 3)
+        self.assertEqual(len(backend.adds), 3)
+
+    def test_tick_performs_no_label_camera_work(self):
+        import inspect
+        import utils.visualize as viz
+        source = inspect.getsource(viz)
+        start = source.index("def _tick()")
+        end = source.index("def _shutdown_cleanup")
+        tick_source = source[start:end]
+        for banned in ("sync_label", "add_label", "update_label",
+                       "remove_label", "label_handle"):
+            self.assertNotIn(banned, tick_source)
+
+
+class SceneWidgetKeyTests(unittest.TestCase):
+    def test_keyname_mapping_and_handler(self):
+        from open3d.visualization import gui
+
+        from utils.scene_widget import (
+            KEY_TO_ACTION, make_key_handler, map_key_event)
+        self.assertEqual(set(KEY_TO_ACTION),
+                         {gui.KeyName.UP, gui.KeyName.DOWN, gui.KeyName.LEFT,
+                          gui.KeyName.RIGHT, gui.KeyName.ENTER,
+                          gui.KeyName.TAB, gui.KeyName.Q,
+                          gui.KeyName.ESCAPE})
+
+        class Event:
+            def __init__(self, key, etype):
+                self.key = key
+                self.type = etype
+
+        cases = [(gui.KeyName.UP, "up"), (gui.KeyName.DOWN, "down"),
+                 (gui.KeyName.LEFT, "left"), (gui.KeyName.RIGHT, "right"),
+                 (gui.KeyName.ENTER, "enter"), (gui.KeyName.TAB, "tab"),
+                 (gui.KeyName.Q, "q"), (gui.KeyName.ESCAPE, "escape")]
+        for key, action in cases:
+            self.assertEqual(
+                map_key_event(Event(key, gui.KeyEvent.Type.DOWN)), action)
+            # key-up is ignored
+            self.assertIsNone(
+                map_key_event(Event(key, gui.KeyEvent.Type.UP)))
+        # unhandled keys map to None and are not consumed
+        self.assertIsNone(
+            map_key_event(Event(gui.KeyName.F1, gui.KeyEvent.Type.DOWN)))
+        seen = []
+        handler = make_key_handler(seen.append)
+        self.assertTrue(handler(Event(gui.KeyName.ENTER,
+                                      gui.KeyEvent.Type.DOWN)))
+        self.assertEqual(seen, ["enter"])
+        self.assertFalse(handler(Event(gui.KeyName.ENTER,
+                                       gui.KeyEvent.Type.UP)))
+        self.assertFalse(handler(Event(gui.KeyName.F1,
+                                       gui.KeyEvent.Type.DOWN)))
+
+
 class HudContentTests(unittest.TestCase):
     def test_pipeline_texts_cover_all_methods_in_six_sentences(self):
         self.assertEqual(
@@ -732,44 +948,35 @@ class HudContentTests(unittest.TestCase):
             for banned in ("utils/", ".py", "topk", "ckpt", "subprocess"):
                 self.assertNotIn(banned, text, method)
 
-    def test_information_payload_reports_official_counts(self):
+    def test_information_payload_reports_explicit_counts(self):
         pred = {"label_set": "ScanNet20", "run_id": "run-a", "model": "mosaic3d"}
-        score = {"tp": 10, "gt": 22, "verdicts": {"a": "fp"}}
+        score = {"tp": 10, "gt": 22, "verdicts": {"a": "fp"},
+                 "ap": 0.271, "ap_class_count": 5}
         run_key = run_node_id("scene0568_00", pred)
         info = information_payload(
             "scene0568_00", pred, {run_key: score}, {},
-            masks={"pred": 598, "gt": 22, "tp": 10, "fp": 558, "ignored": 30})
+            visible_pred=42, eligible_gt=22)
+        self.assertEqual((info["visible_pred"], info["eligible_gt"]), (42, 22))
+        self.assertEqual(info["scene_ap"], 0.271)
+        self.assertNotIn("masks_pred", info)
+        self.assertNotIn("ap50", info)
+
+    def test_label_scale_map_is_screen_space(self):
+        self.assertIsNone(LABEL_SCALE["off"])
+        self.assertIsNone(label_scale("off"))
+        self.assertEqual(label_scale("small"), 1.0)
+        self.assertEqual(label_scale("large"), 1.4)
+        self.assertIsNone(label_scale("bogus"))
+        for value in LABEL_SCALE.values():
+            if value is not None:
+                self.assertLess(value, 2.0)
+
+    def test_label_text_prefers_query(self):
         self.assertEqual(
-            (info["masks_pred"], info["masks_gt"]), (598, 22))
-        self.assertEqual((info["tp"], info["fp"], info["ignored"]), (10, 558, 30))
-        self.assertEqual(info["gt"], 22)
-
-    def test_label_base_is_float_finite_and_has_normals(self):
-        from utils.visualize import _label_base
-        mesh, base = _label_base("chair", (1.0, 0.0, 0.0))
-        self.assertEqual(base.dtype, np.float64)
-        self.assertTrue(np.all(np.isfinite(base)))
-        self.assertGreater(len(np.asarray(mesh.triangle_normals)), 0)
-        # centred on the full bounding box, not just x
-        np.testing.assert_allclose(
-            base.max(0) + base.min(0), np.zeros(3), atol=1e-9)
-
-    def test_place_label_math_is_finite_scaled_and_positioned(self):
-        import open3d as o3d
-        mesh = o3d.geometry.TriangleMesh()
-        base = np.array([[0.0, 0.0, 0.0], [43.0, 0.0, 0.0], [0.0, 10.0, 0.0]])
-        mesh.vertices = o3d.utility.Vector3dVector(base)
-        mesh.triangles = o3d.utility.Vector3iVector([[0, 1, 2]])
-        pos = np.array([1.0, 2.0, 3.0])
-        out = _place_label(mesh, base, pos, 0.1,
-                           np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]))
-        self.assertEqual(len(out.vertices), 3)
-        v = np.asarray(out.vertices)
-        self.assertTrue(np.all(np.isfinite(v)))
-        np.testing.assert_allclose(v[0], pos, atol=1e-9)
-        # Reading direction maps to +x (screen-right), glyph up maps to +z.
-        self.assertAlmostEqual(v[1, 0] - v[0, 0], 4.3, places=6)
-        self.assertAlmostEqual(v[2, 2] - v[0, 2], 1.0, places=6)
+            label_text({"class_name": "chair", "query_label": None}), "chair")
+        self.assertEqual(
+            label_text({"class_name": "chair", "query_label": "armchair"}),
+            "armchair")
 
     def test_labels_setting_row_lists_sizes(self):
         state = _nav_state()
@@ -811,24 +1018,32 @@ class PanelRenderTests(unittest.TestCase):
         def slider_int(self, *_a, **_k):
             return False, None
 
+        def slider_float(self, *_a, **_k):
+            return False, None
+
         def separator(self, *_a, **_k):
             return None
 
         def __getattr__(self, _name):
             return lambda *args, **kwargs: None
 
-    def test_masks_line_and_official_suffix(self):
+    def test_ap_lines_and_explicit_counts(self):
         imgui = self._Imgui()
         _draw_right(imgui, {"info": {
             "scene": "scene0618_00",
             "method": "openyolo3d",
             "run": "vis-replay-openyolo3d",
-            "ap": 0.1, "ap50": 0.2, "ap25": 0.3,
-            "tp": 10, "gt": 22, "fp": 558, "ignored": 30,
-            "masks_pred": 598, "masks_gt": 22,
+            "scene_ap": 0.1,
+            "scene_ap_classes": 5,
+            "run_ap": 0.37,
+            "run_ap_classes": 53,
+            "run_scenes": 10,
+            "visible_pred": 42,
+            "eligible_gt": 22,
         }}, 1080, 680)
-        self.assertIn("AP 0.100 · AP50 0.200 · AP25 0.300", imgui.texts)
-        self.assertIn("Masks [598/22] · TP 10 · FP 558 · ignored 30", imgui.texts)
+        self.assertIn("Scene AP 0.100 (5 evaluated classes)", imgui.texts)
+        self.assertIn("Run AP 0.370 (10 scenes, 53 evaluated classes)", imgui.texts)
+        self.assertIn("Visible predictions 42 | Eligible GT 22", imgui.texts)
 
     def test_pipeline_block_renders_method_text(self):
         imgui = self._Imgui()
@@ -1074,7 +1289,7 @@ class BottomPanelTests(unittest.TestCase):
     def test_default_panel_shows_classes_only(self):
         imgui = self._Imgui()
         _draw_right(imgui, self._payload(), 1080, 680, overlay=self._video())
-        self.assertIn("Classes", imgui.texts)
+        self.assertIn("Classes   P prediction   G eligible GT   [TP green / errors red]", imgui.texts)
         self.assertNotIn("Pipeline: openyolo3d", imgui.texts)
         self.assertEqual(imgui.images, [])
 
@@ -1083,7 +1298,7 @@ class BottomPanelTests(unittest.TestCase):
         _draw_right(imgui, self._payload("preview"), 1080, 680,
                     overlay=self._video())
         self.assertEqual(len(imgui.images), 1)
-        self.assertNotIn("Classes", imgui.texts)
+        self.assertNotIn("Classes   P prediction   G eligible GT   [TP green / errors red]", imgui.texts)
         self.assertNotIn("Pipeline: openyolo3d", imgui.texts)
 
     def test_pipeline_panel_shows_explainer_only(self):
@@ -1091,7 +1306,7 @@ class BottomPanelTests(unittest.TestCase):
         _draw_right(imgui, self._payload("pipeline"), 1080, 680,
                     overlay=self._video())
         self.assertIn("Pipeline: openyolo3d", imgui.texts)
-        self.assertNotIn("Classes", imgui.texts)
+        self.assertNotIn("Classes   P prediction   G eligible GT   [TP green / errors red]", imgui.texts)
         self.assertEqual(imgui.images, [])
 
     def test_view_setting_row_lists_options(self):
@@ -1104,6 +1319,384 @@ class BottomPanelTests(unittest.TestCase):
         self.assertEqual(
             [opt["text"] for opt in view["options"]],
             ["classes", "pipeline", "path", "replay"])
+
+
+class ThresholdFilterTests(unittest.TestCase):
+    def test_union_includes_pred_without_gt(self):
+        self.assertEqual(
+            union_prediction_classes({"chair": 1}, {"chair": 2, "lamp": 3}),
+            ["chair", "lamp"])
+
+    def test_off_shows_all_on_filters(self):
+        fitted = {"chair": 0.5}
+        manual = {}
+        gt_counts = {"chair": 2}
+        low = {"class_name": "chair", "score": 0.4}
+        high = {"class_name": "chair", "score": 0.6}
+        self.assertTrue(filter_survives(low, fitted, manual, FILTER_OFF, gt_counts))
+        self.assertFalse(filter_survives(low, fitted, manual, FILTER_ON, gt_counts))
+        self.assertTrue(filter_survives(high, fitted, manual, FILTER_ON, gt_counts))
+
+    def test_filter_hides_class_without_scene_gt(self):
+        fitted = {"lamp": 0.0}
+        obj = {"class_name": "lamp", "score": 0.99}
+        self.assertFalse(filter_survives(obj, fitted, {}, FILTER_ON, {"chair": 1}))
+        self.assertTrue(filter_survives(obj, fitted, {}, FILTER_ON, {"lamp": 1}))
+        self.assertTrue(filter_survives(obj, fitted, {}, FILTER_OFF, {"chair": 1}))
+
+    def test_filter_hides_unfitted_class(self):
+        obj = {"class_name": "lamp", "score": 0.99}
+        self.assertFalse(filter_survives(obj, {}, {}, FILTER_ON, {"lamp": 1}))
+
+    def test_manual_overrides_fitted(self):
+        fitted = {"chair": 0.5}
+        manual = {"chair": 0.9}
+        self.assertEqual(effective_threshold(fitted, manual, "chair"), 0.9)
+        self.assertIsNone(effective_threshold(fitted, {}, "lamp"))
+
+    def test_build_rows_marks_unfitted(self):
+        rows = build_threshold_rows(["chair", "lamp"], {"chair": 0.73}, {},
+                                    {"chair": 2, "lamp": 3}, {"chair": 1})
+        by_name = {row["name"]: row for row in rows}
+        self.assertTrue(by_name["chair"]["is_fitted"])
+        self.assertFalse(by_name["lamp"]["is_fitted"])
+        self.assertEqual(by_name["lamp"]["effective"], 0.0)
+        self.assertEqual((by_name["lamp"]["pred"], by_name["lamp"]["gt"]), (3, 0))
+
+    def test_keep_indices_single_source_for_backend_and_hud(self):
+        objs = [
+            {"key": "a", "class_name": "chair", "score": 0.9, "verdict": "tp"},
+            {"key": "b", "class_name": "chair", "score": 0.1, "verdict": "fp"},
+            {"key": "c", "class_name": "lamp", "score": 0.9, "verdict": "tp"},
+        ]
+        fitted = {"chair": 0.5}
+        gt_counts = {"chair": 1}
+        keep = derive_keep_indices(objs, None, COLOR_CLASS, True, fitted, {},
+                                   gt_counts)
+        self.assertEqual(keep, [0])
+        # Rank filtering composes; empty ranks select nothing (empty query).
+        self.assertEqual(
+            derive_keep_indices(objs, set(), COLOR_CLASS, False, {}, {}, gt_counts),
+            [])
+        self.assertEqual(
+            derive_keep_indices(objs, {"a", "b"}, COLOR_CLASS, False, {}, {},
+                                gt_counts),
+            [0, 1])
+        # TP/FP verdict gate drops ignored and verdict-less objects.
+        objs2 = [dict(o, verdict=v) for o, v in
+                 zip(objs, ("tp", "ignored", None))]
+        self.assertEqual(
+            derive_keep_indices(objs2, None, COLOR_TPFN, False, {}, {}, gt_counts),
+            [0])
+        # Ceiling predicate composes last.
+        self.assertEqual(
+            derive_keep_indices(objs, None, COLOR_CLASS, False, {}, {}, gt_counts,
+                                hidden=lambda o: o["key"] == "a"),
+            [1, 2])
+
+    def test_build_rows_marks_unfitted(self):
+        rows = build_threshold_rows(["chair", "lamp"], {"chair": 0.73}, {},
+                                    {"chair": 2, "lamp": 3}, {"chair": 1})
+        by_name = {row["name"]: row for row in rows}
+        self.assertTrue(by_name["chair"]["is_fitted"])
+        self.assertFalse(by_name["lamp"]["is_fitted"])
+        self.assertEqual(by_name["lamp"]["effective"], 0.0)
+        self.assertEqual((by_name["lamp"]["pred"], by_name["lamp"]["gt"]), (3, 0))
+
+    def test_ap_text_and_navigator(self):
+        self.assertEqual(scene_ap_text({"ap": 0.271, "ap_class_count": 5}),
+                         "AP 0.271 (5 classes)")
+        self.assertEqual(scene_ap_text({}), "AP unavailable")
+        self.assertEqual(scene_ap_text(None), "AP unavailable")
+
+    def test_filter_delta_rows_no_sliders(self):
+        from utils.hud import _draw_right
+
+        class FakeImgui:
+            WINDOW_NO_TITLE_BAR = 1
+            WINDOW_NO_RESIZE = 2
+            WINDOW_NO_MOVE = 4
+            WINDOW_NO_COLLAPSE = 8
+            WINDOW_NO_SAVED_SETTINGS = 16
+            WINDOW_NO_INPUTS = 32
+
+            def __init__(self):
+                self.texts = []
+                self.sliders = []
+                self.buttons = []
+
+            def text(self, value):
+                self.texts.append(value)
+
+            def slider_float(self, name, value, _lo, _hi):
+                self.sliders.append((name, value))
+                return False, None
+
+            def button(self, label):
+                self.buttons.append(label)
+                return False
+
+            def columns(self, *_a, **_k):
+                return None
+
+            def next_column(self, *_a, **_k):
+                return None
+
+            def get_cursor_screen_pos(self):
+                return (0.0, 0.0)
+
+            def get_window_draw_list(self):
+                class _Draw:
+                    def add_rect_filled(self, *_a, **_k):
+                        return None
+
+                    def add_line(self, *_a, **_k):
+                        return None
+
+                    def add_text(self, *args):
+                        return None
+                return _Draw()
+
+            def get_color_u32_rgba(self, *_a, **_k):
+                return 0
+
+            def __getattr__(self, _name):
+                return lambda *args, **kwargs: None
+
+        class Keys:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, payload):
+                self.sent.append(payload)
+
+        imgui = FakeImgui()
+        keys = Keys()
+        _draw_right(imgui, {
+            "info": {"scene": "scene0618_00", "method": "m", "run": "r",
+                     "scene_ap": 0.2, "scene_ap_classes": 2,
+                     "run_ap": 0.3, "run_ap_classes": 5, "run_scenes": 2,
+                     "visible_pred": 2, "eligible_gt": 1},
+            "classes": ["chair", "lamp"],
+            "colors": {"chair": (1.0, 0.0, 0.0), "lamp": (0.0, 1.0, 0.0)},
+            "class_stats": {"chair": {"pred": 1, "gt": 1},
+                            "lamp": {"pred": 1, "gt": 0}},
+            "filter": {"mode": "on", "active": True, "paused_by_query": False,
+                       "reason": "", "selected": "chair", "rows": [
+                {"name": "chair", "fitted": 0.73, "manual": None,
+                 "effective": 0.73, "is_fitted": True, "is_manual": False,
+                 "pred": 1, "gt": 1},
+                {"name": "lamp", "fitted": None, "manual": None,
+                 "effective": 0.0, "is_fitted": False, "is_manual": False,
+                 "pred": 1, "gt": 0},
+            ]},
+        }, 1080, 680, keys_out=keys)
+        self.assertIn("Filter: On", imgui.texts)
+        self.assertIn("Classes   P prediction   G eligible GT   [TP green / errors red]",
+                      imgui.texts)
+        self.assertIn("Up/Down select, Left/Right adjust, Enter reset", imgui.texts)
+        self.assertFalse(any(name.startswith("##thr_") for name, _v in imgui.sliders))
+        self.assertFalse(any("Reset" in label for label in imgui.buttons))
+        for banned in ("AP50", "AP25", "ignored", "Masks", "22/29", "[Pred/GT]"):
+            self.assertFalse(any(banned in text for text in imgui.texts))
+
+
+class FilterKeyboardTests(unittest.TestCase):
+    def _ctx(self):
+        return {"classes": ["chair", "table"], "fitted": {"chair": 0.5, "table": 0.2},
+                "manual": {}, "editable": True}
+
+    def _options(self):
+        return {"filter": [{"value": "off"}, {"value": "on"}]}
+
+    def test_down_past_last_row_selects_first_class(self):
+        state = _nav_state(focus=FOCUS_SETTINGS,
+                           setting_index=SETTING_ROWS.index("filter"),
+                           filter_selected=None)
+        action = handle_settings(state, KEY_DOWN, self._options(), self._ctx())
+        self.assertEqual(state["filter_selected"], "chair")
+        self.assertIsNone(action["apply"])
+
+    def test_up_down_moves_between_classes_up_returns_to_settings(self):
+        state = _nav_state(focus=FOCUS_SETTINGS,
+                           setting_index=SETTING_ROWS.index("filter"),
+                           filter_selected="chair")
+        handle_settings(state, KEY_DOWN, self._options(), self._ctx())
+        self.assertEqual(state["filter_selected"], "table")
+        handle_settings(state, KEY_UP, self._options(), self._ctx())
+        self.assertEqual(state["filter_selected"], "chair")
+        handle_settings(state, KEY_UP, self._options(), self._ctx())
+        self.assertIsNone(state["filter_selected"])
+
+    def test_left_right_adjusts_and_enter_resets(self):
+        state = _nav_state(focus=FOCUS_SETTINGS,
+                           setting_index=SETTING_ROWS.index("filter"),
+                           filter_selected="chair")
+        action = handle_settings(state, KEY_RIGHT, self._options(), self._ctx())
+        self.assertEqual(action["filter_adjust"], ("chair", 0.51))
+        action = handle_settings(state, KEY_LEFT, self._options(), self._ctx())
+        self.assertEqual(action["filter_adjust"], ("chair", 0.49))
+        ctx = self._ctx()
+        ctx["manual"] = {"chair": 0.9}
+        action = handle_settings(state, KEY_ENTER, self._options(), ctx)
+        self.assertEqual(action["filter_reset"], "chair")
+
+    def test_selection_survives_reorder_by_identity(self):
+        state = _nav_state(focus=FOCUS_SETTINGS,
+                           setting_index=SETTING_ROWS.index("filter"),
+                           filter_selected="chair")
+        ctx = self._ctx()
+        ctx["classes"] = ["table", "chair"]
+        handle_settings(state, KEY_DOWN, self._options(), ctx)
+        self.assertEqual(state["filter_selected"], "chair")
+
+    def test_no_ctx_leaves_settings_navigation_unchanged(self):
+        state = _nav_state(focus=FOCUS_SETTINGS,
+                           setting_index=SETTING_ROWS.index("filter"),
+                           filter_selected=None)
+        action = handle_settings(state, KEY_DOWN, self._options())
+        self.assertIsNone(state["filter_selected"])
+        self.assertIsNone(action["apply"])
+
+
+class QueryScoreNormTests(unittest.TestCase):
+    def test_flat_cosine_span_maps_to_full_gradient(self):
+        scores = {f"m{i}": -0.056 - 0.0007 * i for i in range(10)}
+        norm = normalize_query_scores(scores)
+        self.assertAlmostEqual(norm["m0"], 1.0)
+        self.assertAlmostEqual(norm["m9"], 0.0)
+        self.assertGreater(norm["m0"] - norm["m9"], 0.9)
+
+    def test_constant_scores_read_hot(self):
+        norm = normalize_query_scores({"a": 0.5, "b": 0.5})
+        self.assertEqual(norm, {"a": 1.0, "b": 1.0})
+
+    def test_empty_scores(self):
+        self.assertEqual(normalize_query_scores({}), {})
+
+
+class QueryResultTests(unittest.TestCase):
+    def test_clip_prompt_labels_ranked_masks(self):
+        objs = [{"key": "a", "query_label": None}, {"key": "b", "query_label": None}]
+        kept, status = apply_query_result(objs, ["a", "b"], {}, "chair", True)
+        self.assertEqual(kept, ["a", "b"])
+        self.assertEqual(status, "")
+        self.assertEqual([o["query_label"] for o in objs], ["chair", "chair"])
+
+    def test_native_labels_preferred_over_prompt(self):
+        objs = [{"key": "a", "query_label": None}]
+        kept, _ = apply_query_result(objs, ["a"], {"a": "seat"}, "chair", True)
+        self.assertEqual(objs[0]["query_label"], "seat")
+
+    def test_empty_ranks_select_nothing_with_status(self):
+        objs = [{"key": "a", "query_label": "old"}]
+        kept, status = apply_query_result(objs, [], {}, "zzz", True)
+        self.assertEqual(kept, [])
+        self.assertEqual(status, "No matches for 'zzz'")
+        self.assertIsNone(objs[0]["query_label"])
+
+    def test_stale_keys_dropped_with_status(self):
+        objs = [{"key": "a", "query_label": None}]
+        kept, status = apply_query_result(objs, ["a", "ghost"], {}, "chair", True)
+        self.assertEqual(kept, ["a"])
+        self.assertEqual(status, "1 stale result(s) ignored")
+
+    def test_inactive_query_clears_labels(self):
+        objs = [{"key": "a", "query_label": "chair"}]
+        kept, status = apply_query_result(objs, ["a"], {}, "chair", False)
+        self.assertIsNone(objs[0]["query_label"])
+        self.assertEqual(status, "")
+
+    def test_hud_tpfn_legend(self):
+        from utils.hud import _draw_right
+
+        class FakeImgui:
+            WINDOW_NO_TITLE_BAR = 1
+            WINDOW_NO_RESIZE = 2
+            WINDOW_NO_MOVE = 4
+            WINDOW_NO_COLLAPSE = 8
+            WINDOW_NO_SAVED_SETTINGS = 16
+            WINDOW_NO_INPUTS = 32
+
+            def __init__(self):
+                self.texts = []
+
+            def text(self, value):
+                self.texts.append(value)
+
+            def get_cursor_screen_pos(self):
+                return (0.0, 0.0)
+
+            def get_window_draw_list(self):
+                class _Draw:
+                    def add_rect_filled(self, *_a, **_k):
+                        return None
+
+                    def add_line(self, *_a, **_k):
+                        return None
+
+                    def add_text(self, *args):
+                        return None
+                return _Draw()
+
+            def get_color_u32_rgba(self, *_a, **_k):
+                return 0
+
+            def dummy(self, *_a, **_k):
+                return None
+
+            def __getattr__(self, _name):
+                return lambda *args, **kwargs: None
+
+        imgui = FakeImgui()
+        _draw_right(imgui, {
+            "info": {"scene": "scene0618_00"},
+            "classes": ["chair"],
+            "colors": {"chair": (1.0, 0.0, 0.0)},
+            "class_stats": {"chair": {"pred": 1, "gt": 1}},
+            "color_mode": "tp_fn",
+            "filter": {"mode": "off", "rows": []},
+        }, 1080, 680)
+        self.assertIn("TP green | FP dark red | FN light red", imgui.texts)
+
+    def test_hud_query_row_replaces_delta_rows(self):
+        from utils.hud import _draw_right
+
+        class FakeImgui:
+            WINDOW_NO_TITLE_BAR = 1
+            WINDOW_NO_RESIZE = 2
+            WINDOW_NO_MOVE = 4
+            WINDOW_NO_COLLAPSE = 8
+            WINDOW_NO_SAVED_SETTINGS = 16
+            WINDOW_NO_INPUTS = 32
+
+            def __init__(self):
+                self.texts = []
+                self.ended = False
+
+            def text(self, value):
+                self.texts.append(value)
+
+            def end(self):
+                self.ended = True
+
+            def __getattr__(self, _name):
+                return lambda *args, **kwargs: None
+
+        imgui = FakeImgui()
+        _draw_right(imgui, {
+            "info": {"scene": "scene0618_00"},
+            "classes": ["chair"],
+            "colors": {"chair": (1.0, 0.0, 0.0)},
+            "class_stats": {"chair": {"pred": 2, "gt": 1}},
+            "filter": {"mode": "on", "active": False, "paused_by_query": True,
+                       "reason": "", "rows": []},
+            "query": {"mode": "search", "status": "", "input": "chair",
+                      "count": 2, "results": []},
+        }, 1080, 680)
+        self.assertTrue(imgui.ended)
+        self.assertIn("Query 'chair'  P 2  G -", imgui.texts)
+        self.assertFalse(any("+/- difference" in t for t in imgui.texts))
 
 
 if __name__ == "__main__":

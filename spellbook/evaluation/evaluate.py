@@ -4,7 +4,8 @@
   _vh_clean_2.ply vertex) filtered to the benchmark's valid class ids.
 - evaluate: dispatches a benchmark run's submission root to the official
   ScanNet20 evaluator or the ScanNet200 evaluator; writes a per-class CSV.
-- score-sidecars: writes per-scene AP50 TP/GT sidecars for existing predictions.
+- score-sidecars: writes per-scene AP sidecars plus one pooled micro-F1
+  global threshold artifact per benchmark/run/model.
 """
 import argparse
 import hashlib
@@ -27,14 +28,21 @@ from evaluation.benchmark import (  # noqa: E402
     load_settings, normalize_scene_id, resolve_benchmark, artifact_paths, submission_dir)
 import util  # noqa: E402
 import util_3d  # noqa: E402
+# Imported here (not lazily) so `utils.scan_lock` binds before
+# evaluation.scannet200_evaluator appends BenchmarkScripts/ScanNet200
+# (which contains its own utils.py) to sys.path.
+from evaluation.runs import manifest_path as _run_manifest_path  # noqa: E402
 
 PYTHON = "/home/rolf/anaconda3/envs/3disspellbook/bin/python"
 _LABEL_MAP_FALLBACK = "/data/scannet/v2/scannetv2-labels.combined.tsv"
 
-SIDECAR_SCHEMA = 2
+SIDECAR_SCHEMA = 4
 SIDECAR_METRIC = "scannet_instance_ap50"
 AP50_THRESHOLD = 0.5
 MIN_REGION_SIZE = 100
+GLOBAL_THRESHOLD_SCHEMA = 1
+GLOBAL_THRESHOLD_METRIC = "scannet_instance_micro_f1"
+GLOBAL_THRESHOLD_IOU = 0.5
 
 _EVALUATOR_SCRIPTS = {
     "official": os.path.join(
@@ -161,6 +169,49 @@ def write_score_sidecar(path, payload):
     os.replace(tmp, path)
 
 
+def _validate_eligible_gt_by_class(doc, label_set):
+    from evaluation.benchmark import BENCHMARKS
+
+    spec = BENCHMARKS.get(label_set)
+    if spec is None:
+        return None
+    counts = doc.get("eligible_gt_by_class")
+    if not isinstance(counts, dict):
+        return None
+    valid = set(spec.class_labels)
+    out = {}
+    for name, count in counts.items():
+        if name not in valid:
+            return None
+        if type(count) is not int or count < 0:
+            return None
+        out[name] = count
+    if set(out) != valid:
+        return None
+    return out
+
+
+def _validate_matched_gt(doc, eligible_gt_by_class):
+    verdicts = doc.get("verdicts")
+    matched = doc.get("matched_gt")
+    if not isinstance(verdicts, dict) or not isinstance(matched, dict):
+        return None
+    out = {}
+    seen_gt = set()
+    for key, gid in matched.items():
+        if verdicts.get(key) != "tp":
+            return None
+        if type(gid) is not int or gid < 1000:
+            return None
+        if gid in seen_gt:
+            return None
+        seen_gt.add(gid)
+        out[key] = gid
+    if len(out) != sum(1 for v in verdicts.values() if v == "tp"):
+        return None
+    return out
+
+
 def load_score_sidecar(path, scene_id, label_set, run_id, model,
                        index_sha256=None, gt_sha256=None):
     if not os.path.isfile(path):
@@ -201,7 +252,37 @@ def load_score_sidecar(path, scene_id, label_set, run_id, model,
         verdicts = doc.get("verdicts") or {}
         if not isinstance(verdicts, dict):
             return None
-        return {"tp": tp, "gt": gt, "verdicts": verdicts}
+        raw_ap = doc.get("ap")
+        if raw_ap is None:
+            scene_ap = None
+        else:
+            import math as _math
+
+            scene_ap = float(raw_ap)
+            if not (_math.isfinite(scene_ap) and 0.0 <= scene_ap <= 1.0):
+                return None
+        ap_class_count = int(doc.get("ap_class_count", -1))
+        if ap_class_count < 0:
+            return None
+        if scene_ap is None and ap_class_count != 0:
+            return None
+        eligible_gt_by_class = _validate_eligible_gt_by_class(doc, label_set)
+        if eligible_gt_by_class is None:
+            return None
+        if sum(eligible_gt_by_class.values()) != gt:
+            return None
+        matched_gt = _validate_matched_gt(doc, eligible_gt_by_class)
+        if matched_gt is None:
+            return None
+        return {
+            "tp": tp,
+            "gt": gt,
+            "verdicts": verdicts,
+            "matched_gt": matched_gt,
+            "eligible_gt_by_class": eligible_gt_by_class,
+            "ap": scene_ap,
+            "ap_class_count": int(ap_class_count),
+        }
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
@@ -213,11 +294,15 @@ def score_prediction_scene(submission_root, scene_id, spec, run_id, model, scann
     pred_instances = load_pred_instances(submission_root, scene_id)
     if pred_instances is None:
         return None
-    from evaluation.scannet200_evaluator import scene_instance_summary
-    summary = scene_instance_summary(util_3d.load_ids(gt_file), pred_instances, spec, scene_id)
+    from evaluation.scannet200_evaluator import scene_evaluation_summary
+    summary = scene_evaluation_summary(
+        util_3d.load_ids(gt_file), pred_instances, spec, scene_id)
     verdicts = {}
     for key, value in summary["verdicts"].items():
         verdicts[_relative_mask(key, submission_root)] = value
+    matched_gt = {}
+    for key, gid in summary["matched_gt"].items():
+        matched_gt[_relative_mask(key, submission_root)] = int(gid)
     return {
         "schema": SIDECAR_SCHEMA,
         "metric": SIDECAR_METRIC,
@@ -232,6 +317,10 @@ def score_prediction_scene(submission_root, scene_id, spec, run_id, model, scann
         "tp": int(summary["tp"]),
         "gt": int(summary["gt"]),
         "verdicts": verdicts,
+        "matched_gt": matched_gt,
+        "eligible_gt_by_class": {k: int(v) for k, v in summary["eligible_gt_by_class"].items()},
+        "ap": None if summary["ap"] is None else float(summary["ap"]),
+        "ap_class_count": int(summary["ap_class_count"]),
     }
 
 
@@ -243,6 +332,188 @@ def score_and_write_sidecar(submission_root, scene_id, spec, run_id, model, scan
     write_score_sidecar(
         score_sidecar_path(spec, run_id, model, scene_id, scannet_root=scannet_root), payload)
     return payload
+
+
+def global_threshold_path(spec, run_id, model, scannet_root=None):
+    return os.path.join(artifact_paths(spec, scannet_root)["evaluations"],
+                        run_id, model, "thresholds.f1.json")
+
+
+def _global_threshold_doc(spec, run_id, model, scenes, manifest_sha256,
+                          sidecar_sha256, thresholds):
+    return {
+        "schema": GLOBAL_THRESHOLD_SCHEMA,
+        "metric": GLOBAL_THRESHOLD_METRIC,
+        "threshold_objective": "f1",
+        "threshold_iou": float(GLOBAL_THRESHOLD_IOU),
+        "min_region_size": MIN_REGION_SIZE,
+        "benchmark": spec.name,
+        "label_set": spec.name,
+        "run_id": run_id,
+        "model": model,
+        "scenes": list(scenes),
+        "manifest_sha256": manifest_sha256,
+        "scene_sidecar_sha256": dict(sidecar_sha256),
+        "thresholds": {
+            name: {
+                "confidence": float(entry["confidence"]),
+                "f1": float(entry["f1"]),
+                "tp": int(entry["tp"]),
+                "fp": int(entry["fp"]),
+                "fn": int(entry["fn"]),
+                "gt": int(entry["gt"]),
+            }
+            for name, entry in thresholds.items()
+        },
+    }
+
+
+def write_global_thresholds(path, doc):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f, sort_keys=True, separators=(",", ":"))
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def load_global_thresholds(path, spec, run_id, model, scenes,
+                           manifest_sha256=None, sidecar_sha256=None):
+    """Load a pooled micro-F1 threshold artifact, or None when stale.
+
+    Rejects wrong schema/metric/identity, a scene tuple that is not exactly
+    ``scenes``, unknown classes, non-finite or out-of-range values, and any
+    manifest/sidecar hash mismatch.
+    """
+    import math as _math
+
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+        if int(doc.get("schema", -1)) != GLOBAL_THRESHOLD_SCHEMA:
+            return None
+        if doc.get("metric") != GLOBAL_THRESHOLD_METRIC:
+            return None
+        if doc.get("threshold_objective") != "f1":
+            return None
+        if float(doc.get("threshold_iou")) != float(GLOBAL_THRESHOLD_IOU):
+            return None
+        if int(doc.get("min_region_size")) != MIN_REGION_SIZE:
+            return None
+        if doc.get("benchmark") != spec.name or doc.get("label_set") != spec.name:
+            return None
+        if doc.get("run_id") != run_id or doc.get("model") != model:
+            return None
+        if list(doc.get("scenes") or []) != list(scenes):
+            return None
+        if manifest_sha256 is not None and doc.get("manifest_sha256") != manifest_sha256:
+            return None
+        stored_hashes = doc.get("scene_sidecar_sha256") or {}
+        if sidecar_sha256 is not None:
+            if dict(stored_hashes) != dict(sidecar_sha256):
+                return None
+        valid = set(spec.class_labels)
+        thresholds = doc.get("thresholds")
+        if not isinstance(thresholds, dict):
+            return None
+        out = {}
+        for name, entry in thresholds.items():
+            if name not in valid or not isinstance(entry, dict):
+                return None
+            try:
+                conf = float(entry["confidence"])
+                f1 = float(entry["f1"])
+                tp = int(entry["tp"])
+                fp = int(entry["fp"])
+                fn = int(entry["fn"])
+                gt = int(entry["gt"])
+            except (TypeError, ValueError, KeyError):
+                return None
+            if not (_math.isfinite(conf) and _math.isfinite(f1)):
+                return None
+            if not (0.0 <= conf <= 1.0 and 0.0 <= f1 <= 1.0):
+                return None
+            if min(tp, fp, fn, gt) < 0 or tp + fn != gt:
+                return None
+            out[name] = {"confidence": conf, "f1": f1, "tp": tp,
+                         "fp": fp, "fn": fn, "gt": gt}
+        return out
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def filter_population(spec, run_id, scannet_root=None):
+    """Ordered protocol scenes usable for global threshold fitting.
+
+    The run manifest's scenes intersected with the fixed 16-scene protocol
+    tuple (tuple order kept). Runs predate the 16-scene protocol, so the
+    population is whatever protocol scenes the run actually covers; the
+    artifact records its population and the loader hash-binds it. Empty when
+    the run covers no protocol scene.
+    """
+    from evaluation.benchmark import PREDICTION_EVALUATION_SCENES
+    from evaluation.runs import load_manifest
+
+    scenes = list(PREDICTION_EVALUATION_SCENES)
+    try:
+        man = load_manifest(
+            _run_manifest_path(spec, run_id, scannet_root=scannet_root),
+            spec=spec, run_id=run_id)
+        have = set(man.get("scenes") or [])
+        scenes = [s for s in scenes if s in have]
+    except (OSError, ValueError):
+        pass
+    return scenes
+
+
+def score_global_thresholds(submission_root, spec, run_id, model, scenes,
+                            scannet_root=None):
+    """Fit pooled micro-F1 thresholds over ``scenes`` and persist them.
+
+    Requires every listed scene complete with a valid schema sidecar.
+    Returns the fitted {class: {...}} mapping, or None when the subset is
+    incomplete. Callers pass :func:`filter_population` (available protocol
+    scenes, at least one); the artifact records its exact population.
+    """
+    from evaluation.scannet200_evaluator import compute_global_thresholds, scene_sweep_inputs
+
+    scenes = list(scenes)
+    gt_dir = artifact_paths(spec, scannet_root)["gt"]
+    for scene_id in scenes:
+        if scene_submission_status(
+                submission_root, scene_id, spec, run_id, model,
+                scannet_root=scannet_root) != "complete":
+            return None
+    scene_inputs = []
+    sidecar_sha256 = {}
+    for scene_id in scenes:
+        gt_file = os.path.join(gt_dir, scene_id + ".txt")
+        pred_instances = load_pred_instances(submission_root, scene_id)
+        if pred_instances is None:
+            return None
+        scene_inputs.append(scene_sweep_inputs(
+            util_3d.load_ids(gt_file), pred_instances, spec, scene_id))
+        sidecar_sha256[scene_id] = _sha256_file(
+            score_sidecar_path(spec, run_id, model, scene_id, scannet_root=scannet_root))
+    thresholds = compute_global_thresholds(scene_inputs, spec.class_labels)
+    manifest_sha256 = None
+    manifest = _run_manifest_path(spec, run_id, scannet_root=scannet_root)
+    if os.path.isfile(manifest):
+        manifest_sha256 = _sha256_file(manifest)
+    doc = _global_threshold_doc(spec, run_id, model, scenes, manifest_sha256,
+                                sidecar_sha256, thresholds)
+    from utils.scan_lock import exclusive_lock
+    lock_path = os.path.join(os.path.dirname(
+        global_threshold_path(spec, run_id, model, scannet_root=scannet_root)),
+        ".thresholds.lock")
+    with exclusive_lock(lock_path):
+        write_global_thresholds(
+            global_threshold_path(spec, run_id, model, scannet_root=scannet_root), doc)
+    return thresholds
 
 
 def _ply_vertex_count(path):
@@ -365,7 +636,7 @@ def export_gt_cli(argv=None):
 
 def score_sidecars_cli(argv=None):
     ap = argparse.ArgumentParser(
-        description="Write per-scene AP50 TP/GT sidecars for existing predictions")
+        description="Write per-scene AP sidecars plus pooled global F1 thresholds")
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--models", required=True, help="comma-separated model names")
     ap.add_argument("--scenes", required=True,
@@ -394,6 +665,18 @@ def score_sidecars_cli(argv=None):
                 print(f"[miss] {scene} {model}")
             else:
                 print(f"[ok] {scene} {model} TP/GT {payload['tp']}/{payload['gt']}")
+        population = filter_population(spec, args.run_id, scannet_root=root)
+        if not population:
+            print(f"[thresholds-skip] {model} (run covers no protocol scene)")
+            continue
+        fitted = score_global_thresholds(
+            pred_dir, spec, args.run_id, model, population, scannet_root=root)
+        if fitted is None:
+            print(f"[thresholds-miss] {model} (need {len(population)} scenes complete: "
+                  f"{','.join(population)})")
+        else:
+            print(f"[thresholds-ok] {model} {len(fitted)} classes "
+                  f"over {len(population)} scenes")
 
 
 def evaluate_cli(argv=None):

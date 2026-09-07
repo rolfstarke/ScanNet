@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -45,7 +46,8 @@ _GEOMETRY_REF = os.path.join(_SPELLBOOK, "reconstruct", "geometry_reference.yaml
 
 _PALETTE = colormaps["tab20"].colors
 TP_COLOR = np.array([0.10, 0.80, 0.20], dtype=float)
-FP_COLOR = np.array([0.90, 0.15, 0.15], dtype=float)
+FP_COLOR = np.array([0.55, 0.08, 0.08], dtype=float)
+FN_COLOR = np.array([0.95, 0.55, 0.50], dtype=float)
 IGNORED_COLOR = np.array([0.55, 0.55, 0.55], dtype=float)
 MIN_REGION_SIZE = 100
 AP50_THRESHOLD = 0.5
@@ -93,7 +95,9 @@ SOURCE_SCENE = "scene_only"
 SOURCE_PRED = "prediction"
 COLOR_CLASS = "class"
 COLOR_INSTANCE = "instance"
-COLOR_TPGT = "tp_gt"
+COLOR_TPFN = "tp_fn"
+# Backward-compatible alias; new code uses COLOR_TPFN.
+COLOR_TPFN = COLOR_TPFN
 COLOR_QUERY = "query"
 KIND_SCENE = "scene"
 KIND_SCAN = "scan"
@@ -114,7 +118,7 @@ KEY_ESCAPE = 256
 KEY_PRESS = 1
 
 SETTING_ROWS = ("benchmark", "mode", "color", "geometry", "boxes", "labels", "ceiling",
-                "cad", "query", "view")
+                "cad", "query", "view", "filter")
 PANEL_CLASSES = "classes"
 PANEL_PIPELINE = "pipeline"
 PANEL_PREVIEW = "preview"
@@ -122,8 +126,12 @@ VIEW_CLASSES = "classes"
 VIEW_PIPELINE = "pipeline"
 VIEW_PATH = "path"
 VIEW_REPLAY = "replay"
-LABEL_WORLD = {"off": 0.0, "small": 0.05, "large": 0.09}
-LABEL_FONT_UNITS = 10.0
+LABEL_SCALE = {"off": None, "small": 1.0, "large": 1.4}
+FILTER_OFF = "off"
+FILTER_ON = "on"
+# Backward-compatible aliases; new code uses FILTER_*.
+THRESHOLDS_OFF = FILTER_OFF
+THRESHOLDS_ON = FILTER_ON
 SETTING_NAMES = {
     "benchmark": "Label set",
     "mode": "Mode",
@@ -135,6 +143,7 @@ SETTING_NAMES = {
     "cad": "CAD report",
     "query": "Query",
     "view": "View",
+    "filter": "Filter",
 }
 
 
@@ -175,46 +184,119 @@ def _below_height(geom, up_axis, max_val):
     return geom.crop(box)
 
 
-def _label_base(text, color):
+def label_scale(setting):
+    """Screen-space label scale for a Labels setting value.
+
+    ``off`` maps to ``None`` (no handle); ``small``/``large`` map to the
+    native-font multipliers from the migration plan. Unknown values yield
+    ``None`` so no handle is created.
+    """
+    return LABEL_SCALE.get(setting)
+
+
+def label_text(obj):
+    """Text for one instance label handle: query label or class name."""
+    return obj.get("query_label") or obj["class_name"]
+
+
+def _label_state_key(text, color, anchor, scale):
+    try:
+        color_key = tuple(float(v) for v in color)
+    except (TypeError, ValueError):
+        color_key = None
+    try:
+        anchor_key = tuple(float(v) for v in np.asarray(anchor, dtype=float).ravel())
+    except (TypeError, ValueError):
+        anchor_key = None
+    return (str(text), color_key, anchor_key, None if scale is None else float(scale))
+
+
+def sync_label(backend, obj, visible, setting, text=None, color=(1.0, 1.0, 1.0), anchor=None):
+    """Idempotent per-object Label3D synchronization (plan D3/H).
+
+    - Hidden instance or ``off`` setting: remove the handle, clear it.
+    - New visible instance: ``add_label`` once.
+    - Otherwise mutate position/text/color/scale only when changed.
+    - Repeated calls with unchanged state make no backend calls.
+    - Camera movement never calls this function (no label work on orbit).
+    """
+    scale = label_scale(setting)
+    handle = obj.get("label_handle")
+    if not visible or scale is None:
+        if handle is not None:
+            backend.remove_label(handle)
+            obj["label_handle"] = None
+            obj["label_state"] = None
+        return None
+    if text is None:
+        text = label_text(obj)
+    if anchor is None:
+        bounds = obj.get("bounds") or {}
+        anchor = bounds.get("anchor")
+    if anchor is None:
+        if handle is not None:
+            backend.remove_label(handle)
+            obj["label_handle"] = None
+            obj["label_state"] = None
+        return None
+    key = _label_state_key(text, color, anchor, scale)
+    if handle is not None and obj.get("label_state") == key:
+        return handle
+    if handle is None:
+        obj["label_handle"] = backend.add_label(anchor, text, color, scale)
+        obj["label_state"] = key
+        return obj["label_handle"]
+    backend.update_label(handle, pos=anchor, text=text, color=color, scale=scale)
+    obj["label_state"] = key
+    return handle
+
+
+def remove_label_handle(backend, obj):
+    """Explicit handle removal for filter/source/detach/shutdown paths."""
+    handle = obj.get("label_handle")
+    if handle is not None:
+        backend.remove_label(handle)
+        obj["label_handle"] = None
+        obj["label_state"] = None
+
+
+def aabb_edges(min_bound, max_bound):
+    """Return (points (8,3), lines (12,2)) for one axis-aligned box."""
+    lo = np.asarray(min_bound, dtype=float).ravel()
+    hi = np.asarray(max_bound, dtype=float).ravel()
+    pts = np.array([
+        [lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]],
+        [hi[0], hi[1], lo[2]], [lo[0], hi[1], lo[2]],
+        [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]],
+        [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]],
+    ], dtype=float)
+    lines = np.array([
+        [0, 1], [1, 2], [2, 3], [3, 0],
+        [4, 5], [5, 6], [6, 7], [7, 4],
+        [0, 4], [1, 5], [2, 6], [3, 7],
+    ], dtype=np.int32)
+    return pts, lines
+
+
+def box_lineset(min_bound, max_bound):
+    """Build one cached LineSet for an instance box (Stage G)."""
     import open3d as o3d
-    t_mesh = o3d.t.geometry.TriangleMesh.create_text(text, depth=1.0)
-    bounds = t_mesh.get_axis_aligned_bounding_box()
-    center = np.array(
-        ((bounds.min_bound + bounds.max_bound) / 2).numpy(), dtype=float)
-    mesh = t_mesh.to_legacy()
-    # create_text emits inverted winding: the capped face is culled from its
-    # own outward side (verified: hollow/mirrored glyphs on screen). Flip once
-    # so the cap survives back-face culling, then derive normals from it.
-    mesh.triangles = o3d.utility.Vector3iVector(
-        np.asarray(mesh.triangles)[:, ::-1])
-    mesh.compute_vertex_normals()
-    mesh.compute_triangle_normals()
-    mesh.paint_uniform_color(color)
-    base_vertices = np.asarray(mesh.vertices, dtype=float) - center
-    return mesh, base_vertices
+    pts, lines = aabb_edges(min_bound, max_bound)
+    geom = o3d.geometry.LineSet()
+    geom.points = o3d.utility.Vector3dVector(pts)
+    geom.lines = o3d.utility.Vector2iVector(lines)
+    return geom
 
 
-def _place_label(mesh, base_vertices, position, char_size, x_dir, y_dir):
-    # Update vertices in place: the legacy visualizer binds the original
-    # vertex buffer at add_geometry time, so replacing the attribute object
-    # would leave the renderer showing stale geometry.
-    # Proper rotation (det +1): local +X is the reading direction on
-    # screen-right, local +Y is glyph-up, local +Z faces the camera. The old
-    # code negated z (a reflection, det -1), which flipped winding and showed
-    # hollow mirrored outlines. Verified on screen: solid correct glyphs.
-    z_dir = np.cross(x_dir, y_dir)
-    rotation = np.column_stack([x_dir, y_dir, z_dir])
-    np.asarray(mesh.vertices)[:, :] = (
-        (base_vertices * char_size) @ rotation.T + position)
-    # Normals must follow the same rotation or lighting stays glued to the
-    # font frame while the glyphs turn. (Placement happens once per label.)
-    if mesh.has_vertex_normals():
-        normals = np.asarray(mesh.vertex_normals)
-        np.asarray(mesh.vertex_normals)[:, :] = normals @ rotation.T
-    if mesh.has_triangle_normals():
-        normals = np.asarray(mesh.triangle_normals)
-        np.asarray(mesh.triangle_normals)[:, :] = normals @ rotation.T
-    return mesh
+def ensure_object_box(obj):
+    """Build the cached box LineSet once; split from label creation."""
+    if obj.get("box") is not None:
+        return obj["box"]
+    bounds = obj.get("bounds")
+    if bounds is None:
+        return None
+    obj["box"] = box_lineset(bounds["min"], bounds["max"])
+    return obj["box"]
 
 
 def load_label_map(label_map_file=LABEL_MAP_FILE):
@@ -384,9 +466,14 @@ def available_models(run_root, scene_id=None):
     return models
 
 
+def classify_scene(gt_ids, pred_instances, spec, scene_id, overlap_th=AP50_THRESHOLD):
+    from evaluation.scannet200_evaluator import scene_evaluation_summary
+    return scene_evaluation_summary(gt_ids, pred_instances, spec, scene_id, overlap_th)
+
+
 def classify_ap50(gt_ids, pred_instances, spec, scene_id, overlap_th=AP50_THRESHOLD):
-    from evaluation.scannet200_evaluator import scene_instance_summary
-    return scene_instance_summary(gt_ids, pred_instances, spec, scene_id, overlap_th)
+    # Backward-compatible alias; new code uses classify_scene.
+    return classify_scene(gt_ids, pred_instances, spec, scene_id, overlap_th)
 
 
 def discover_reconstructions(scannet_dir):
@@ -535,7 +622,7 @@ def collect_prediction_times(scannet_root, pred_index):
     return times
 
 
-def collect_tp_scores(scannet_root, pred_index):
+def collect_scene_scores(scannet_root, pred_index):
     scores = {}
     for rid, leaves in pred_index.items():
         for p in leaves:
@@ -554,6 +641,11 @@ def collect_tp_scores(scannet_root, pred_index):
     return scores
 
 
+def collect_tp_scores(scannet_root, pred_index):
+    # Backward-compatible alias; new code uses collect_scene_scores.
+    return collect_scene_scores(scannet_root, pred_index)
+
+
 def collect_run_metrics(scannet_root, pred_index):
     out = {}
     for leaves in pred_index.values():
@@ -567,14 +659,19 @@ def collect_run_metrics(scannet_root, pred_index):
             try:
                 metrics = read_evaluator_csv(csv_path)
                 comparable = False
+                scene_count = None
                 try:
-                    comparable = _is_comparable(load_manifest(
+                    manifest = load_manifest(
                         os.path.join(eval_root, p["run_id"], "run.json"),
-                        spec=spec, run_id=p["run_id"]))
+                        spec=spec, run_id=p["run_id"])
+                    comparable = _is_comparable(manifest)
+                    scene_count = len(manifest.get("scenes") or [])
                 except (OSError, ValueError):
                     pass
                 out[key] = {
-                    "ap": metrics["ap"], "ap50": metrics["ap50"], "ap25": metrics["ap25"],
+                    "ap": metrics["ap"],
+                    "ap_count": metrics.get("ap_count"),
+                    "scene_count": scene_count,
                     "comparable": comparable,
                 }
             except (OSError, ValueError, KeyError):
@@ -582,11 +679,16 @@ def collect_run_metrics(scannet_root, pred_index):
     return out
 
 
-def collect_ap50_scores(scannet_root, pred_index):
+def collect_ap_scores(scannet_root, pred_index):
     return {
-        key: (value["ap50"] if value else None)
+        key: (value["ap"] if value else None)
         for key, value in collect_run_metrics(scannet_root, pred_index).items()
     }
+
+
+def collect_ap50_scores(scannet_root, pred_index):
+    # Backward-compatible alias; AP is primary, AP50 is no longer displayed.
+    return collect_ap_scores(scannet_root, pred_index)
 
 
 def scene_node_id(scene):
@@ -605,10 +707,240 @@ def run_node_id(recon, pred):
     return (KIND_RUN, recon, pred["label_set"], pred["run_id"], pred["model"])
 
 
+def scene_ap_text(score):
+    if not score or score.get("ap") is None:
+        return "AP unavailable"
+    try:
+        count = int(score.get("ap_class_count", 0))
+    except (TypeError, ValueError):
+        count = 0
+    return f"AP {float(score['ap']):.3f} ({count} classes)"
+
+
 def tp_gt_text(score):
+    # Backward-compatible alias; navigator now shows strict scene AP.
     if not score:
         return None
+    if score.get("ap") is not None:
+        return scene_ap_text(score)
     return f"TP/GT {score['tp']}/{score['gt']}"
+
+
+def fitted_thresholds(score):
+    # Backward-compatible alias; Filter now uses the run-level global artifact.
+    return global_fitted_thresholds(score)
+
+
+def global_fitted_thresholds(score):
+    if not score:
+        return {}
+    thresholds = score.get("thresholds") or {}
+    out = {}
+    for name, entry in thresholds.items():
+        try:
+            out[name] = float(entry.get("confidence"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return out
+
+
+def load_filter_thresholds(spec, run_id, model, scannet_root=None):
+    """Load pooled micro-F1 thresholds for one benchmark/run/model.
+
+    Returns (fitted_map_or_None, reason). The artifact is accepted for the
+    run's available protocol scenes (:func:`filter_population`, at least one)
+    with matching manifest and sidecar hashes; otherwise Filter On stays
+    disabled with a concise reason.
+    """
+    import math as _math
+
+    from evaluation.evaluate import (
+        filter_population, global_threshold_path, load_global_thresholds,
+        score_sidecar_path)
+    from evaluation.runs import manifest_path
+
+    scenes = filter_population(spec, run_id, scannet_root=scannet_root)
+    if not scenes:
+        return None, "run covers no protocol scene"
+    manifest = manifest_path(spec, run_id, scannet_root=scannet_root)
+    if not os.path.isfile(manifest):
+        return None, "no run manifest"
+    try:
+        with open(manifest, "rb") as f:
+            manifest_sha = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None, "unreadable run manifest"
+    sidecar_sha = {}
+    for scene_id in scenes:
+        path = score_sidecar_path(spec, run_id, model, scene_id,
+                                  scannet_root=scannet_root)
+        if not os.path.isfile(path):
+            return None, f"missing sidecar {scene_id}"
+        try:
+            with open(path, "rb") as f:
+                sidecar_sha[scene_id] = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return None, f"unreadable sidecar {scene_id}"
+    fitted = load_global_thresholds(
+        global_threshold_path(spec, run_id, model, scannet_root=scannet_root),
+        spec, run_id, model, scenes,
+        manifest_sha256=manifest_sha, sidecar_sha256=sidecar_sha)
+    if fitted is None:
+        return None, ("stale or missing global thresholds "
+                      f"(score {len(scenes)} scenes: {','.join(scenes)})")
+    bad = [name for name, entry in fitted.items()
+           if not (_math.isfinite(float(entry["confidence"]))
+                   and 0.0 <= float(entry["confidence"]) <= 1.0)]
+    if bad:
+        return None, "invalid global thresholds"
+    return {name: float(entry["confidence"]) for name, entry in fitted.items()}, ""
+
+
+def effective_threshold(fitted, manual, class_name):
+    if manual is not None and class_name in manual and manual[class_name] is not None:
+        return float(manual[class_name])
+    if fitted is not None and class_name in fitted:
+        try:
+            return float(fitted[class_name])
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def union_prediction_classes(eligible_gt_counts, pred_counts):
+    gt_names = set(eligible_gt_counts or {})
+    pred_names = set(pred_counts or {})
+    return sorted(gt_names | pred_names)
+
+
+def filter_survives(obj, fitted, manual, enabled, eligible_gt_counts=None):
+    """Filter On keeps predictions with scene GT presence and confidence.
+
+    A prediction survives only when its class has eligible GT in the current
+    scene and its confidence reaches the effective (manual or fitted global)
+    threshold. Classes without a fitted threshold expose no editable track
+    and are hidden while Filter is On. Filter Off keeps everything.
+    """
+    if enabled != FILTER_ON:
+        return True
+    gt_count = 0
+    if eligible_gt_counts is not None:
+        try:
+            gt_count = int((eligible_gt_counts or {}).get(obj.get("class_name"), 0))
+        except (TypeError, ValueError):
+            gt_count = 0
+    if gt_count <= 0:
+        return False
+    thr = effective_threshold(fitted or {}, manual or {}, obj.get("class_name"))
+    if thr is None:
+        return False
+    try:
+        score = float(obj.get("score", 0.0))
+    except (TypeError, ValueError):
+        score = 0.0
+    return score >= thr
+
+
+def threshold_survives(obj, fitted, manual, enabled):
+    # Backward-compatible alias; new code uses filter_survives with GT presence.
+    return filter_survives(obj, fitted, manual, enabled, None)
+
+
+def build_threshold_rows(union, fitted, manual, pred_counts, gt_counts):
+    rows = []
+    for name in union:
+        fit = None
+        try:
+            if fitted is not None and name in fitted:
+                fit = float(fitted[name])
+        except (TypeError, ValueError):
+            fit = None
+        man = None
+        if manual is not None and name in manual and manual[name] is not None:
+            try:
+                man = float(manual[name])
+            except (TypeError, ValueError):
+                man = None
+        eff = man if man is not None else (fit if fit is not None else 0.0)
+        rows.append({
+            "name": name,
+            "fitted": fit,
+            "manual": man,
+            "effective": float(eff),
+            "is_fitted": fit is not None,
+            "is_manual": man is not None,
+            "pred": int((pred_counts or {}).get(name, 0)),
+            "gt": int((gt_counts or {}).get(name, 0)),
+        })
+    return rows
+
+
+def derive_keep_indices(objects, rank_set, color_mode, filter_on, fitted,
+                       manual, eligible_gt, hidden=None):
+    """Shared visibility rule for the 3D backend and every HUD count.
+
+    One function decides the kept object indices so geometry, Visible
+    predictions, class rows, and boxes/labels cannot disagree. ``hidden`` is
+    an optional per-object predicate (ceiling gate); Query rank filtering,
+    TP/FP verdict filtering, and Filter (GT presence + confidence) apply
+    first.
+    """
+    keep = []
+    for i, obj in enumerate(objects or []):
+        if rank_set is not None and obj.get("key") not in rank_set:
+            continue
+        if color_mode == COLOR_TPFN and obj.get("verdict") not in ("tp", "fp"):
+            continue
+        if filter_on and not filter_survives(
+                obj, fitted or {}, manual or {}, FILTER_ON, eligible_gt or {}):
+            continue
+        if hidden is not None and hidden(obj):
+            continue
+        keep.append(i)
+    return keep
+
+
+def normalize_query_scores(scores):
+    """Min-max normalize a {key: score} mapping to [0, 1] for heatmap color.
+
+    Raw cosine similarities span a few thousandths, which renders as one
+    flat color. The top result maps to 1 (hot) and the lowest to 0 (cold);
+    constant scores map to 1 so a single result still reads hot. Raw scores
+    stay untouched for the HUD result lines.
+    """
+    if not scores:
+        return {}
+    values = [float(v) for v in scores.values()]
+    lo, hi = min(values), max(values)
+    if not (hi > lo):
+        return {key: 1.0 for key in scores}
+    span = hi - lo
+    return {key: (float(value) - lo) / span for key, value in scores.items()}
+
+
+def apply_query_result(objects, ranks, labels, prompt, active):
+    """Apply a query result to loaded objects; pure helper for tests.
+
+    Returns (kept_ranks, status). Ranked objects receive the native label or
+    the prompt; everything else is cleared. Unknown keys are dropped. An
+    explicit empty rank set yields a No-matches status instead of restoring
+    the full scene.
+    """
+    valid = {obj.get("key") for obj in objects or []}
+    kept = [key for key in (ranks or []) if key in valid]
+    dropped = len(list(ranks or [])) - len(kept)
+    labels = labels or {}
+    for obj in objects or []:
+        key = obj.get("key")
+        if active and key in kept:
+            obj["query_label"] = labels.get(key) or prompt or None
+        else:
+            obj["query_label"] = None
+    if dropped:
+        return kept, f"{dropped} stale result(s) ignored"
+    if active and not kept and prompt:
+        return kept, f"No matches for '{prompt}'"
+    return kept, ""
 
 
 def group_methods(leaves):
@@ -626,9 +958,15 @@ def best_prediction(leaves, metrics=None):
     def key(pred):
         value = metrics.get((pred["label_set"], pred["run_id"], pred["model"]))
         if not isinstance(value, dict):
-            return (1, 1, 0.0, 0.0, -pred.get("mtime", 0.0), pred["run_id"], pred["label_set"])
-        return (0, 0 if value.get("comparable") else 1, -value["ap"], -value["ap50"],
-                -pred.get("mtime", 0.0), pred["run_id"], pred["label_set"])
+            return (1, 1, 0.0, -pred.get("mtime", 0.0), pred["run_id"], pred["label_set"])
+        try:
+            ap = float(value.get("ap"))
+        except (TypeError, ValueError):
+            ap = None
+        if ap is None or not math.isfinite(ap):
+            return (1, 1, 0.0, -pred.get("mtime", 0.0), pred["run_id"], pred["label_set"])
+        return (0, 0 if value.get("comparable") else 1, -ap,
+                pred["run_id"], pred["label_set"])
 
     return min(leaves, key=key)
 
@@ -661,9 +999,53 @@ def apply_verdicts(objects, verdicts):
     return bound_tp
 
 
-def merge_tp_gt_overlay(points, objects):
+def eligible_gt_id_masks(gt_ids, spec, min_region_size=MIN_REGION_SIZE):
+    """Per-instance eligible GT masks: {class_name: {gt_id: bool mask}}.
+
+    Mirrors ``eligible_gt_counts`` eligibility (valid class, id >= 1000,
+    region >= min_region_size) so the FN set exactly matches the protocol
+    denominator. Returns {} when the flat GT length cannot be trusted.
+    """
+    gt_ids = np.asarray(gt_ids)
+    out = {}
+    instance_ids, sizes = np.unique(gt_ids, return_counts=True)
+    for instance_id, size in zip(instance_ids, sizes):
+        instance_id = int(instance_id)
+        label_id = instance_id // 1000
+        if (instance_id >= 1000 and int(size) >= int(min_region_size)
+                and label_id in spec.id_to_label):
+            name = spec.id_to_label[label_id]
+            out.setdefault(name, {})[instance_id] = (gt_ids == instance_id)
+    return out
+
+
+def unmatched_gt_ids(eligible_ids_by_class, matched_ids, classes):
+    """Eligible GT ids with no retained TP, per displayed class.
+
+    ``eligible_ids_by_class`` maps class -> iterable of gt ids; ``matched_ids``
+    are gt ids hit by currently retained TP predictions. Returns
+    {class: [unmatched ids]}; empty classes are omitted.
+    """
+    matched = set(matched_ids or [])
+    out = {}
+    for name in classes or []:
+        ids = [int(gid) for gid in (eligible_ids_by_class or {}).get(name, [])
+               if int(gid) not in matched]
+        if ids:
+            out[name] = sorted(ids)
+    return out
+
+
+def merge_tp_fn_overlay(points, objects, fn_masks=None):
+    """One merged TP/FP/FN overlay with deterministic overlap precedence.
+
+    TP paints first claim priority, then FN, then FP, so a correct or missed
+    object is never buried by a leaking false-positive mask. ``fn_masks`` is
+    an optional iterable of boolean vertex selections for unmatched eligible
+    GT. Ignored predictions are omitted.
+    """
     scored = [obj for obj in objects if obj.get("verdict") in ("tp", "fp")]
-    if scored and all(obj.get("packed") is not None for obj in scored):
+    if not fn_masks and scored and all(obj.get("packed") is not None for obj in scored):
         return merge_packed_overlay(points, objects, FP_COLOR, TP_COLOR)
     points = np.asarray(points)
     n = len(points)
@@ -675,6 +1057,10 @@ def merge_tp_gt_overlay(points, objects):
         sel = np.asarray(obj["sel"], dtype=bool)
         colors[sel] = FP_COLOR
         keep[sel] = True
+    for sel in fn_masks or []:
+        sel = np.asarray(sel, dtype=bool)
+        colors[sel] = FN_COLOR
+        keep[sel] = True
     for obj in objects:
         if obj.get("verdict") != "tp":
             continue
@@ -682,6 +1068,11 @@ def merge_tp_gt_overlay(points, objects):
         colors[sel] = TP_COLOR
         keep[sel] = True
     return points[keep], colors[keep]
+
+
+def merge_tp_gt_overlay(points, objects, fn_masks=None):
+    # Backward-compatible alias; new code uses merge_tp_fn_overlay.
+    return merge_tp_fn_overlay(points, objects, fn_masks)
 
 
 def object_bounds(points, up_axis):
@@ -707,6 +1098,10 @@ def render_object_fields(src, key, up_axis):
         "bounds": object_bounds(src["points"], up_axis),
         "box": None,
         "label": None,
+        "label_handle": None,
+        "label_state": None,
+        "pcd_name": None,
+        "box_name": None,
     }
 
 
@@ -720,41 +1115,19 @@ def capped_geometry(session, kind, cropper):
     return geom
 
 
-def ensure_object_decorations(obj, color, label_x_dir, label_y_dir, up_axis,
-                              label_height=0.05, want_box=True, want_label=True):
-    """Build box + text label once. Labels are static world-size geometry:
-    `label_height` is the cap height in meters, facing is fixed at creation,
-    and nothing is rewritten per frame — zoom and orbit never rescale them."""
+def ensure_object_decorations(obj, color=None, label_x_dir=None,
+                               label_y_dir=None, up_axis=None,
+                               label_height=None, want_box=True,
+                               want_label=False):
+    """Build the cached box LineSet once (Stage G).
+
+    Label handles are owned by :func:`sync_label` in the render loop, not
+    by this helper: Label3D needs no camera-facing vertex placement, so no
+    Python work happens on orbit. Kept signature-compatible; label args are
+    accepted and ignored.
+    """
     if want_box:
-        if obj.get("box") is None:
-            box = obj["pcd"].get_axis_aligned_bounding_box()
-            box.color = color
-            obj["box"] = box
-        else:
-            obj["box"].color = color
-    if not want_label:
-        return obj
-    if obj.get("label") is None:
-        bounds = obj.get("bounds")
-        if bounds is None:
-            if obj.get("box") is not None:
-                label_pos = np.array(obj["box"].get_center())
-                label_pos[up_axis] = obj["box"].max_bound[up_axis] + 0.05
-            elif obj.get("pcd") is not None:
-                bb = obj["pcd"].get_axis_aligned_bounding_box()
-                label_pos = np.array(bb.get_center())
-                label_pos[up_axis] = bb.max_bound[up_axis] + 0.05
-            else:
-                return obj
-        else:
-            label_pos = np.array(bounds["anchor"], dtype=float)
-        mesh, base = _label_base(obj.get("query_label") or obj["class_name"], color)
-        _place_label(mesh, base, label_pos,
-                     label_height / LABEL_FONT_UNITS,
-                     label_x_dir, label_y_dir)
-        obj["label"] = {"mesh": mesh, "base": base, "anchor": label_pos}
-    else:
-        obj["label"]["mesh"].paint_uniform_color(color)
+        ensure_object_box(obj)
     return obj
 
 
@@ -800,22 +1173,25 @@ def format_metric(value):
 
 
 def information_payload(scene_id, selected_pred, scores, run_metrics,
-                        recon_times=None, pred_times=None, masks=None):
+                        recon_times=None, pred_times=None, masks=None,
+                        visible_pred=None, eligible_gt=None):
     info = {
         "scene": scene_id,
         "method": None,
         "run": None,
-        "ap": None,
-        "ap50": None,
-        "ap25": None,
-        "tp": None,
-        "gt": None,
-        "fp": None,
-        "ignored": None,
-        "masks_pred": None,
-        "masks_gt": None,
+        "scene_ap": None,
+        "scene_ap_classes": None,
+        "run_ap": None,
+        "run_ap_classes": None,
+        "run_scenes": None,
+        "visible_pred": None,
+        "eligible_gt": None,
         "reconstruction_s": None,
         "prediction_s": None,
+        # Backward-compatible aliases for existing callers/tests.
+        "ap": None,
+        "tp": None,
+        "gt": None,
     }
     if scene_id:
         info["reconstruction_s"] = (recon_times or {}).get(scene_id)
@@ -826,30 +1202,42 @@ def information_payload(scene_id, selected_pred, scores, run_metrics,
     metrics = run_metrics.get(
         (selected_pred["label_set"], selected_pred["run_id"], selected_pred["model"]))
     if metrics:
+        info["run_ap"] = metrics.get("ap")
         info["ap"] = metrics.get("ap")
-        info["ap50"] = metrics.get("ap50")
-        info["ap25"] = metrics.get("ap25")
+        info["run_ap_classes"] = metrics.get("ap_count")
+        info["run_scenes"] = metrics.get("scene_count")
     if scene_id:
         run_key = run_node_id(scene_id, selected_pred)
         score = scores.get(run_key)
         if score:
-            info["tp"] = score["tp"]
-            info["gt"] = score["gt"]
-            info["fp"] = fp_count(score)
+            info["scene_ap"] = score.get("ap")
+            info["scene_ap_classes"] = score.get("ap_class_count")
+            info["tp"] = score.get("tp")
+            info["gt"] = score.get("gt")
+            if eligible_gt is None:
+                eligible_gt = score.get("gt")
         info["prediction_s"] = (pred_times or {}).get(run_key)
-    if masks:
-        info["masks_pred"] = masks.get("pred")
-        info["masks_gt"] = masks.get("gt")
-        if masks.get("tp") is not None:
-            info["tp"] = masks["tp"]
-            info["fp"] = masks.get("fp")
-            info["ignored"] = masks.get("ignored")
+    if isinstance(visible_pred, int):
+        info["visible_pred"] = visible_pred
+    elif masks and masks.get("pred") is not None:
+        try:
+            info["visible_pred"] = int(masks.get("pred"))
+        except (TypeError, ValueError):
+            pass
+    if isinstance(eligible_gt, int):
+        info["eligible_gt"] = eligible_gt
+    elif masks and masks.get("gt") is not None:
+        try:
+            info["eligible_gt"] = int(masks.get("gt"))
+        except (TypeError, ValueError):
+            pass
     return info
 
 
-def flatten_tree(groups, predictions, expanded, cad, scores, benchmark=None, ap50=None):
+def flatten_tree(groups, predictions, expanded, cad, scores, benchmark=None,
+                 ap50=None, run_metrics=None):
     rows = []
-    ap50 = ap50 or {}
+    run_metrics = run_metrics if run_metrics is not None else (ap50 or {})
     for scene, recons in groups.items():
         sid = scene_node_id(scene)
         scene_open = sid in expanded
@@ -877,11 +1265,11 @@ def flatten_tree(groups, predictions, expanded, cad, scores, benchmark=None, ap5
             for model, runs in methods.items():
                 mid = method_node_id(recon, model)
                 method_open = mid in expanded
-                best = best_prediction(runs, ap50)
+                best = best_prediction(runs, run_metrics)
                 best_score = scores.get(run_node_id(recon, best)) if best else None
                 rows.append({
                     "id": mid, "kind": KIND_METHOD, "label": model,
-                    "suffix": tp_gt_text(best_score), "depth": 2,
+                    "suffix": scene_ap_text(best_score), "depth": 2,
                     "expanded": method_open, "parent": sid_scan,
                     "folder": True, "recon_id": recon, "prediction": best,
                 })
@@ -891,7 +1279,7 @@ def flatten_tree(groups, predictions, expanded, cad, scores, benchmark=None, ap5
                     pid = run_node_id(recon, pred)
                     rows.append({
                         "id": pid, "kind": KIND_RUN, "label": pred["run_id"],
-                        "suffix": tp_gt_text(scores.get(pid)), "depth": 3,
+                        "suffix": scene_ap_text(scores.get(pid)), "depth": 3,
                         "expanded": False, "parent": mid,
                         "folder": False, "recon_id": recon, "prediction": pred,
                     })
@@ -1019,11 +1407,54 @@ def clamp_setting_index(state, option_lists=None):
     return idx
 
 
-def handle_settings(state, key, option_lists):
-    action = {"apply": None}
+def handle_settings(state, key, option_lists, filter_ctx=None):
+    """Arrow navigation for settings plus per-class threshold selection.
+
+    ``filter_ctx`` is an optional {"classes", "fitted", "manual", "editable"}
+    mapping. When editable, Down past the last visible setting selects the
+    first class threshold; Up/Down then moves between classes, Left/Right
+    adjusts by 0.01, and Enter restores the fitted value. Selection is keyed
+    by class name so row reorder cannot steal it.
+    """
+    action = {"apply": None, "filter_adjust": None, "filter_reset": None}
     visible = visible_setting_rows(option_lists)
     if not visible:
         state["setting_index"] = 0
+        return action
+    ctx = filter_ctx or {}
+    editable = list(ctx.get("classes") or []) if ctx.get("editable") else []
+    fitted = ctx.get("fitted") or {}
+    manual = ctx.get("manual") or {}
+    selected = state.get("filter_selected")
+    if selected is not None and selected not in editable:
+        selected = None
+        state["filter_selected"] = None
+    if selected is not None:
+        pos = editable.index(selected)
+        if key == KEY_DOWN:
+            if pos + 1 < len(editable):
+                state["filter_selected"] = editable[pos + 1]
+            return action
+        if key == KEY_UP:
+            if pos > 0:
+                state["filter_selected"] = editable[pos - 1]
+            else:
+                state["filter_selected"] = None
+            return action
+        if key in (KEY_LEFT, KEY_RIGHT):
+            try:
+                current = float(manual[selected]) if selected in manual else float(
+                    fitted[selected])
+            except (TypeError, ValueError, KeyError):
+                return action
+            delta = 0.01 if key == KEY_RIGHT else -0.01
+            value = min(1.0, max(0.0, round(current + delta, 4)))
+            action["filter_adjust"] = (selected, value)
+            return action
+        if key == KEY_ENTER:
+            if selected in manual:
+                action["filter_reset"] = selected
+            return action
         return action
     idx = clamp_setting_index(state, option_lists)
     row = SETTING_ROWS[idx]
@@ -1033,6 +1464,8 @@ def handle_settings(state, key, option_lists):
         nxt = pos + (-1 if key == KEY_UP else 1)
         if 0 <= nxt < len(visible):
             state["setting_index"] = SETTING_ROWS.index(visible[nxt])
+        elif key == KEY_DOWN and editable:
+            state["filter_selected"] = editable[0]
         return action
     specs = option_lists.get(row) or []
     enabled = enabled_values(specs)
@@ -1081,9 +1514,10 @@ def _focus_order(state):
     return order
 
 
-def handle_navigation(state, key, rows, option_lists):
+def handle_navigation(state, key, rows, option_lists, filter_ctx=None):
     if key == KEY_TAB:
         state["candidate"] = None
+        state["filter_selected"] = None
         order = _focus_order(state)
         try:
             pos = order.index(state.get("focus"))
@@ -1100,7 +1534,7 @@ def handle_navigation(state, key, rows, option_lists):
         action["activate"] = None
         action["apply"] = None
         return action
-    action = handle_settings(state, key, option_lists)
+    action = handle_settings(state, key, option_lists, filter_ctx)
     action["activate"] = None
     return action
 
@@ -1117,6 +1551,7 @@ def state_value(state, row):
         "cad": state.get("cad_open", False),
         "query": state.get("query_mode", QUERY_OFF),
         "view": state.get("view", VIEW_CLASSES),
+        "filter": state.get("filter", FILTER_OFF),
     }[row]
 
 
@@ -1126,24 +1561,27 @@ def settings_payload(state, option_lists, display_value):
     idx = clamp_setting_index(state, option_lists)
     out = []
     for name in visible:
-        specs = [spec for spec in (option_lists.get(name) or []) if spec.get("enabled", True)]
+        specs = option_lists.get(name) or []
         applied = state_value(state, name)
         target = pending[1] if pending is not None and pending[0] == name else applied
         i = SETTING_ROWS.index(name)
         options = []
         for spec in specs:
             value = spec["value"]
+            enabled = bool(spec.get("enabled", True))
             if i == idx and pending is not None and pending[0] == name and value == pending[1] and value != applied:
                 kind = "pending"
             elif value == applied:
                 kind = "applied"
             else:
                 kind = "idle"
+            if not enabled:
+                kind = "disabled"
             options.append({
                 "text": display_value(name, value),
                 "kind": kind,
                 "sel": False,
-                "enabled": True,
+                "enabled": enabled,
             })
         if i == idx:
             for option, spec in zip(options, specs):
@@ -1164,10 +1602,11 @@ def cad_report_png(scene_dir):
     return path if os.path.isfile(path) else None
 
 
-def clear_tracked(vis, displayed, key):
-    for geom in list(displayed[key]):
-        vis.remove_geometry(geom, reset_bounding_box=False)
-    displayed[key] = set()
+def clear_tracked(backend, names):
+    """Remove every registered renderer name (idempotent) and empty the set."""
+    for name in sorted(names):
+        backend.remove(name)
+    names.clear()
 
 
 def _instance_counts(objects):
@@ -1193,11 +1632,14 @@ def class_count_stats(objects, classes, gt_counts=None):
     ignored = Counter(o["class_name"] for o in objects if o.get("verdict") == "ignored")
     rows = {}
     for name in classes:
+        gt = None if gt_counts is None else int(gt_counts[name])
+        n_tp = int(tp[name])
         rows[name] = {
             "pred": int(pred[name]),
-            "gt": None if gt_counts is None else int(gt_counts[name]),
-            "tp": int(tp[name]),
+            "gt": gt,
+            "tp": n_tp,
             "fp": int(fp[name]),
+            "fn": None if gt is None else max(0, gt - n_tp),
             "ignored": int(ignored[name]),
         }
     return rows
@@ -1334,8 +1776,9 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
               ceiling_height=2.0):
     import multiprocessing
     import subprocess
-    import glfw
     import open3d as o3d
+
+    from utils.scene_widget import SceneWidgetBackend, make_key_handler
 
     if not os.environ.get("DISPLAY"):
         raise RuntimeError(
@@ -1350,7 +1793,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     except OSError:
         reference = None
     cad = collect_cad_scores(scannet_dir, recon_ids, reference)
-    scores = collect_tp_scores(scannet_root, pred_index)
+    scores = collect_scene_scores(scannet_root, pred_index)
     run_metrics = collect_run_metrics(scannet_root, pred_index)
     recon_times = collect_reconstruction_times(scannet_dir, recon_ids)
     pred_times = collect_prediction_times(scannet_root, pred_index)
@@ -1379,6 +1822,12 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         "active_method": None,
         "cad_open": False,
         "query_mode": QUERY_OFF,
+        "filter": FILTER_OFF,
+        "view_revision": 0,
+        "filter_fitted": {},
+        "filter_unavailable": "",
+        "filter_manual": {},
+        "filter_key": None,
         "view": VIEW_CLASSES,
         # camera_mode/panel mirror "view" for the render loop and HUD payload;
         # "view" is the single setting the user edits.
@@ -1392,20 +1841,28 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
     view_w = max(640, display_width - hud.LEFT_WIDTH - hud.RIGHT_WIDTH - 10)
     view_h = max(480, display_height - 100)
     view_rect = (hud.LEFT_WIDTH, 0, view_w, view_h)
-    vis = o3d.visualization.VisualizerWithKeyCallback()
-    vis.create_window(window_name=hud.VIEWER_TITLE,
-                      width=view_w, height=view_h,
-                      left=hud.LEFT_WIDTH, top=0)
+    # Stage C: SceneWidget backend owns the center window. Initial x/y is
+    # best-effort on Wayland; the pixel-docked HUD contract targets X11.
+    backend = SceneWidgetBackend.create_window(
+        hud.VIEWER_TITLE, view_w, view_h, hud.LEFT_WIDTH, 0)
+    app = o3d.visualization.gui.Application.instance
 
-    current = {"scene": None, "placeholder": None}
-    displayed = {"objs": set(), "boxes": set(), "labels": set(), "camera": set()}
+    SCENE_MAIN = "scene/main"
+    OVERLAY_NAME = "overlay/tpfn"
+    PATH_NAME = "camera/path"
+    MARKER_NAME = "camera/marker"
+    current = {"scene": None, "variant": None}
+    # Name-based ownership (Stage D4): renderer names, never object identity.
+    displayed = {"objs": set(), "boxes": set(), "camera": set()}
+    geom_names = {"gen": 0, "variant": None}
+    mat_cache = {}
     objects = []
-    overlay = {"pcd": None}
+    overlay = {"pcd": None, "key": None}
     query_client = QueryClient()
     query_rt = {
-        "request_id": 0, "status": "", "labels": {}, "scores": {}, "ranks": [],
-        "reset_id": 0, "pending": None, "features": None, "input": "",
-        "openins": None, "native_result": None,
+        "request_id": 0, "status": "", "labels": {}, "scores": {}, "norm": {},
+        "ranks": [], "reset_id": 0, "pending": None, "features": None,
+        "input": "", "openins": None, "native_result": None,
     }
     prompt_rt = {
         "process": None, "recv": None, "mode": None,
@@ -1483,6 +1940,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         query_rt["status"] = status
         query_rt["labels"] = {}
         query_rt["scores"] = {}
+        query_rt["norm"] = {}
         query_rt["ranks"] = []
         query_rt["pending"] = None
         query_rt["input"] = ""
@@ -1584,7 +2042,9 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             camera_rt["color_size"] = None
 
     def _detach_camera():
-        clear_tracked(vis, displayed, "camera")
+        for name in (PATH_NAME, MARKER_NAME):
+            backend.remove(name)
+        displayed["camera"] = set()
         camera_rt["geoms"]["path"] = None
         camera_rt["geoms"]["marker"] = None
         camera_rt["video"] = None
@@ -1599,7 +2059,9 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         camera_rt["last_report"] = None
 
     def _rebuild_camera_path():
-        clear_tracked(vis, displayed, "camera")
+        for name in (PATH_NAME, MARKER_NAME):
+            backend.remove(name)
+        displayed["camera"] = set()
         camera_rt["geoms"]["path"] = None
         camera_rt["geoms"]["marker"] = None
         if state["camera_mode"] == CAMERA_OFF or camera_rt["sequence"] is None:
@@ -1630,41 +2092,64 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         path.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
         path.colors = o3d.utility.Vector3dVector(np.asarray(colors[:len(points)]))
         camera_rt["geoms"]["path"] = path
-        vis.add_geometry(path, reset_bounding_box=False)
-        displayed["camera"].add(path)
+        backend.add(PATH_NAME, path,
+                    backend.line_material((1.0, 1.0, 1.0, 1.0)))
+        displayed["camera"].add(PATH_NAME)
+        _ensure_camera_marker_registered()
+        backend.request_redraw()
+
+    def _canonical_marker_points():
+        """Camera-local pyramid (apex + 4 corners) for the active calibration.
+
+        Poses are world-from-camera, so the registered canonical geometry
+        reaches world space through ``set_geometry_transform(pose)`` with no
+        per-frame vertex rewrite or re-registration during playback.
+        """
+        from utils.camera_replay import FRUSTUM_DEPTH
+        calib = camera_rt.get("calib") or {}
+        size = camera_rt.get("color_size")
+        try:
+            k_inv = np.linalg.inv(np.asarray(calib["K_color"], dtype=float))
+            w, h = int(size[0]), int(size[1])
+        except (TypeError, ValueError, KeyError, IndexError,
+                np.linalg.LinAlgError):
+            return None
+        d = float(FRUSTUM_DEPTH)
+        pts = [np.zeros(3)]
+        for u, v in ((0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)):
+            pts.append(k_inv @ np.array([float(u), float(v), 1.0]) * d)
+        return np.stack(pts)
+
+    def _ensure_camera_marker_registered():
+        """Register the canonical marker once; never re-add in playback."""
+        if backend.has(MARKER_NAME):
+            return True
+        local = _canonical_marker_points()
+        if local is None:
+            return False
+        import open3d as o3d
+        marker = o3d.geometry.LineSet()
+        marker.points = o3d.utility.Vector3dVector(local)
+        marker.lines = o3d.utility.Vector2iVector(
+            np.asarray(FRUSTUM_LINES, dtype=np.int32))
+        camera_rt["geoms"]["marker"] = marker
+        backend.add(MARKER_NAME, marker,
+                    backend.line_material((1.0, 0.55, 0.1, 1.0)))
+        return True
 
     def _update_camera_marker(pose):
-        """Classical wireframe camera pyramid at the current replay pose."""
-        marker = camera_rt["geoms"].get("marker")
-        seq = camera_rt["sequence"]
-        calib = camera_rt.get("calib")
-        size = camera_rt.get("color_size")
+        """Move the canonical marker via transform; hide when unavailable."""
         if (state["camera_mode"] != CAMERA_REPLAY
                 or camera_rt.get("phase") != "ready"
-                or pose is None or not is_valid_pose(pose)
-                or calib is None or calib.get("K_color") is None
-                or not size or seq is None):
-            if marker in displayed["camera"]:
-                vis.remove_geometry(marker, reset_bounding_box=False)
-                displayed["camera"].discard(marker)
+                or pose is None or not is_valid_pose(pose)):
+            if backend.has(MARKER_NAME):
+                backend.show(MARKER_NAME, False)
             return
-        try:
-            origin, corners = frustum_corners(
-                pose, calib["K_color"], size[0], size[1])
-        except Exception:
+        if not _ensure_camera_marker_registered():
             return
-        pts = np.vstack([origin, corners])
-        segs = np.asarray(FRUSTUM_LINES, dtype=np.int32)
-        if marker is None:
-            marker = o3d.geometry.LineSet()
-            camera_rt["geoms"]["marker"] = marker
-            vis.add_geometry(marker, reset_bounding_box=False)
-            displayed["camera"].add(marker)
-        marker.points = o3d.utility.Vector3dVector(pts)
-        marker.lines = o3d.utility.Vector2iVector(segs)
-        marker.paint_uniform_color([1.0, 0.55, 0.1])
-        if marker in displayed["camera"]:
-            vis.update_geometry(marker)
+        backend.show(MARKER_NAME, True)
+        backend.set_transform(MARKER_NAME, np.asarray(pose, dtype=float))
+        displayed["camera"].add(MARKER_NAME)
 
     def _replay_frame_count():
         if state["camera_mode"] != CAMERA_REPLAY:
@@ -1961,6 +2446,8 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             query_rt["ranks"] = [key for key, _score in ranked[:10]]
         else:
             query_rt["ranks"] = []
+        query_rt["norm"] = normalize_query_scores(
+            {key: query_rt["scores"].get(key, 0.0) for key in query_rt["ranks"]})
         query_rt["status"] = ""
         query_rt["pending"] = None
         return True
@@ -2013,6 +2500,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         keys = msg.get("keys") or []
         query_rt["ranks"] = keys
         query_rt["scores"] = dict(zip(keys, msg.get("scores") or []))
+        query_rt["norm"] = normalize_query_scores(query_rt["scores"])
         query_rt["labels"] = {}
         query_rt["status"] = ""
         query_rt["pending"] = None
@@ -2032,9 +2520,9 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         if row == "color":
             scene_only = state["source_mode"] == SOURCE_SCENE
             return _opts(
-                [COLOR_CLASS, COLOR_INSTANCE, COLOR_TPGT],
+                [COLOR_CLASS, COLOR_INSTANCE, COLOR_TPFN],
                 {COLOR_CLASS: not scene_only, COLOR_INSTANCE: not scene_only,
-                 COLOR_TPGT: state["source_mode"] == SOURCE_PRED and _tp_available()})
+                 COLOR_TPFN: state["source_mode"] == SOURCE_PRED and _tp_available()})
         if row == "geometry":
             return _opts(["mesh", "pointcloud"])
         if row == "boxes":
@@ -2070,6 +2558,14 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                  VIEW_PIPELINE: bool(pred and pred["model"] in MODEL_PIPELINE),
                  VIEW_PATH: has_frames,
                  VIEW_REPLAY: bool(has_frames and can_replay)})
+        if row == "filter":
+            pred = _pred()
+            fitted = state.get("filter_fitted")
+            enabled = (state["source_mode"] == SOURCE_PRED and pred is not None
+                       and fitted is not None)
+            return _opts(
+                [FILTER_OFF, FILTER_ON],
+                {FILTER_OFF: True, FILTER_ON: enabled})
         return []
 
     def _option_lists():
@@ -2083,7 +2579,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                     SOURCE_PRED: "Prediction"}[value]
         if row == "color":
             return {COLOR_CLASS: "Classes", COLOR_INSTANCE: "Instances",
-                    COLOR_TPGT: "TP/GT"}[value]
+                    COLOR_TPFN: "TP/FP/FN"}[value]
         if row == "geometry":
             return {"mesh": "Mesh", "pointcloud": "Points"}[value]
         if row == "boxes":
@@ -2095,32 +2591,90 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         if row == "cad":
             return "Open" if value else "Closed"
         if row == "query":
-            return {QUERY_OFF: "Off", QUERY_SEARCH: "Search", QUERY_IMAGE: "Image"}[value]
+            text = {QUERY_OFF: "Off", QUERY_SEARCH: "Search", QUERY_IMAGE: "Image"}[value]
+            if value != QUERY_OFF:
+                opts = {spec["value"] for spec in _option_list("query")
+                        if spec.get("enabled", True)}
+                if value not in opts:
+                    text = f"{text} (unavailable)"
+            return text
         if row == "view":
-            return {VIEW_CLASSES: "Classes", VIEW_PIPELINE: "Pipeline",
+            text = {VIEW_CLASSES: "Classes", VIEW_PIPELINE: "Pipeline",
                     VIEW_PATH: "Path", VIEW_REPLAY: "Replay"}.get(value, str(value))
+            if value == VIEW_REPLAY:
+                pred = _pred()
+                ok, reason = replay2d.available(
+                    pred, camera_rt.get("sequence"))
+                if not ok and reason:
+                    text = f"Replay ({reason})"
+            return text
+        if row == "filter":
+            if value == FILTER_ON and not state.get("filter_fitted"):
+                return "On (no thresholds)"
+            return {FILTER_OFF: "Off", FILTER_ON: "On"}.get(value, str(value))
         return value
 
     def _tree_rows():
         return flatten_tree(groups, pred_index, state["expanded"], cad, scores,
-                            benchmark=state["benchmark"], ap50=run_metrics)
+                            benchmark=state["benchmark"], run_metrics=run_metrics)
 
     def _make_objects(data, keys=None):
         import open3d as o3d
         made = []
         up_axis = session["up_axis"]
+        gen = geom_names["gen"]
         for idx, o in enumerate(data["objects"]):
             pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(o["points"])
-            pcd.colors = o3d.utility.Vector3dVector(o["colors"])
+            # Points only (Stage F): uniform base_color materials recolor via
+            # modify_geometry_material; vertex colors would override them.
+            pcd.points = o3d.utility.Vector3dVector(
+                np.asarray(o["points"], dtype=float))
+            assert not pcd.has_colors(), "object render clouds must omit vertex colors"
             fields = render_object_fields(o, keys[idx] if keys else None, up_axis)
             fields.update({
                 "pcd": pcd,
                 "rgb": o["colors"],
                 "verdict": None,
+                "pcd_name": f"object/{gen}/{idx}",
+                "box_name": f"box/{gen}/{idx}",
             })
             made.append(fields)
         return made
+
+    def _filter_selection_key():
+        pred = _pred()
+        if pred is None or session is None:
+            return None
+        return (pred["label_set"], pred["run_id"], pred["model"])
+
+    def _refresh_filter_thresholds():
+        """Load the global threshold artifact for the current run/model.
+
+        Manual overrides are keyed by (benchmark, run, model, class) and
+        survive scene changes; they are never written to disk.
+        """
+        key = _filter_selection_key()
+        if key != state.get("filter_key"):
+            state["filter_key"] = key
+            state["filter_manual"] = {}
+            state["filter_fitted"] = {}
+            state["filter_unavailable"] = ""
+        pred = _pred()
+        if pred is None:
+            state["filter_fitted"] = {}
+            state["filter_unavailable"] = "no prediction selected"
+            return
+        spec = _spec(pred["label_set"])
+        fitted, reason = load_filter_thresholds(
+            spec, pred["run_id"], pred["model"], scannet_root)
+        if fitted is None:
+            state["filter_fitted"] = None
+            state["filter_unavailable"] = reason or "global thresholds unavailable"
+            if state.get("filter") == FILTER_ON:
+                state["filter"] = FILTER_OFF
+        else:
+            state["filter_fitted"] = fitted
+            state["filter_unavailable"] = ""
 
     def _score_predictions(data, root, pred):
         run_key = run_node_id(session["id"], pred)
@@ -2132,31 +2686,66 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             verdicts = normalize_verdicts(sidecar["verdicts"], root)
             bound = apply_verdicts(objects, verdicts)
             if bound == int(sidecar["tp"]):
+                _refresh_filter_thresholds()
                 return status
             verdicts = None
         gt_file = os.path.join(artifact_paths(spec, scannet_root)["gt"], session["id"] + ".txt")
         if not os.path.isfile(gt_file):
             apply_verdicts(objects, {})
-            return "TP/GT unavailable: no evaluation GT for this label set."
-        summary = classify_ap50(
+            return "AP unavailable: no evaluation GT for this label set."
+        summary = classify_scene(
             util_3d.load_ids(gt_file), data["pred_instances"], spec, session["id"])
         verdicts = normalize_verdicts(summary["verdicts"], root)
         bound = apply_verdicts(objects, verdicts)
         scores[run_key] = {
-            "tp": int(summary["tp"]), "gt": int(summary["gt"]), "verdicts": verdicts,
+            "tp": int(summary["tp"]),
+            "gt": int(summary["gt"]),
+            "verdicts": verdicts,
+            "matched_gt": {
+                relative_mask_key(key, root): int(gid)
+                for key, gid in (summary.get("matched_gt") or {}).items()
+            },
+            "eligible_gt_by_class": {
+                name: int(count)
+                for name, count in (summary.get("eligible_gt_by_class") or {}).items()
+            },
+            "ap": summary.get("ap"),
+            "ap_class_count": int(summary.get("ap_class_count", 0)),
         }
+        _refresh_filter_thresholds()
         if bound != int(summary["tp"]):
-            return "TP/GT coloring mismatch: bound predictions disagree with the evaluator."
+            return "AP coloring mismatch: bound predictions disagree with the evaluator."
         return status
+
+    def _retire_object_generation():
+        """Remove previous-generation GPU names and label handles (D4).
+
+        Called before the CPU object list is replaced so no names or GPU
+        resources accumulate across scans/runs/source switches.
+        """
+        for obj in objects:
+            remove_label_handle(backend, obj)
+        backend.clear_generation("object/")
+        backend.clear_generation("box/")
+        displayed["objs"] = {
+            name for name in displayed["objs"]
+            if not (name.startswith("object/") or name.startswith("box/"))}
+
+    def _stamp_generation():
+        geom_names["gen"] += 1
+        gen = geom_names["gen"]
+        for i, obj in enumerate(objects):
+            obj["pcd_name"] = f"object/{gen}/{i}"
+            obj["box_name"] = f"box/{gen}/{i}"
 
     def _load_source():
         nonlocal objects
-        if overlay["pcd"] is not None:
-            if overlay["pcd"] in displayed["objs"]:
-                vis.remove_geometry(overlay["pcd"], reset_bounding_box=False)
-                displayed["objs"].discard(overlay["pcd"])
-            overlay["pcd"] = None
+        backend.remove(OVERLAY_NAME)
+        displayed["objs"].discard(OVERLAY_NAME)
+        overlay["pcd"] = None
+        overlay["key"] = None
         if session is None:
+            _retire_object_generation()
             objects = []
             return
         pred = _pred()
@@ -2165,11 +2754,14 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         key = (state["source_mode"], pred_key)
         cache = session["source_cache"]
         if key in cache:
+            _retire_object_generation()
             objects, state["status"] = cache[key]
+            _stamp_generation()
             _load_query_features()
             if state["camera_mode"] == CAMERA_REPLAY:
                 _start_replay_cache()
             return
+        _retire_object_generation()
         if state["source_mode"] == SOURCE_SCENE:
             objects = []
             state["status"] = ""
@@ -2202,9 +2794,10 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                         obj["sel"] = src["sel"]
                     state["status"] = _score_predictions(data, root, pred)
         cache[key] = (objects, state["status"])
+        _stamp_generation()
         _load_query_features()
         if state["camera_mode"] == CAMERA_REPLAY:
-            _render_replay_frame()
+            _start_replay_cache()
 
     def _variant():
         kind = "mesh" if state["geometry"] == "mesh" else "pointcloud"
@@ -2212,17 +2805,45 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             return capped_geometry(session, kind, _below_height)
         return session[kind]
 
+    def _session_bounds():
+        pts = np.asarray(session["scene_pts"], dtype=float)
+        return o3d.geometry.AxisAlignedBoundingBox.create_from_points(
+            o3d.utility.Vector3dVector(pts))
+
+    def _frame_camera():
+        # Frame from active session bounds (never Open3DScene.bounding_box:
+        # invisible cached geometry is included there). Only on new scan or
+        # explicit reset_view; settings changes preserve the camera.
+        bounds = _session_bounds()
+        center = np.asarray(bounds.get_center(), dtype=float)
+        backend.setup_camera(60.0, bounds, center)
+
     def _swap_scene(reset_view=False):
-        if current.get("placeholder") is not None:
-            vis.remove_geometry(current["placeholder"], reset_bounding_box=False)
-            current["placeholder"] = None
-        if current["scene"] is not None:
-            vis.remove_geometry(current["scene"], reset_bounding_box=False)
-            current["scene"] = None
         if session is None:
+            backend.remove(SCENE_MAIN)
+            current["scene"] = None
+            current["variant"] = None
+            geom_names["variant"] = None
             return
-        current["scene"] = _variant()
-        vis.add_geometry(current["scene"], reset_bounding_box=reset_view)
+        variant = _variant()
+        if (current["scene"] is variant
+                and geom_names["variant"] == (state["geometry"], state["ceiling_hidden"])
+                and backend.has(SCENE_MAIN)):
+            return
+        backend.remove(SCENE_MAIN)
+        current["scene"] = variant
+        current["variant"] = (state["geometry"], state["ceiling_hidden"])
+        geom_names["variant"] = (state["geometry"], state["ceiling_hidden"])
+        if state["geometry"] == "mesh":
+            backend.add(SCENE_MAIN, variant,
+                        backend.mesh_material((1.0, 1.0, 1.0, 1.0)))
+        else:
+            backend.add(SCENE_MAIN, variant,
+                        backend.points_material((1.0, 1.0, 1.0, 1.0),
+                                                point_size=1))
+        if reset_view:
+            _frame_camera()
+        backend.request_redraw()
 
     def _ceiling_hidden(obj):
         if session is None or not state["ceiling_hidden"]:
@@ -2232,100 +2853,285 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             return False
         return bounds["max"][session["up_axis"]] > session["ceiling_val"]
 
-    def _rebuild_overlay():
-        if overlay["pcd"] is not None:
-            if overlay["pcd"] in displayed["objs"]:
-                vis.remove_geometry(overlay["pcd"], reset_bounding_box=False)
-                displayed["objs"].discard(overlay["pcd"])
-            overlay["pcd"] = None
+    def _eligible_gt_id_masks():
+        """Cached {class: {gt_id: mask}} for the active scene and benchmark."""
+        if session is None:
+            return {}
+        pred = _pred()
+        spec = _spec(pred["label_set"] if pred else state["benchmark"])
+        cache = session.setdefault("eligible_gt_id_masks", {})
+        if spec.name in cache:
+            return cache[spec.name]
+        gt_file = os.path.join(
+            artifact_paths(spec, scannet_root)["gt"], session["id"] + ".txt")
+        try:
+            gt_ids = util_3d.load_ids(gt_file)
+        except (OSError, ValueError):
+            cache[spec.name] = {}
+            return {}
+        if len(np.asarray(gt_ids)) != len(np.asarray(session["scene_pts"])):
+            cache[spec.name] = {}
+            return {}
+        cache[spec.name] = eligible_gt_id_masks(gt_ids, spec)
+        return cache[spec.name]
+
+    def _fn_masks(snap):
+        """Unmatched eligible GT masks for the current snapshot.
+
+        Returns (fn_ids, masks). A threshold change that removes a retained
+        TP immediately surfaces its matched GT instance here.
+        """
+        pred = _pred()
+        if pred is None or session is None:
+            return [], []
+        masks = _eligible_gt_id_masks()
+        if not masks:
+            return [], []
+        run_key = run_node_id(session["id"], pred)
+        sidecar = scores.get(run_key) or {}
+        matched = sidecar.get("matched_gt") or {}
+        try:
+            root = submission_dir(
+                _spec(pred["label_set"]), pred["run_id"], pred["model"], scannet_root)
+            norm = normalize_verdicts(matched, root)
+        except (OSError, ValueError, KeyError):
+            norm = dict(matched)
+        kept_keys = {objects[i].get("key") for i in snap["keep"]
+                     if objects[i].get("verdict") == "tp"}
+        matched_ids = {int(gid) for key, gid in norm.items() if key in kept_keys}
+        eligible_ids = {name: list(per) for name, per in masks.items()}
+        fn = unmatched_gt_ids(eligible_ids, matched_ids, snap["classes"])
+        ids, sels = [], []
+        for name in sorted(fn):
+            for gid in fn[name]:
+                ids.append(gid)
+                sels.append(masks[name][gid])
+        return ids, sels
+
+    def _overlay_key(kept, fn_ids=()):
+        pred = _pred()
+        return (
+            state["source_mode"], state["color_mode"], state["ceiling_hidden"],
+            None if pred is None else (
+                pred["label_set"], pred["run_id"], pred["model"]),
+            tuple((id(obj), obj.get("verdict")) for obj in kept),
+            tuple(fn_ids),
+        )
+
+    def _rebuild_overlay(snap=None):
+        # Rebuild/re-register the TP/FP/FN overlay only when source, verdict,
+        # filter, or FN data changes, not on every tick.
         if (session is None or state["source_mode"] != SOURCE_PRED
-                or state["color_mode"] != COLOR_TPGT or not objects):
+                or state["color_mode"] != COLOR_TPFN or not objects):
+            backend.remove(OVERLAY_NAME)
+            displayed["objs"].discard(OVERLAY_NAME)
+            overlay["pcd"] = None
+            overlay["key"] = None
             return
-        kept = [obj for obj in objects if obj.get("sel") is not None and not _ceiling_hidden(obj)]
-        pts, cols = merge_tp_gt_overlay(session["scene_pts"], kept)
+        if snap is None:
+            snap = _derive_view()
+        kept = [objects[i] for i in snap["keep"] if objects[i].get("sel") is not None]
+        fn_ids, fn_sels = _fn_masks(snap)
+        key = _overlay_key(kept, fn_ids)
+        if overlay["pcd"] is not None and overlay["key"] == key and backend.has(OVERLAY_NAME):
+            return
+        backend.remove(OVERLAY_NAME)
+        displayed["objs"].discard(OVERLAY_NAME)
+        overlay["pcd"] = None
+        overlay["key"] = None
+        pts, cols = merge_tp_fn_overlay(session["scene_pts"], kept, fn_sels)
         if len(pts) == 0:
             return
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts)
-        pcd.colors = o3d.utility.Vector3dVector(cols)
+        pcd.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=float))
+        pcd.colors = o3d.utility.Vector3dVector(np.asarray(cols, dtype=float))
         overlay["pcd"] = pcd
+        overlay["key"] = key
+        backend.add(OVERLAY_NAME, pcd,
+                    backend.points_material((1.0, 1.0, 1.0, 1.0),
+                                            point_size=3))
 
-    def _wanted():
+    def _query_active():
+        return state.get("query_mode") in (QUERY_SEARCH, QUERY_IMAGE)
+
+    def _filter_active():
+        return (state.get("filter") == FILTER_ON
+                and state["source_mode"] == SOURCE_PRED
+                and not _query_active())
+
+    def _derive_view():
+        """Single derivation of everything the current state displays.
+
+        Returns one immutable snapshot: kept object indices, visible objects
+        and counts, class rows, eligible GT, effective thresholds, active
+        Query ranks, and the state revision. ``_wanted()`` (3D backend) and
+        ``_hud_payload()`` (numbers/panels) both consume this snapshot instead
+        of independently re-filtering objects, so geometry and HUD cannot
+        disagree about what is visible.
+        """
+        counts = _instance_counts(objects) if objects else Counter()
+        eligible_gt = _eligible_scene_gt_counts()
+        fitted = state.get("filter_fitted")
+        if fitted is None:
+            fitted = {}
+        manual = state.get("filter_manual") or {}
+        filter_on = _filter_active()
+        filter_paused = (state.get("filter") == FILTER_ON
+                         and state["source_mode"] == SOURCE_PRED
+                         and _query_active())
+        query_active = _query_active()
         if state["source_mode"] == SOURCE_SCENE:
-            return set(), set(), set()
-        rank_set = set(query_rt["ranks"]) if state["query_mode"] in (QUERY_SEARCH, QUERY_IMAGE) and query_rt["ranks"] else None
+            rank_set = None
+        elif query_active:
+            rank_set = set(query_rt["ranks"]) if query_rt["ranks"] else set()
+        else:
+            rank_set = None
         keep = []
-        for i, obj in enumerate(objects):
-            if rank_set is not None and obj.get("key") not in rank_set:
-                continue
-            if state["color_mode"] == COLOR_TPGT and obj["verdict"] not in ("tp", "fp"):
-                continue
-            if _ceiling_hidden(obj):
-                continue
-            keep.append(i)
-        if state["color_mode"] == COLOR_TPGT:
-            want_objs = {overlay["pcd"]} if overlay["pcd"] is not None else set()
+        if state["source_mode"] != SOURCE_SCENE:
+            keep = derive_keep_indices(
+                objects, rank_set, state["color_mode"], filter_on,
+                fitted, manual, eligible_gt, hidden=_ceiling_hidden)
+        visible_objects = [objects[i] for i in keep]
+        visible_counts = _instance_counts(visible_objects) if visible_objects else Counter()
+        if state["source_mode"] == SOURCE_PRED:
+            if filter_on or filter_paused:
+                classes = sorted(eligible_gt or {})
+            else:
+                classes = union_prediction_classes(eligible_gt, counts)
+        elif eligible_gt is not None:
+            classes = sorted(eligible_gt)
+        elif session and session["gt_counts"]:
+            classes = sorted(session["gt_counts"])
         else:
-            want_objs = {objects[i]["pcd"] for i in keep}
+            classes = sorted(counts)
+        class_stats = {}
+        if state["source_mode"] == SOURCE_PRED and eligible_gt is not None:
+            class_stats = class_count_stats(visible_objects, classes, eligible_gt)
+        threshold_rows = []
+        if state["source_mode"] == SOURCE_PRED:
+            threshold_rows = build_threshold_rows(
+                classes, fitted, manual, visible_counts, eligible_gt or {})
+        return {
+            "revision": int(state.get("view_revision", 0)),
+            "keep": tuple(keep),
+            "visible_objects": visible_objects,
+            "visible_counts": visible_counts,
+            "raw_counts": counts,
+            "classes": classes,
+            "class_stats": class_stats,
+            "eligible_gt": eligible_gt,
+            "eligible_total": (sum(eligible_gt.values()) if eligible_gt else None),
+            "fitted": fitted,
+            "manual": manual,
+            "filter_on": filter_on,
+            "filter_paused": filter_paused,
+            "query_active": query_active,
+            "rank_set": rank_set,
+            "threshold_rows": threshold_rows,
+        }
+
+    def _filter_ctx():
+        """Keyboard context for per-class threshold selection.
+
+        Editable only when Filter is effectively On with fitted global
+        thresholds; Query-paused, hidden, or unfitted rows never receive
+        threshold actions.
+        """
+        fitted = state.get("filter_fitted")
+        if not (state.get("filter") == FILTER_ON
+                and state["source_mode"] == SOURCE_PRED
+                and fitted and not _query_active()):
+            return {"classes": [], "fitted": {}, "manual": {}, "editable": False}
+        snap_classes = _derive_view()["classes"]
+        manual = state.get("filter_manual") or {}
+        return {"classes": [name for name in snap_classes if name in fitted],
+                "fitted": dict(fitted), "manual": dict(manual), "editable": True}
+
+    def _commit_view():
+        """One commit path: bump revision, repaint, sync backend, publish HUD."""
+        state["view_revision"] = int(state.get("view_revision", 0)) + 1
+        _paint()
+        _sync()
+        _update_hud()
+
+    def _wanted(snap=None):
+        """Return (object names, box names, label ops) — names, not identity.
+
+        Label ops are (obj, visible, color, anchor) tuples for :func:`sync_label`;
+        no camera math happens here, so orbit causes no Python label work.
+        Visibility comes from ``_derive_view()``; this function only maps the
+        shared keep-set onto backend names, boxes, and labels.
+        """
+        if snap is None:
+            snap = _derive_view()
+        if state["source_mode"] == SOURCE_SCENE:
+            return set(), set(), []
+        keep = list(snap["keep"])
+        if state["color_mode"] == COLOR_TPFN:
+            want_objs = {OVERLAY_NAME} if overlay["pcd"] is not None else set()
+        else:
+            want_objs = {objects[i]["pcd_name"] for i in keep
+                         if objects[i].get("pcd_name")}
         want_boxes = set()
-        want_labels = set()
+        label_ops = []
         want_box = bool(state["boxes"])
-        label_height = LABEL_WORLD.get(state.get("labels", "off"), 0.0)
         want_text = state.get("labels", "off") != "off"
-        # Face new labels toward the live camera once; never touch them again.
-        try:
-            _params = vis.get_view_control().convert_to_pinhole_camera_parameters()
-            _ext = np.asarray(_params.extrinsic)
-            _cam = -_ext[:3, :3].T @ _ext[:3, 3]
-        except Exception:
-            _cam = None
-        if _cam is not None and np.linalg.norm(_cam) > 1e-6:
-            _to_cam = _cam - session["scene_pts"].mean(0)
-            _to_cam[session["up_axis"]] = 0.0
-            if np.linalg.norm(_to_cam) < 1e-6:
-                _to_cam = np.array([1.0, 0.0, 0.0])
-                _to_cam[session["up_axis"]] = 0.0
-            _to_cam /= np.linalg.norm(_to_cam)
-            _x_dir = np.cross(session["up_vec"], _to_cam)
-            if np.linalg.norm(_x_dir) < 1e-6:
-                _x_dir = np.array([1.0, 0.0, 0.0])
-            _x_dir /= np.linalg.norm(_x_dir)
-        else:
-            _x_dir = np.array([1.0, 0.0, 0.0])
-            _x_dir[session["up_axis"]] = 0.0
-            _x_dir /= max(np.linalg.norm(_x_dir), 1e-9)
-        if want_box or want_text:
+        if want_box:
             for i in keep:
                 obj = objects[i]
-                ensure_object_decorations(
-                    obj, _object_color(i, obj),
-                    _x_dir, session["up_vec"], session["up_axis"],
-                    label_height=label_height, want_box=want_box, want_label=want_text)
-                if want_box and obj.get("box") is not None:
-                    want_boxes.add(obj["box"])
-                if want_text and obj.get("label") is not None:
-                    want_labels.add(obj["label"]["mesh"])
-        return want_objs, want_boxes, want_labels
+                ensure_object_box(obj)
+                if obj.get("box") is not None and obj.get("box_name"):
+                    want_boxes.add(obj["box_name"])
+        keep_set = set(keep)
+        for i, obj in enumerate(objects):
+            visible = i in keep_set and want_text
+            color = tuple(float(v) for v in _object_color(i, obj))
+            anchor = (obj.get("bounds") or {}).get("anchor")
+            label_ops.append((obj, visible, color, anchor))
+        return want_objs, want_boxes, label_ops
 
-    def _apply_diff(displayed_set, wanted_set):
-        for g in displayed_set - wanted_set:
-            vis.remove_geometry(g, reset_bounding_box=False)
-        for g in wanted_set - displayed_set:
-            vis.add_geometry(g, reset_bounding_box=False)
-        return wanted_set
+    def _apply_diff(wanted_names, family):
+        """Show/hide already-registered names; never add/remove here."""
+        for name in list(displayed[family]):
+            if name not in wanted_names and backend.has(name):
+                backend.show(name, False)
+        for name in wanted_names:
+            if backend.has(name):
+                backend.show(name, True)
+        displayed[family] = set(wanted_names)
 
     def _sync():
-        want_objs, want_boxes, want_labels = _wanted()
-        displayed["objs"] = _apply_diff(displayed["objs"], want_objs)
-        displayed["boxes"] = _apply_diff(displayed["boxes"], want_boxes)
-        displayed["labels"] = _apply_diff(displayed["labels"], want_labels)
+        want_objs, want_boxes, label_ops = _wanted()
+        for idx, obj in enumerate(objects):
+            name = obj.get("pcd_name")
+            if not name:
+                continue
+            if not backend.has(name):
+                backend.add(name, obj["pcd"], _object_material(idx, obj))
+        for idx, obj in enumerate(objects):
+            bname = obj.get("box_name")
+            if not bname:
+                continue
+            if obj.get("box") is not None and not backend.has(bname):
+                backend.add(bname, obj["box"], _box_material(idx, obj))
+        _apply_diff(want_objs, "objs")
+        _apply_diff(want_boxes, "boxes")
+        for obj, visible, color, anchor in label_ops:
+            sync_label(backend, obj, visible, state.get("labels", "off"),
+                       color=color, anchor=anchor)
+        # One redraw per batch (Stage I); idle ticks request none.
+        backend.request_redraw()
 
     def _object_color(idx, o):
         if state["color_mode"] == COLOR_QUERY:
-            score = float(query_rt["scores"].get(o.get("key"), 0.0))
-            t = max(0.0, min(1.0, (score + 1.0) * 0.5))
+            norm = query_rt.get("norm") or {}
+            if o.get("key") in norm:
+                t = max(0.0, min(1.0, float(norm[o.get("key")])))
+            else:
+                score = float(query_rt["scores"].get(o.get("key"), 0.0))
+                t = max(0.0, min(1.0, (score + 1.0) * 0.5))
             return colormaps["plasma"](t)[:3]
-        if state["color_mode"] == COLOR_TPGT:
+        if state["color_mode"] == COLOR_TPFN:
             if o["verdict"] == "tp":
                 return TP_COLOR
             if o["verdict"] == "fp":
@@ -2338,69 +3144,91 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         name = o.get("query_label") or o["class_name"]
         return _class_color(name, nyu40map, palette)
 
+    def _material_key(idx, obj):
+        mode = state["color_mode"]
+        if mode == COLOR_INSTANCE:
+            return ("instance", idx)
+        if mode == COLOR_QUERY:
+            return ("query", idx)
+        if mode == COLOR_TPFN and obj.get("verdict") in ("tp", "fp", "ignored"):
+            return ("verdict", obj.get("verdict"))
+        return ("class", obj.get("query_label") or obj.get("class_name"))
+
+    def _object_material(idx, obj):
+        # Class/verdict materials cached; per-object keys only for instance
+        # and query gradients (Stage F). No per-point color uploads.
+        color = tuple(float(v) for v in _object_color(idx, obj)) + (1.0,)
+        key = ("points",) + _material_key(idx, obj)
+        mat = mat_cache.get(key)
+        if mat is None:
+            mat = backend.points_material(color, point_size=3)
+            mat_cache[key] = mat
+        return mat
+
+    def _box_material(idx, obj):
+        color = tuple(float(v) for v in _object_color(idx, obj)) + (1.0,)
+        key = ("line",) + _material_key(idx, obj)
+        mat = mat_cache.get(key)
+        if mat is None:
+            mat = backend.line_material(color, line_width=2)
+            mat_cache[key] = mat
+        return mat
+
     def _paint():
-        clear_tracked(vis, displayed, "boxes")
         _rebuild_overlay()
         for idx, o in enumerate(objects):
-            color = _object_color(idx, o)
-            if state["color_mode"] != COLOR_TPGT:
-                colors = np.tile(color, (len(o["pcd"].points), 1))
-                o["pcd"].colors = o3d.utility.Vector3dVector(colors)
-                if o["pcd"] in displayed["objs"]:
-                    vis.update_geometry(o["pcd"])
-            if o.get("box") is not None:
-                o["box"].color = color
-            lab = o.get("label")
-            if lab is not None:
-                lab["mesh"].paint_uniform_color(color)
-                if lab["mesh"] in displayed["labels"]:
-                    vis.update_geometry(lab["mesh"])
+            name = o.get("pcd_name")
+            if name and backend.has(name):
+                backend.set_material(name, _object_material(idx, o))
+            bname = o.get("box_name")
+            if o.get("box") is not None and bname and backend.has(bname):
+                backend.set_material(bname, _box_material(idx, o))
 
     def _detach_all():
+        backend.remove(OVERLAY_NAME)
         overlay["pcd"] = None
-        clear_tracked(vis, displayed, "objs")
-        clear_tracked(vis, displayed, "boxes")
-        clear_tracked(vis, displayed, "labels")
+        overlay["key"] = None
+        _retire_object_generation()
+        displayed["boxes"] = set()
         _detach_camera()
-        if current.get("placeholder") is not None:
-            vis.remove_geometry(current["placeholder"], reset_bounding_box=False)
-            current["placeholder"] = None
-        if current["scene"] is not None:
-            vis.remove_geometry(current["scene"], reset_bounding_box=False)
-            current["scene"] = None
+        backend.remove(SCENE_MAIN)
+        current["scene"] = None
+        current["variant"] = None
+        geom_names["variant"] = None
 
-    def _hud_payload():
-        counts = _instance_counts(objects) if objects else Counter()
-        eligible_gt = _eligible_scene_gt_counts()
-        if eligible_gt is not None:
-            presence = eligible_gt
-        elif state["source_mode"] == SOURCE_PRED:
-            presence = counts
-        elif session and session["gt_counts"]:
-            presence = session["gt_counts"]
-        else:
-            presence = counts
-        classes = sorted(presence)
-        class_stats = {}
-        if state["source_mode"] == SOURCE_PRED and eligible_gt is not None:
-            class_stats = class_count_stats(objects, classes, eligible_gt)
+    def _hud_payload(snap=None):
+        if snap is None:
+            snap = _derive_view()
+        visible_objects = snap["visible_objects"]
+        visible_counts = snap["visible_counts"]
+        classes = snap["classes"]
+        class_stats = snap["class_stats"]
+        eligible_gt = snap["eligible_gt"]
+        fitted = snap["fitted"]
+        manual = snap["manual"]
+        filter_on = snap["filter_on"]
+        filter_paused = snap["filter_paused"]
         png = _cad_png()
         pred = _pred()
-        masks = None
-        if state["source_mode"] == SOURCE_PRED and objects:
-            masks = {
-                "pred": len(objects),
-                "gt": sum(eligible_gt.values()) if eligible_gt else None,
-                "tp": sum(1 for o in objects if o.get("verdict") == "tp"),
-                "fp": sum(1 for o in objects if o.get("verdict") == "fp"),
-                "ignored": sum(1 for o in objects if o.get("verdict") == "ignored"),
-            }
+        eligible_total = snap["eligible_total"]
+        threshold_rows = snap["threshold_rows"] if state["source_mode"] == SOURCE_PRED else []
         return {
             "status": state["status"],
+            "view_revision": snap["revision"],
             "settings": settings_payload(state, _option_lists(), _display_value),
             "info": information_payload(
                 session["id"] if session else None, pred, scores, run_metrics,
-                recon_times, pred_times, masks),
+                recon_times, pred_times, None,
+                visible_pred=len(visible_objects) if state["source_mode"] == SOURCE_PRED else None,
+                eligible_gt=eligible_total if state["source_mode"] == SOURCE_PRED else None),
+            "filter": {
+                "mode": state.get("filter", FILTER_OFF),
+                "active": filter_on,
+                "paused_by_query": filter_paused,
+                "reason": state.get("filter_unavailable") or "",
+                "selected": state.get("filter_selected"),
+                "rows": threshold_rows,
+            },
             "pipeline": (
                 {"method": pred["model"], "text": MODEL_PIPELINE[pred["model"]]}
                 if pred and pred["model"] in MODEL_PIPELINE else None),
@@ -2416,6 +3244,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                 "mode": state["query_mode"],
                 "status": query_rt["status"],
                 "input": query_rt["input"],
+                "count": len(query_rt["ranks"] or []),
                 "reset_id": query_rt["reset_id"],
                 "can_search": any(
                     opt["value"] == QUERY_SEARCH and opt.get("enabled", True)
@@ -2444,6 +3273,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
             },
             "video": None if state.get("cad_open") else camera_rt.get("video"),
             "panel": state.get("panel", PANEL_CLASSES),
+            "color_mode": state["color_mode"],
         }
 
     def _update_hud():
@@ -2451,7 +3281,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         publish_left({"tree": payload["tree"]})
         publish_right({k: payload[k] for k in (
             "settings", "classes", "colors", "class_stats", "status", "focus", "cad_overlay", "info",
-            "query", "camera", "video", "pipeline", "panel")})
+            "query", "camera", "video", "pipeline", "panel", "filter")})
 
     def _normalize_color():
         if state["source_mode"] == SOURCE_SCENE:
@@ -2459,7 +3289,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         if state["color_mode"] == COLOR_QUERY and state["query_mode"] not in (
                 QUERY_SEARCH, QUERY_IMAGE):
             state["color_mode"] = COLOR_CLASS
-        if state["color_mode"] == COLOR_TPGT and (
+        if state["color_mode"] == COLOR_TPFN and (
                 state["source_mode"] != SOURCE_PRED or not _tp_available()):
             state["color_mode"] = COLOR_CLASS
 
@@ -2544,17 +3374,27 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                 _start_replay_cache()
             else:
                 camera_rt["video"] = None
+        elif row == "filter":
+            if value == state.get("filter", FILTER_OFF):
+                return
+            if value == FILTER_ON:
+                _refresh_filter_thresholds()
+                if state.get("filter_fitted") is None:
+                    state["status"] = (
+                        "Filter unavailable: %s" % (state.get("filter_unavailable")
+                                                    or "global thresholds missing"))
+                    _update_hud()
+                    return
+            state["filter"] = value
         _normalize_color()
         if session is None:
             _update_hud()
             return
         if need_reload:
             _load_source()
-        _paint()
-        _sync()
         if recolor_replay and state["camera_mode"] == CAMERA_REPLAY:
             _invalidate_replay_cache()
-        _update_hud()
+        _commit_view()
 
     def _bind_session(recon_id):
         nonlocal session, objects
@@ -2600,10 +3440,9 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         state["candidate"] = None
         _normalize_color()
         _load_source()
-        _paint()
-        _sync()
+        _refresh_filter_thresholds()
         _swap_scene(reset_view=True)
-        _update_hud()
+        _commit_view()
 
     def _activate_run(row):
         recon = row["recon_id"]
@@ -2626,20 +3465,32 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         state["active_method"] = method_node_id(recon, pred["model"])
         _normalize_color()
         _load_source()
+        _refresh_filter_thresholds()
         if need_view:
             _swap_scene(reset_view=True)
-        _paint()
-        _sync()
-        _update_hud()
+        _commit_view()
 
     def _activate_method(row):
         _activate_run(row)
 
     def _sync_query_objects():
-        for obj in objects:
-            obj["query_label"] = None
-        _paint()
-        _sync()
+        """Apply the active query result to objects and refresh one revision.
+
+        Ranked objects receive the prompted (CLIP) or native (OpenIns3D)
+        label; all other objects are cleared. Stale keys from a previous
+        source generation are dropped with a status note. An explicit empty
+        rank set renders no prediction masks with a No-matches status instead
+        of silently restoring the full scene.
+        """
+        requested = list(query_rt.get("ranks") or [])
+        prompt = query_rt.get("input") or ""
+        active = state["query_mode"] in (QUERY_SEARCH, QUERY_IMAGE)
+        kept, status = apply_query_result(
+            objects, requested, query_rt.get("labels"), prompt, active)
+        query_rt["ranks"] = kept
+        if status:
+            query_rt["status"] = status
+        _commit_view()
         if state["camera_mode"] == CAMERA_REPLAY:
             _invalidate_replay_cache()
 
@@ -2686,15 +3537,52 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                 camera_rt["last_tick"] = None
                 _show_cached_frame(camera_rt["frame"])
                 _update_hud()
+            return
+        if kind == "filter_set":
+            name = action.get("class")
+            if not name:
+                return
+            try:
+                value = float(action.get("value"))
+            except (TypeError, ValueError):
+                return
+            value = min(1.0, max(0.0, value))
+            manual = dict(state.get("filter_manual") or {})
+            manual[name] = value
+            state["filter_manual"] = manual
+            _commit_view()
+            return
+        if kind == "filter_reset":
+            name = action.get("class")
+            if not name:
+                return
+            manual = dict(state.get("filter_manual") or {})
+            if name in manual:
+                del manual[name]
+                state["filter_manual"] = manual
+                _commit_view()
+            return
+
+    _ACTION_TO_KEY = {
+        "up": KEY_UP, "down": KEY_DOWN, "left": KEY_LEFT,
+        "right": KEY_RIGHT, "enter": KEY_ENTER, "tab": KEY_TAB,
+        "q": ord("Q"), "escape": KEY_ESCAPE,
+    }
 
     def _dispatch(key):
         if isinstance(key, dict):
             _handle_hud_action(key)
             return
+        if isinstance(key, str):
+            # SceneWidget key action via make_key_handler (Stage D).
+            key = _ACTION_TO_KEY.get(key)
+            if key is None:
+                return
         if key in (ord("Q"), KEY_ESCAPE):
-            vis.close()
+            backend.close()
             return
-        action = handle_navigation(state, key, _tree_rows(), _option_lists())
+        action = handle_navigation(state, key, _tree_rows(), _option_lists(),
+                                     _filter_ctx())
         if action.get("activate"):
             row = action["activate"]
             if row["kind"] == KIND_SCAN:
@@ -2707,6 +3595,13 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         if action.get("apply"):
             _apply(*action["apply"])
             return
+        if action.get("filter_adjust"):
+            name, value = action["filter_adjust"]
+            _handle_hud_action({"type": "filter_set", "class": name, "value": value})
+            return
+        if action.get("filter_reset"):
+            _handle_hud_action({"type": "filter_reset", "class": action["filter_reset"]})
+            return
         if action.get("transport"):
             _exec_replay_transport(action["transport"])
             return
@@ -2714,6 +3609,7 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         _update_hud()
 
     def _drain_keys():
+        dispatched = 0
         for conn in (left_key_recv, right_key_recv):
             while True:
                 try:
@@ -2724,20 +3620,23 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                     break
                 if isinstance(key, (int, dict)):
                     _dispatch(key)
+                    dispatched += 1
+        return dispatched
 
-    def _tick(_vis):
-        _drain_keys()
-        _poll_query_prompt()
+    def _tick():
+        # No-arg Window tick (Stage D): preserve polling + ready-frame-first
+        # replay; True only on visible change so idle ticks skip redraw.
+        dirty = bool(_drain_keys())
+        if _poll_query_prompt():
+            dirty = True
         native = query_rt.get("native_result")
         if native is not None:
             query_rt["native_result"] = None
             if _apply_native_query_response(native):
                 _sync_query_objects()
-                _update_hud()
         msg = query_client.poll()
         if msg and _apply_query_response(msg):
             _sync_query_objects()
-            _update_hud()
         updated = False
         if (state["camera_mode"] == CAMERA_REPLAY and camera_rt["sequence"]
                 and not state.get("cad_open")):
@@ -2765,15 +3664,25 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
                         updated = True
                     else:
                         camera_rt["last_tick"] = last
-        return updated
+        return dirty or updated
 
-    def _key_action(key, handler):
-        def callback(_vis, action, _mods):
-            if action != KEY_PRESS:
-                return False
-            handler()
-            return False
-        vis.register_key_action_callback(key, callback)
+    def _shutdown_cleanup():
+        # One idempotent path for keyboard and window-manager closure:
+        # replay/prompt/query/openins/HUD/labels/geometry, then app quit
+        # is handled by the backend after this cleanup runs.
+        _close_replay()
+        _close_query_prompt()
+        query_client.close()
+        proc = query_rt.get("openins")
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        for obj in objects:
+            remove_label_handle(backend, obj)
+        _stop_hud(left_q, left_p, stop_left)
+        _stop_hud(right_q, right_p, stop_right)
 
     t0 = time.monotonic()
     while time.monotonic() - t0 < 2.0:
@@ -2782,26 +3691,12 @@ def visualize(scene_id=None, scannet_dir=DEFAULT_SCANNET_DIR, benchmark="ScanNet
         time.sleep(0.02)
     _update_hud()
 
-    _key_action(KEY_UP, lambda: _dispatch(KEY_UP))
-    _key_action(KEY_DOWN, lambda: _dispatch(KEY_DOWN))
-    _key_action(KEY_LEFT, lambda: _dispatch(KEY_LEFT))
-    _key_action(KEY_RIGHT, lambda: _dispatch(KEY_RIGHT))
-    _key_action(KEY_ENTER, lambda: _dispatch(KEY_ENTER))
-    _key_action(KEY_TAB, lambda: _dispatch(KEY_TAB))
-    _key_action(ord("Q"), lambda: _dispatch(ord("Q")))
-    _key_action(KEY_ESCAPE, lambda: _dispatch(KEY_ESCAPE))
-    vis.register_animation_callback(_tick)
+    backend.attach_close(cleanup=_shutdown_cleanup)
+    # Stage D: explicit gui.KeyName routing (never raw GLFW ints); True
+    # consumes nav keys so camera controls do not steal them. Key-up is
+    # ignored; repeat key-down dispatches like a first press. No custom
+    # mouse callback: SceneWidget ROTATE_CAMERA controls stay native.
+    backend._window.set_on_key(make_key_handler(_dispatch))
+    backend._window.set_on_tick_event(_tick)
     print("Keys: Tab HUD, arrows, Enter, mouse view, Esc/Q quit")
-    vis.run()
-    _close_replay()
-    _close_query_prompt()
-    query_client.close()
-    proc = query_rt.get("openins")
-    if proc is not None:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-    _stop_hud(left_q, left_p, stop_left)
-    _stop_hud(right_q, right_p, stop_right)
-    vis.destroy_window()
+    app.run()
