@@ -244,17 +244,25 @@ def main():
             os.symlink(shared, local)
             info = extract_mod.load_info(shared)
 
+            from utils.compute_time import write_reconstruction_timing
+
             if policy == "managed":
                 settings = load_settings()
                 with gpu_lease(settings["gpu_pool"], settings["scannet_root"]) as lease:
+                    started = time.monotonic()
                     mesh_native, poses, keep, convention = engine.reconstruct(
                         work, root, gpu=lease.index, lease_fd=lease.fileno())
                     _pipeline(work, root, sid, info, args.engine, mesh_native, poses,
                               keep, convention)
+                    write_reconstruction_timing(
+                        root, sid, args.engine, time.monotonic() - started)
             else:
+                started = time.monotonic()
                 mesh_native, poses, keep, convention = engine.reconstruct(work, root)
                 _pipeline(work, root, sid, info, args.engine, mesh_native, poses,
                           keep, convention)
+                write_reconstruction_timing(
+                    root, sid, args.engine, time.monotonic() - started)
 
             if args.scene == BENCHMARK_SCENE:
                 try:

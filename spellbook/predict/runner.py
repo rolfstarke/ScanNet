@@ -125,7 +125,7 @@ def _pointcloud_path(scene_id, scannet_root):
 
 
 def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, tasks_log, lease,
-             run_id, parameters_json, scannet_root):
+             run_id, parameters_json, scannet_root, features_out=None):
     """Run one (model, scene) task in a subprocess. Returns
     (model, scene_id, out_dir, elapsed, ok). Task markers and TP50 scoring happen after
     the GPU lease is released."""
@@ -142,6 +142,8 @@ def _run_one(model, scene_id, frames_dir, classes, gpu, out_dir, benchmark, task
         if frames_dir is None:
             raise RuntimeError(f"{model} needs frames but extraction produced none for {scene_id}")
         args += ["--frames", frames_dir]
+    if features_out:
+        args += ["--features-out", features_out]
 
     env = child_env(lease, model)
     pass_fds = (lease.fileno(),)
@@ -174,6 +176,15 @@ def _read_tasks(tasks_log):
         return []
     with open(tasks_log) as f:
         return [line.strip() for line in f if line.strip()]
+
+
+def _ensure_task(tasks_log, scene_id, scannet_root=None):
+    from utils.scan_lock import exclusive_lock, prediction_index_lock_path
+    with exclusive_lock(prediction_index_lock_path(scannet_root)):
+        scenes = _read_tasks(tasks_log)
+        if scene_id not in scenes:
+            scenes.append(scene_id)
+            _atomic_write_tasks(tasks_log, scenes)
 
 
 def _finalize_prediction(model, scene_id, out_dir, benchmark, run_id, tasks_log,
@@ -222,6 +233,31 @@ def gpu_check_model(model, lease, hold_seconds=5):
                 visible_gpu=info.get("visible"), lease_fd=lease.fileno(),
                 runtime=info.get("device") or "torch",
                 seconds=round(time.time() - start, 1), reason=None)
+
+
+def _auto_evaluate(spec, run_id, models, unique_scenes, scannet_root):
+    """Grade a finished prediction run: export missing GT, then evaluate each
+    model. Never raises — a failed grade must not downgrade good predictions."""
+    from evaluation.benchmark import artifact_paths
+    from evaluation.evaluate import evaluate_cli, export_gt_cli
+    from evaluation.runs import run_is_evaluated
+    gt_dir = artifact_paths(spec, scannet_root)["gt"]
+    for scene_id in unique_scenes:
+        if os.path.isfile(os.path.join(gt_dir, scene_id + ".txt")):
+            continue
+        try:
+            export_gt_cli(["--scene", scene_id, "--benchmark", spec.name,
+                           "--scannet-root", scannet_root])
+        except Exception as exc:
+            print(f"[WARN] GT export failed for {scene_id} ({exc})")
+    for model in models:
+        if run_is_evaluated(spec, run_id, model, scannet_root):
+            continue
+        try:
+            evaluate_cli(["--run-id", run_id, "--benchmark", spec.name,
+                          "--models", model, "--scannet-root", scannet_root])
+        except Exception as exc:
+            print(f"[WARN] auto-evaluation failed for {model} ({exc})")
 
 
 def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, replace=False,
@@ -316,6 +352,7 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
                 status = scene_submission_status(
                     out_dir, scene_id, spec, run_id, model, scannet_root=scannet_root)
                 if status == "complete":
+                    _ensure_task(tasks_log, scene_id, scannet_root=scannet_root)
                     skipped.append((model, scene_id, out_dir, 0.0, True))
                 elif status == "needs_score":
                     try:
@@ -346,11 +383,17 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
                 lock_ctx.__enter__()
             try:
                 with gpu_lease(gpu_pool, scannet_root) as lease:
+                    from utils.query import clip_features_path
                     result = _run_one(
                         model, scene_id, frames_dir_by_scene.get(scene_id), classes,
                         lease.index, out_dir, benchmark, tasks_log, lease,
-                        run_id, param_paths[model], scannet_root)
+                        run_id, param_paths[model], scannet_root,
+                        features_out=clip_features_path(
+                            spec, run_id, model, scene_id, scannet_root=scannet_root))
                 if result[-1]:
+                    from utils.compute_time import write_prediction_timing
+                    write_prediction_timing(
+                        spec, run_id, model, scene_id, result[3], scannet_root=scannet_root)
                     try:
                         _finalize_prediction(
                             model, scene_id, result[2], benchmark, run_id, tasks_log,
@@ -369,6 +412,10 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
                 futures = [pool.submit(work, t) for t in pending]
                 for fut in futures:
                     results.append(fut.result())
+        if all(row[-1] for row in results):
+            _auto_evaluate(spec, run_id, models, unique_scenes, scannet_root)
+        else:
+            print("[WARN] evaluation skipped (failed tasks)")
         return results
     finally:
         for lk in reversed(locks):

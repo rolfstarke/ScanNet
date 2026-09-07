@@ -25,8 +25,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (  # noqa: E402
-    _benchmark_spec, add_run_args, decimate, load_overrides,
-    scene_id_from_pointcloud, write_scannet_submission,
+    _benchmark_spec, add_run_args, decimate, load_overrides, publish_clip_features,
+    scene_id_from_pointcloud, write_scannet_submission_rows,
 )
 
 OPENMASK3D_REPO = "/home/rolf/GIT/openmask3d"
@@ -39,6 +39,7 @@ NUM_QUERIES = 150
 DBSCAN_MIN_POINTS = 1
 FREQUENCY = 10
 CLIP_PROMPT = "a {} in a scene"
+DEDUP_IOU = 0.5
 SCRATCH_ROOT = "/data/openmask3d/scratch"
 
 
@@ -133,15 +134,40 @@ def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS,
         norm = np.linalg.norm(feats[mi])
         if norm < 1e-6:
             continue
-        sims = (feats[mi] / norm) @ text_ft.T
+        unit = feats[mi] / norm
+        sims = unit @ text_ft.T
         best = int(np.argmax(sims))
         name = classes[best]
         if name in ("wall", "floor"):
             skipped += 1
             continue
-        instances.append((sel, name, 1.0))
+        instances.append((sel, name, 1.0, unit))
     print(f"[INFO] skipped {skipped} wall/floor CLIP assignments")
     return instances
+
+
+def _dedup_instances(instances, iou_threshold=DEDUP_IOU):
+    """Greedily keeps the highest-confidence mask within each same-class overlapping
+    cluster (overlap = intersection over the SMALLER mask, so a small spurious proposal
+    nested inside a larger correct one still counts as a duplicate)."""
+    by_class = {}
+    for i, inst in enumerate(instances):
+        by_class.setdefault(inst[1], []).append(i)
+
+    keep = [False] * len(instances)
+    for idxs in by_class.values():
+        idxs.sort(key=lambda i: -instances[i][2])
+        kept_masks = []
+        for i in idxs:
+            mask = instances[i][0]
+            mask_size = mask.sum()
+            if any(mask_size and kept.sum() and
+                   np.logical_and(mask, kept).sum() / min(mask_size, kept.sum()) > iou_threshold
+                   for kept in kept_masks):
+                continue
+            kept_masks.append(mask)
+            keep[i] = True
+    return [inst for inst, k in zip(instances, keep) if k]
 
 
 def main():
@@ -158,13 +184,14 @@ def main():
     scene_id = scene_id_from_pointcloud(args.pointcloud)
     params = load_overrides(args.parameters_json, {
         "point_limit", "min_mask_points", "num_queries", "dbscan_min_points",
-        "frequency", "clip_prompt"})
+        "frequency", "clip_prompt", "dedup_iou"})
     point_limit = int(params.get("point_limit", POINT_LIMIT))
     min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
     num_queries = int(params.get("num_queries", NUM_QUERIES))
     dbscan_min_points = int(params.get("dbscan_min_points", DBSCAN_MIN_POINTS))
     frequency = int(params.get("frequency", FREQUENCY))
     clip_prompt = str(params.get("clip_prompt", CLIP_PROMPT))
+    dedup_iou = float(params.get("dedup_iou", DEDUP_IOU))
     print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params} "
           f"queries={num_queries} dbscan_min={dbscan_min_points} freq={frequency}")
 
@@ -196,14 +223,22 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     clip_classes = _clip_vocab(spec)
     instances = _classify(masks, feats, clip_classes, device, min_mask_points, clip_prompt)
+    deduped = _dedup_instances(instances, iou_threshold=dedup_iou)
 
-    def _instances():
-        for sel_decimated, class_name, confidence in instances:
-            yield sel_decimated[nn_idx], class_name, confidence
+    candidates = []
+    feature_rows = []
+    for item in deduped:
+        sel_decimated, class_name, confidence, feat = item
+        candidates.append((sel_decimated[nn_idx], class_name, confidence))
+        feature_rows.append(feat)
 
-    n_written = write_scannet_submission(args.out, scene_id, args.classes, _instances(),
-                                          min_mask_points, spec)
-    print(f"[INFO] {len(instances)} instances, {n_written} written to {args.out}")
+    rows = write_scannet_submission_rows(args.out, scene_id, args.classes, candidates,
+                                        min_mask_points, spec)
+    publish_clip_features(
+        args.features_out, feature_rows, rows, spec, args.run_id, "openmask3d", scene_id,
+        "openai_clip", "ViT-L/14@336px", 768)
+    print(f"[INFO] {len(instances)} raw instances -> {len(deduped)} after IoU-overlap "
+          f"dedup, {rows['n_written']} written to {args.out}")
 
 
 if __name__ == "__main__":
