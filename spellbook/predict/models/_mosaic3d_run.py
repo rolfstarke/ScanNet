@@ -21,8 +21,8 @@ from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (  # noqa: E402
-    _benchmark_spec, add_run_args, decimate, load_overrides,
-    scene_id_from_pointcloud, write_scannet_submission,
+    _benchmark_spec, add_run_args, decimate, load_overrides, publish_clip_features,
+    scene_id_from_pointcloud, write_scannet_submission_rows,
 )
 
 MOSAIC3D_REPO = "/home/rolf/GIT/Mosaic3D"
@@ -113,7 +113,29 @@ def main():
         scene_ply = args.pointcloud
 
     sys.path.insert(0, MOSAIC3D_REPO)
-    os.chdir(MOSAIC3D_REPO)
+    os.chdir(MOSAIC3D_REPO)  # run_custom_scene.py's own imports assume repo root as cwd
+    from scripts.run_custom_scene import (  # noqa: E402
+        CLIP_CFG, build_net, load_backbone_ckpt, run_inference)
+    from src.models.utils.clip_models import build_clip_model  # noqa: E402
+
+    class _CaptureNet:
+        def __init__(self, net):
+            self.net = net
+            self.point = None
+
+        def __call__(self, *args, **kwargs):
+            self.point = self.net(*args, **kwargs)
+            return self.point
+
+        def eval(self):
+            self.net.eval()
+            return self
+
+        def to(self, device_):
+            self.net.to(device_)
+            return self
+
+    feature_rows = None
     if instance_head == "mask3d":
         from scripts.run_custom_scene import classify_mask3d_proposals
         masks = _mask3d_masks(args.pointcloud, args.run_id, scene_id, mask3d_confidence)
@@ -127,22 +149,48 @@ def main():
         nn_idx = np.arange(len(full_pts))
         working_pts = full_pts
     else:
-        from scripts.run_custom_scene import run_inference
+        net = build_net()
+        load_backbone_ckpt(net, checkpoint)
+        net = net.to(device).eval()
+        clip_model = build_clip_model(CLIP_CFG, device=device)
+        clip_model.eval()
+        for param in clip_model.parameters():
+            param.requires_grad = False
+        capturer = _CaptureNet(net)
         objects, _, _ = run_inference(
             scene_ply, args.classes, checkpoint, device, condition=condition,
             grid_size=grid_size, up_axis=up_axis,
-            class_profiles=STRUCTURAL_CLASS_PROFILES,
+            class_profiles=STRUCTURAL_CLASS_PROFILES, net=capturer, clip_model=clip_model,
         )
-
-    def _instances():
+        if capturer.point is None:
+            raise RuntimeError("Mosaic3D encoder produced no captured point features")
+        point = capturer.point
+        point_feat = point.sparse_conv_feat.features[point.v2p_map]
+        point_feat = torch.nn.functional.normalize(
+            point_feat.float(), dim=-1).detach().cpu().numpy()
+        feature_rows = []
         for obj in objects:
-            sel_working = np.zeros(len(working_pts), dtype=bool)
-            sel_working[obj["point_indices"]] = True
-            yield sel_working[nn_idx], obj["class_name"], obj["score"]
+            vec = point_feat[obj["point_indices"]].mean(axis=0)
+            norm = np.linalg.norm(vec)
+            if norm >= 1e-6:
+                vec = vec / norm
+            feature_rows.append(vec.astype(np.float32))
 
-    n_written = write_scannet_submission(args.out, scene_id, args.classes, _instances(),
-                                          min_mask_points, spec)
-    print(f"[INFO] Wrote {n_written} instances to {args.out} ({len(working_pts)}/{len(full_pts)} points used)")
+    candidates = []
+    for obj in objects:
+        sel_working = np.zeros(len(working_pts), dtype=bool)
+        sel_working[obj["point_indices"]] = True
+        candidates.append((sel_working[nn_idx], obj["class_name"], obj["score"]))
+
+    rows = write_scannet_submission_rows(args.out, scene_id, args.classes, candidates,
+                                        min_mask_points, spec)
+    if feature_rows is not None:
+        publish_clip_features(
+            args.features_out, feature_rows, rows, spec, args.run_id, "mosaic3d", scene_id,
+            "open_clip", CLIP_CFG["model_id"], 768)
+    else:
+        print(f"[INFO] mask3d head exposes no point features; skipping clip publish")
+    print(f"[INFO] Wrote {rows['n_written']} instances to {args.out} ({len(working_pts)}/{len(full_pts)} points used)")
 
 
 if __name__ == "__main__":

@@ -143,7 +143,7 @@ class RankingTests(unittest.TestCase):
                 dumped = list(csv.DictReader(f))
             self.assertEqual([row["run_id"] for row in dumped], ["run-b", "run-a"])
 
-    def test_equal_ap_orders_by_ap50(self):
+    def test_equal_ap_orders_by_run_id(self):
         with tempfile.TemporaryDirectory() as root:
             spec = self._layout(root, "run-b", "mosaic3d", ["scene0568_01"],
                                 _csv_rows("0.5", "0.9", "0.1"))
@@ -152,9 +152,10 @@ class RankingTests(unittest.TestCase):
             rows, path = rank_runs(spec, scannet_root=root)
             with open(path, newline="") as f:
                 dumped = list(csv.DictReader(f))
-            self.assertEqual([row["run_id"] for row in dumped], ["run-b", "run-a"])
+            self.assertEqual([row["run_id"] for row in dumped], ["run-a", "run-b"])
             by_id = {row["run_id"]: row for row in rows}
-            self.assertGreater(by_id["run-b"]["ap50"], by_id["run-a"]["ap50"])
+            self.assertEqual(by_id["run-a"]["rank_ap"], 1)
+            self.assertEqual(by_id["run-b"]["rank_ap"], 2)
 
     def test_groups_do_not_cross_method_or_scenes(self):
         with tempfile.TemporaryDirectory() as root:
@@ -237,7 +238,7 @@ def _lease(*args, **kwargs):
 class RunnerTests(unittest.TestCase):
     def _scene_root(self, root):
         scans = os.path.join(root, "scans")
-        ply = os.path.join(scans, "scene0568_01", "scene0568_01_vh_clean_2.ply")
+        ply = os.path.join(scans, "scene0046_00", "scene0046_00_vh_clean_2.ply")
         os.makedirs(os.path.dirname(ply))
         with open(ply, "w") as f:
             f.write("ply\n")
@@ -259,7 +260,7 @@ class RunnerTests(unittest.TestCase):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        return runner.predict(["scene0568_01"], ["mosaic3d"], None, "ScanNet20",
+        return runner.predict(["scene0046_00"], ["mosaic3d"], None, "ScanNet20",
                               "run-a", **predict_kwargs)
 
     def test_manifest_written_once_before_tasks(self):
@@ -273,7 +274,7 @@ class RunnerTests(unittest.TestCase):
 
             def run_one(*args, **kwargs):
                 calls.append(("run", args, kwargs))
-                return ("mosaic3d", "scene0568_01", "/tmp", 0.1, True)
+                return ("mosaic3d", "scene0046_00", "/tmp", 0.1, True)
 
             with mock.patch("evaluation.runs.write_run_manifest", side_effect=write), \
                     mock.patch("predict.runner._run_one", side_effect=run_one):
@@ -282,22 +283,87 @@ class RunnerTests(unittest.TestCase):
             _spec, run_id, scenes, methods = calls[0][1]
             kwargs = calls[0][2]
             self.assertEqual(run_id, "run-a")
-            self.assertEqual(scenes, ["scene0568_01"])
+            self.assertEqual(scenes, ["scene0046_00"])
             self.assertEqual(methods, ["mosaic3d"])
             self.assertEqual(kwargs["run_parameters"], {"mosaic3d": {"x": 1}})
             self.assertEqual(kwargs["issue"], 7)
             self.assertEqual(kwargs["scannet_root"], root)
+            timing = os.path.join(
+                root, "derived", "evaluations", "ScanNet20", "run-a", "mosaic3d",
+                "scene0046_00.timing.json")
+            self.assertTrue(os.path.isfile(timing))
+            run_kwargs = calls[1][2]
+            self.assertTrue(run_kwargs["features_out"].endswith(
+                "scene0046_00.clip.npz"))
+            self.assertIn("/derived/evaluations/", run_kwargs["features_out"].replace("\\", "/"))
 
     def test_manifest_conflict_skips_models(self):
         spec = _spec20()
         with tempfile.TemporaryDirectory() as root:
             scans = self._scene_root(root)
-            write_run_manifest(spec, "run-a", ["scene0568_01"], ["mosaic3d"],
+            write_run_manifest(spec, "run-a", ["scene0046_00"], ["mosaic3d"],
                                issue=1, scannet_root=root)
             with mock.patch("predict.runner._run_one") as run_one:
                 with self.assertRaises(ValueError):
                     self._run(root, scans, issue=2)
             run_one.assert_not_called()
+
+
+class AutoEvaluateTests(unittest.TestCase):
+    def _gt(self, root, scene):
+        path = os.path.join(
+            root, "derived", "ground_truth", "ScanNet20", scene + ".txt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("1001\n")
+
+    def test_exports_missing_gt_and_evaluates_each_model(self):
+        from predict.runner import _auto_evaluate
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            self._gt(root, "scene0568_01")
+            calls = []
+            with mock.patch(
+                    "evaluation.evaluate.evaluate_cli",
+                    side_effect=lambda argv: calls.append(("eval", argv))), \
+                 mock.patch(
+                    "evaluation.evaluate.export_gt_cli",
+                    side_effect=lambda argv: calls.append(("gt", argv))):
+                _auto_evaluate(spec, "run-a", ["openyolo3d"],
+                               ["scene0568_01", "scene0575_00"], root)
+            gt_calls = [c for c in calls if c[0] == "gt"]
+            self.assertEqual(len(gt_calls), 1)
+            self.assertIn("scene0575_00", gt_calls[0][1])
+            eval_calls = [c for c in calls if c[0] == "eval"]
+            self.assertEqual(len(eval_calls), 1)
+            self.assertIn("run-a", eval_calls[0][1])
+
+    def test_skips_model_with_existing_csv(self):
+        from predict.runner import _auto_evaluate
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            self._gt(root, "scene0568_01")
+            _write_csv(os.path.join(
+                root, "derived", "evaluations", "ScanNet20",
+                "run-a", "openyolo3d.csv"), _csv_rows(0.1, 0.1, 0.1))
+            with mock.patch(
+                    "evaluation.evaluate.evaluate_cli") as eval_cli, \
+                 mock.patch("evaluation.evaluate.export_gt_cli") as export_gt:
+                _auto_evaluate(spec, "run-a", ["openyolo3d"],
+                               ["scene0568_01"], root)
+            eval_cli.assert_not_called()
+            export_gt.assert_not_called()
+
+    def test_grader_failure_warns_instead_of_raising(self):
+        from predict.runner import _auto_evaluate
+        spec = _spec20()
+        with tempfile.TemporaryDirectory() as root:
+            self._gt(root, "scene0568_01")
+            with mock.patch(
+                    "evaluation.evaluate.evaluate_cli",
+                    side_effect=RuntimeError("boom")):
+                _auto_evaluate(spec, "run-a", ["openyolo3d"],
+                               ["scene0568_01"], root)
 
 
 if __name__ == "__main__":

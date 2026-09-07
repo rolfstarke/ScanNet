@@ -14,6 +14,7 @@ from evaluation.benchmark import (
     PREDICTION_EVALUATION_SCENES, PREDICTION_METHODS, artifact_paths,
     load_settings, normalize_scene_id, resolve_benchmark, submission_dir,
     validate_prediction_methods, validate_prediction_scenes,
+    validate_recorded_prediction_scenes,
 )
 from utils.scan_lock import exclusive_lock, prediction_index_lock_path
 
@@ -46,9 +47,17 @@ _EXTERNAL_REPOS = {
     "openmask3d": "/home/rolf/GIT/openmask3d",
 }
 _REQUIRED_EXTERNAL = {
-    "mosaic3d": ("/home/rolf/GIT/Mosaic3D/scripts/run_custom_scene.py",),
+    "mosaic3d": (
+        "/home/rolf/GIT/Mosaic3D/scripts/run_custom_scene.py",
+        "/data/mosaic3d/ckpts/spunet34c.ckpt",
+    ),
     "openins3d": ("/home/rolf/GIT/OpenIns3D/third_party/scannet200_val.ckpt",),
-    "openyolo3d": ("/home/rolf/GIT/OpenYOLO3D/pretrained/config_scannet200.yaml",),
+    "openyolo3d": (
+        "/home/rolf/GIT/OpenYOLO3D/pretrained/config_scannet200.yaml",
+        "/home/rolf/GIT/OpenYOLO3D/pretrained/checkpoints/scannet200_val.ckpt",
+        "/home/rolf/GIT/OpenYOLO3D/pretrained/checkpoints/"
+        "yolo_world_v2_x_obj365v1_goldg_cc3mlite_pretrain_1280ft-14996a36.pth",
+    ),
     "open3dis": (
         "/home/rolf/GIT/Open3DIS/configs/ov3dis_scene4.yaml",
         "/home/rolf/GIT/Open3DIS/open3dis/dataset/ov3dis_loader.py",
@@ -95,9 +104,10 @@ def normalize_run_id(run_id):
 
 
 def normalize_scenes(scenes, require_complete=False):
-    out = validate_prediction_scenes(scenes, require_complete=require_complete)
     if require_complete:
+        validate_prediction_scenes(scenes, require_complete=True)
         return list(PREDICTION_EVALUATION_SCENES)
+    out = validate_recorded_prediction_scenes(scenes)
     return sorted(out)
 
 
@@ -222,7 +232,7 @@ def validate_manifest(doc, spec=None, run_id=None):
     if extra:
         raise ValueError(f"manifest has unknown key(s): {extra}")
     if type(doc.get("schema")) is not int or doc.get("schema") != MANIFEST_SCHEMA:
-        raise ValueError("manifest schema must be 1")
+        raise ValueError(f"manifest schema must be {MANIFEST_SCHEMA}")
     resolved = resolve_benchmark(doc.get("benchmark"))
     if spec is not None and resolved.name != spec.name:
         raise ValueError(f"manifest benchmark {resolved.name!r} does not match {spec.name!r}")
@@ -319,7 +329,10 @@ def read_evaluator_csv(path):
         raise ValueError(f"empty evaluator csv: {path}")
     metrics = {}
     for metric in METRICS:
-        metrics[metric] = _mean([_parse_metric(row[metric]) for row in rows])
+        values = [_parse_metric(row[metric]) for row in rows]
+        metrics[metric] = _mean(values)
+        metrics[f"{metric}_count"] = sum(
+            1 for value in values if value is not None and math.isfinite(value))
         if metrics[metric] is None:
             raise ValueError(f"no finite {metric} values in {path}")
     return metrics
@@ -384,7 +397,7 @@ def _assign_ranks(rows):
                 row[f"rank_{metric}"] = lookup[row["run_id"]]
         ranked.extend(members)
     ranked.sort(key=lambda row: (row["method"], ";".join(row["scenes"]),
-                                 -row["ap"], -row["ap50"], row["run_id"]))
+                                 -row["ap"], row["run_id"]))
     return ranked
 
 
@@ -475,6 +488,15 @@ def prune_prediction_artifacts(spec, run_id, method, scannet_root=None, apply=Fa
         return {"apply": False, "target": pred_dir}
     if os.path.isdir(pred_dir):
         shutil.rmtree(pred_dir)
+    for scene in man["scenes"]:
+        clip_path = os.path.join(sidecar_dir, scene + ".clip.npz")
+        try:
+            os.unlink(clip_path)
+        except FileNotFoundError:
+            pass
+        if method == "openins3d":
+            from utils.query import openins_snap_root
+            shutil.rmtree(openins_snap_root(run_id, scene), ignore_errors=True)
     return {"apply": True, "target": pred_dir}
 
 
