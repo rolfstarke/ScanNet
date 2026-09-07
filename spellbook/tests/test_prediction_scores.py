@@ -719,10 +719,11 @@ class OpenMaskOverrideTests(unittest.TestCase):
         path = os.path.join(_SPELLBOOK, "predict", "models", "_openmask3d_run.py")
         with open(path) as f:
             text = f.read()
+        self.assertIn("def _classify(masks, feats, classes, device,", text)
+        self.assertIn("min_mask_points=MIN_MASK_POINTS", text)
         self.assertIn(
-            "def _classify(masks, feats, classes, device, min_mask_points=MIN_MASK_POINTS):",
+            "_classify(masks, feats, clip_classes, device, min_mask_points, clip_prompt)",
             text)
-        self.assertIn("_classify(masks, feats, args.classes, device, min_mask_points)", text)
         self.assertNotIn("if sel.sum() < MIN_MASK_POINTS:", text)
 
 
