@@ -525,6 +525,20 @@ def _fmt_avg_eta(prog):
     return avg_txt, eta_txt
 
 
+CURRENT_COLS = ("GPU", "GPU%", "MEMORY", "RUNTIME", "CPUc", "PROGRESS", "ETA",
+                "SESSION", "RUN")
+CURRENT_FMT = "{:>7} {:>7} {:>13} {:>7} {:>7} {:>8} {:>7} {:<12} {}"
+FUTURE_COLS = ("STATUS", "SESSION", "RUN")
+FUTURE_FMT = "{:<6} {:<12} {}"
+PAST_COLS = ("STATE", "RUNTIME", "SESSION", "RUN")
+PAST_FMT = "{:<8} {:>7} {:<12} {}"
+
+
+def _header(fmt, cols):
+    """Header padded by the same format its rows use, so columns line up."""
+    return fmt.format(*cols).rstrip()
+
+
 def render_snapshot(res, pool, prev_cpu, rows, scannet_root,
                     cpu_base=None, cpu_interval=None, cpu_cores=None,
                     now=None):
@@ -586,33 +600,26 @@ def render_snapshot(res, pool, prev_cpu, rows, scannet_root,
 
     lines.append("")
     lines.append("CURRENT JOBS")
-    lines.append("STATE JOB GPU GPU% MEMORY TEMP RUNTIME CPUc PROGRESS "
-                 "UNIT AVG ETA SESSION RUN")
-    emitted_gpus = set()
+    lines.append(_header(CURRENT_FMT, CURRENT_COLS))
     by_gpu_job = {}
     for row in current_rows:
         for gpu in owned.get(row["job_id"], []):
             by_gpu_job[gpu] = row
-    for gpu in sorted(set(stats) | set(pool) | {0}):
+    for gpu in sorted(set(stats) | set(pool) | set(leases) | {0}):
         if gpu in by_gpu_job:
             row = by_gpu_job[gpu]
-            # Emit multi-GPU jobs once at their lowest index.
-            if min(owned[row["job_id"]]) != gpu:
-                continue
-            lines.append(_current_line(row, owned[row["job_id"]], stats,
-                                       res, rows_by_id, owners, memo,
-                                       cpu_cores, scannet_root, now))
-            emitted_gpus.update(owned[row["job_id"]])
+            lines.append(_current_line(row, gpu, stats, cpu_cores, memo,
+                                       scannet_root, now))
+        elif gpu in leases:
+            lines.append(_holder_line(gpu, stats, owners.get(gpu), memo,
+                                      scannet_root, now))
+        else:
+            lines.append(_device_line(gpu, stats.get(gpu), pool))
     for row in current_rows:
         if row["job_id"] in owned:
             continue
-        lines.append(_current_line(row, [], stats, res, rows_by_id, owners,
-                                   memo, cpu_cores, scannet_root, now))
-    for gpu in sorted(set(stats) | set(pool) | {0}):
-        if gpu in emitted_gpus:
-            continue
-        lines.append(_device_line(gpu, stats.get(gpu), leases.get(gpu),
-                                  owners.get(gpu), pool, now))
+        lines.append(_current_line(row, None, stats, cpu_cores, memo,
+                                   scannet_root, now))
 
     future = sorted(
         (r for r in rows if r.get("state") in ACTIVE_JOB_STATES
@@ -620,15 +627,14 @@ def render_snapshot(res, pool, prev_cpu, rows, scannet_root,
         key=lambda r: r.get("submitted") or 0)
     lines.append("")
     lines.append("FUTURE JOBS")
-    lines.append("STATE JOB PLAN SESSION RUN")
+    lines.append(_header(FUTURE_FMT, FUTURE_COLS))
     labels = {"queued": "QUEUE", "starting": "START", "running": "WAIT",
               "cancelling": "STOP"}
     for row in future:
-        session = short_branch(row.get("branch"))
-        lines.append(f"{labels.get(row['state'], row['state']):<5} "
-                     f"{short_job(row['job_id']):<11} "
-                     f"{_plan_string(row)[:24]:<24} "
-                     f"{session[:12]:<12} {row.get('run_id') or row['kind']}")
+        lines.append(FUTURE_FMT.format(
+            labels.get(row["state"], row["state"]),
+            short_branch(row.get("branch"))[:12],
+            row.get("run_id") or row["kind"]))
 
     recent = sorted(
         (row for row in rows if row["state"] in TERMINAL_JOB_STATES),
@@ -638,7 +644,7 @@ def render_snapshot(res, pool, prev_cpu, rows, scannet_root,
     )[:20]
     lines.append("")
     lines.append("PAST JOBS")
-    lines.append("STATE JOB TOTAL SESSION RUN")
+    lines.append(_header(PAST_FMT, PAST_COLS))
     past_labels = {"succeeded": "DONE", "failed": "FAIL",
                    "cancelled": "CANCEL", "lost": "LOST"}
     for row in recent:
@@ -647,89 +653,92 @@ def render_snapshot(res, pool, prev_cpu, rows, scannet_root,
         if isinstance(started, (int, float)) \
                 and isinstance(ended, (int, float)) \
                 and isinstance(wait, (int, float)):
-            total = dur(max(0.0, ended - started - wait))
+            runtime = dur(max(0.0, ended - started - wait))
         else:
-            total = "-"
+            runtime = "-"
         state = past_labels[row["state"]]
         if state == "FAIL" and row.get("exit_code") not in (None, 0):
-            state += str(row["exit_code"])
-        session = short_branch(row.get("branch"))
-        lines.append(f"{state:<6} {short_job(row['job_id']):<11} "
-                     f"{total:>7} {session[:12]:<12} "
-                     f"{row.get('run_id') or row['kind']}")
+            state += f":{row['exit_code']}"
+        lines.append(PAST_FMT.format(
+            state, runtime, short_branch(row.get("branch"))[:12],
+            row.get("run_id") or row["kind"]))
     return lines
 
 
-def _current_line(row, gpus, stats, res, rows_by_id, owners, memo,
-                  cpu_cores, scannet_root, now):
-    state = "STOP" if row.get("state") == "cancelling" else "RUN"
-    job = short_job(row["job_id"])
-    if gpus:
-        gpu_txt = ",".join(str(g) for g in sorted(gpus))
-        utils_txt, mem_txt, temp_txt = [], [], []
-        for gpu in sorted(gpus):
-            st = stats.get(gpu)
-            if st is None:
-                utils_txt.append("-")
-                mem_txt.append("-")
-                temp_txt.append("-")
-            else:
-                utils_txt.append(f"{st['util']:.0f}%")
-                mem_txt.append(f"{st['mem_used'] / 1024:.1f}/"
-                               f"{st['mem_total'] / 1024:.1f}G")
-                temp_txt.append(f"{st['temp']:.0f}C")
-        util_txt = "/".join(utils_txt)
-        mem_txt = "/".join(mem_txt) if len(mem_txt) > 1 else mem_txt[0]
-        temp_txt = "/".join(temp_txt) if len(temp_txt) > 1 else temp_txt[0]
-    else:
-        gpu_txt, util_txt, mem_txt, temp_txt = "-", "-", "-", "-"
-    runtime = _effective_runtime(row, now)
-    cpu = _fmt_cpu(cpu_cores.get(row["job_id"]))
-    prog = _progress(row, scannet_root, memo)
-    progress = _fmt_progress(prog)
-    unit = prog.get("unit") or "-"
-    avg_txt, eta_txt = _fmt_avg_eta(prog)
-    session = short_branch(row.get("branch"))
-    run = row.get("run_id") or row["kind"]
-    return (f"{state:<5} {job:<11} {gpu_txt:>3} {util_txt:>4} {mem_txt:>11} "
-            f"{temp_txt:>4} {runtime:>7} {cpu:>5} {progress:>8} "
-            f"{str(unit)[:28]:<28} {avg_txt:>4} {eta_txt:>4} "
-            f"{session[:12]:<12} {run}")
-
-
-def _device_line(gpu, st, lease_pid, owner, pool, now):
-    job = "-"
+def _gpu_cells(gpu, stats):
+    """GPU/util/memory cells for one device, or dashes for CPU-only work."""
+    if gpu is None:
+        return "-", "-", "-"
+    st = stats.get(gpu)
     if st is None:
-        return (f"{'UNAVAILABLE':<5} {'-':<11} {gpu:>3} {'-':>4} {'-':>11} "
-                f"{'-':>4} {'-':>7} {'-':>5} {'-':>8} {'-':<28} "
-                f"{'-':>4} {'-':>4} {'-':<12} unavailable")
+        return str(gpu), "-", "-"
+    return str(gpu), f"{st['util']:.0f}%", \
+        f"{st['mem_used'] / 1024:.1f}/{st['mem_total'] / 1024:.1f}G"
+
+
+def _synthetic_row(owner):
+    """Registry-free job row from a live lease holder (read-only).
+
+    Foreground runs without a job record still carry kind/benchmark/
+    model/run-id/cwd in argv, which is all the progress resolvers need.
+    """
+    owner = owner or {}
+    argv = list(owner.get("argv") or [])
+    kind = "command"
+    if "--predict" in argv:
+        kind = "predict"
+    elif "--engine" in argv:
+        kind = "reconstruct"
+    elif "--extract-frames" in argv:
+        kind = "extract"
+    return {"job_id": f"pid-{owner.get('pid') or '?'}", "kind": kind,
+            "argv": argv, "cwd": owner.get("cwd"),
+            "run_id": _arg(argv, "--run-id"),
+            "started": owner.get("started"), "gpu_wait": 0.0,
+            "state": "running"}
+
+
+def _job_line(gpu, stats, row, cpu, session, run, memo, scannet_root, now):
+    """Shared row body for registry jobs and record-free lease holders."""
+    gpu_txt, util_txt, mem_txt = _gpu_cells(gpu, stats)
+    prog = _progress(row, scannet_root, memo)
+    _, eta_txt = _fmt_avg_eta(prog)
+    return CURRENT_FMT.format(
+        gpu_txt, util_txt, mem_txt, _effective_runtime(row, now),
+        cpu, _fmt_progress(prog), eta_txt, session[:12], run)
+
+
+def _current_line(row, gpu, stats, cpu_cores, memo, scannet_root, now):
+    return _job_line(gpu, stats, row, _fmt_cpu(cpu_cores.get(row["job_id"])),
+                     short_branch(row.get("branch")),
+                     row.get("run_id") or row["kind"], memo, scannet_root, now)
+
+
+def _holder_line(gpu, stats, owner, memo, scannet_root, now):
+    """One row for a leased GPU whose holder has no job record."""
+    owner = owner or {}
+    row = _synthetic_row(owner)
+    return _job_line(gpu, stats, row, "-", _session(owner),
+                     row.get("run_id") or _run_name(owner), memo,
+                     scannet_root, now)
+
+
+def _device_line(gpu, st, pool):
+    """Row for a GPU that no current job holds."""
+    if st is None:
+        return CURRENT_FMT.format(gpu, "-", "-", "-", "-", "-", "-", "-",
+                                  "unavailable")
     mem = f"{st['mem_used'] / 1024:.1f}/{st['mem_total'] / 1024:.1f}G"
     util = f"{st['util']:.0f}%"
-    temp = f"{st['temp']:.0f}C"
     if gpu == 0:
-        return (f"{'RESERVED':<5} {'-':<11} {gpu:>3} {util:>4} {mem:>11} "
-                f"{temp:>4} {'-':>7} {'-':>5} {'-':>8} {'-':<28} "
-                f"{'-':>4} {'-':>4} {'-':<12} reserved")
-    if gpu not in pool:
-        return (f"{'UNMANAGED':<5} {'-':<11} {gpu:>3} {util:>4} {mem:>11} "
-                f"{temp:>4} {'-':>7} {'-':>5} {'-':>8} {'-':<28} "
-                f"{'-':>4} {'-':>4} {'-':<12} unmanaged")
-    if lease_pid is not None:
-        owner = owner or {}
-        started = owner.get("started")
-        runtime = dur(now - started) if isinstance(started, (int, float)) \
-            else "-"
-        session = _session(owner)
-        run = _run_name(owner)
-        return (f"{'RUN':<5} {'-':<11} {gpu:>3} {util:>4} {mem:>11} "
-                f"{temp:>4} {runtime:>7} {'-':>5} {'-':>8} {'-':<28} "
-                f"{'-':>4} {'-':>4} {session[:12]:<12} {run}")
-    active = st["util"] > 5 or st["mem_used"] > 512
-    label = "UNLEASED" if active else "FREE"
-    run = "unleased" if active else "free"
-    return (f"{label:<5} {'-':<11} {gpu:>3} {util:>4} {mem:>11} "
-            f"{temp:>4} {'-':>7} {'-':>5} {'-':>8} {'-':<28} "
-            f"{'-':>4} {'-':>4} {'-':<12} {run}")
+        run = "reserved"
+    elif gpu not in pool:
+        run = "unmanaged"
+    elif st["util"] > 5 or st["mem_used"] > 512:
+        run = "unleased"
+    else:
+        run = "free"
+    return CURRENT_FMT.format(gpu, util, mem, "-", "-", "-", "-", "-", run)
 
 
 def _pool():

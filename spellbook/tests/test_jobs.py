@@ -518,17 +518,38 @@ class StatusUtilTests(unittest.TestCase):
                 mock.patch("utils.status.time.time", return_value=1700000000.0):
             text = self._render(fake, rows, root)
         current = text.split("CURRENT JOBS\n", 1)[1].split("FUTURE JOBS", 1)[0]
-        self.assertRegex(current, r"RUN\s+120000-0001\s+1\s+80%.*20s")
+        self.assertRegex(current, r"1\s+80%\s+\S+\s+20s\s+\S+\s+\S+\s+\S+\s+\S+\s+run-a")
         self.assertEqual(st._effective_runtime(rows[0], 1700000000.0), "20s")
 
-    def test_cpu_job_renders_run_with_gpu_dash(self):
+    def test_current_header_has_cpuc_and_no_avg(self):
         with tempfile.TemporaryDirectory() as root:
             text = self._render(self._fake_res(), self._rows(), root,
                                 cpu_cores={"job-20260910-120000-0001": 8.1})
         current = text.split("CURRENT JOBS\n", 1)[1].split("FUTURE JOBS", 1)[0]
-        self.assertRegex(current, r"RUN\s+120000-0001\s+-\s+-")
+        header, rest = current.rstrip().split("\n", 1)
+        self.assertEqual(header.split(),
+                         ["GPU", "GPU%", "MEMORY", "RUNTIME", "CPUc",
+                          "PROGRESS", "ETA", "SESSION", "RUN"])
+        self.assertEqual(
+            header,
+            f"{'GPU':>7} {'GPU%':>7} {'MEMORY':>13} {'RUNTIME':>7} "
+            f"{'CPUc':>7} {'PROGRESS':>8} {'ETA':>7} {'SESSION':<12} RUN")
         self.assertIn("8.1c", current)
-        self.assertNotIn("STATE CPU", text)
+
+    def test_current_rows_align_to_nine_columns(self):
+        fake = self._fake_res()
+        fake.gpu_leases.return_value = {1: 42}
+        fake.process_info.return_value = {"pid": 42, "argv": [], "cwd": None,
+                                          "started": 1699999970.0,
+                                          "job_id": "job-20260910-120000-0001"}
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch("utils.status.time.time", return_value=1700000000.0):
+            text = self._render(fake, self._rows(), root)
+        current = text.split("CURRENT JOBS\n", 1)[1].split("FUTURE JOBS", 1)[0]
+        lines = [line for line in current.strip().split("\n") if line.strip()]
+        self.assertGreater(len(lines), 1)
+        for line in lines:
+            self.assertEqual(len(line.split()), 9, line)
 
     def test_gpu_util_attributed_only_to_owner(self):
         fake = self._fake_res()
@@ -548,7 +569,7 @@ class StatusUtilTests(unittest.TestCase):
         future = text.split("FUTURE JOBS\n", 1)[1]
         self.assertIn("run-b", future)
 
-    def test_multi_gpu_job_is_single_row(self):
+    def test_multi_gpu_job_has_one_row_per_gpu(self):
         fake = self._fake_res()
         fake.gpu_stats.return_value = {
             0: {"util": 0.0, "mem_used": 5.0, "mem_total": 100.0, "temp": 33.0},
@@ -563,9 +584,9 @@ class StatusUtilTests(unittest.TestCase):
                 mock.patch("utils.status.time.time", return_value=1700000000.0):
             text = self._render(fake, self._rows(), root)
         current = text.split("CURRENT JOBS\n", 1)[1].split("FUTURE JOBS", 1)[0]
-        self.assertEqual(current.count("120000-0001"), 1)
-        self.assertIn("1,2", current)
-        self.assertIn("80%/70%", current)
+        self.assertEqual(current.count("run-a"), 2)
+        self.assertRegex(current, r"(?m)^\s*1\s+80%")
+        self.assertRegex(current, r"(?m)^\s*2\s+70%")
 
     def test_gpu_conditions_all_visible(self):
         base_stats = {
@@ -578,14 +599,14 @@ class StatusUtilTests(unittest.TestCase):
         fake.gpu_leases.return_value = {}
         with tempfile.TemporaryDirectory() as root:
             text = self._render(fake, [], root, pool=[1, 2])
-            self.assertIn("RESERVED", text)
-            self.assertIn("UNLEASED", text)
-            self.assertIn("FREE", text)
+            self.assertIn("reserved", text)
+            self.assertIn("unleased", text)
+            self.assertIn("free", text)
             text = self._render(fake, [], root, pool=[1])
-            self.assertIn("UNMANAGED", text)
+            self.assertIn("unmanaged", text)
             fake.gpu_stats.return_value = {}
             text = self._render(fake, [], root, pool=[1])
-            self.assertIn("UNAVAILABLE", text)
+            self.assertIn("unavailable", text)
 
     def test_foreground_lease_keeps_identity_without_job_fields(self):
         fake = self._fake_res()
@@ -604,6 +625,68 @@ class StatusUtilTests(unittest.TestCase):
         self.assertIn("1m", current)
         self.assertNotIn("python", current)
 
+    def test_record_free_multi_gpu_holder_has_one_row_per_gpu(self):
+        fake = self._fake_res()
+        fake.gpu_stats.return_value = {
+            0: {"util": 0.0, "mem_used": 5.0, "mem_total": 100.0,
+                "temp": 33.0},
+            1: {"util": 80.0, "mem_used": 50.0, "mem_total": 100.0,
+                "temp": 60.0},
+            2: {"util": 70.0, "mem_used": 40.0, "mem_total": 100.0,
+                "temp": 59.0},
+        }
+        fake.gpu_leases.return_value = {1: 42, 2: 42}
+        fake.process_info.return_value = {
+            "pid": 42,
+            "argv": ["spellbook/main.py", "--predict", "--models", "open3dis",
+                     "--run-id", "baseline-open3dis"],
+            "cwd": "/tmp/debug/prediction-open3dis",
+            "started": 1699999940.0, "job_id": None}
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch("utils.status.time.time", return_value=1700000000.0):
+            text = self._render(fake, [], root, pool=[1, 2])
+        current = text.split("CURRENT JOBS\n", 1)[1].split("FUTURE JOBS", 1)[0]
+        self.assertEqual(current.count("baseline-open3dis"), 2)
+        self.assertRegex(current, r"(?m)^\s*1\s+80%")
+        self.assertRegex(current, r"(?m)^\s*2\s+70%")
+
+    def test_record_free_lease_holder_shows_progress(self):
+        import json
+        with tempfile.TemporaryDirectory() as root:
+            eval_root = os.path.join(root, "derived", "evaluations",
+                                     "ScanNet20", "run-s")
+            model_dir = os.path.join(eval_root, "mosaic3d")
+            os.makedirs(model_dir)
+            with open(os.path.join(eval_root, "run.json"), "w") as f:
+                json.dump({"schema": 2, "benchmark": "ScanNet20",
+                           "run_id": "run-s",
+                           "scenes": ["scene0046_00", "scene0084_01"],
+                           "methods": {"mosaic3d": {"parameters": {}}}}, f)
+            with open(os.path.join(eval_root, "mosaic3d.tasks"), "w") as f:
+                f.write("scene0046_00\n")
+            with open(os.path.join(model_dir, "scene0046_00.timing.json"),
+                      "w") as f:
+                json.dump({"schema": 1, "kind": "prediction",
+                           "scene_id": "scene0046_00", "run_id": "run-s",
+                           "model": "mosaic3d", "elapsed_s": 60.0}, f)
+            fake = self._fake_res()
+            fake.gpu_leases.return_value = {1: 42}
+            fake.process_info.return_value = {
+                "pid": 42,
+                "argv": ["spellbook/main.py", "--predict",
+                         "--benchmark", "ScanNet20", "--models", "mosaic3d",
+                         "--run-id", "run-s", "--foreground"],
+                "cwd": "/tmp/debug/prediction-open3dis",
+                "started": 1699999940.0, "job_id": None}
+            with mock.patch("utils.status.time.time",
+                            return_value=1700000000.0):
+                text = self._render(fake, [], root)
+        current = text.split("CURRENT JOBS\n", 1)[1].split("FUTURE JOBS", 1)[0]
+        self.assertIn("run-s", current)
+        self.assertIn("1/2", current)
+        self.assertIn("1m", current)
+        self.assertIn("open3dis", current)
+
     def test_cancelling_placement(self):
         rows = self._rows()
         rows[0]["state"] = "cancelling"
@@ -615,13 +698,14 @@ class StatusUtilTests(unittest.TestCase):
             text = self._render(self._fake_res(), rows, root,
                                 cpu_cores={"job-20260910-120000-0001": 2.0})
         current = text.split("CURRENT JOBS\n", 1)[1].split("FUTURE JOBS", 1)[0]
-        self.assertIn("STOP", current)
+        self.assertIn("run-a", current)
 
     def test_future_queue_oldest_first_each_once(self):
         now = 1700000000.0
         rows = [{
             "job_id": f"job-20260910-120000-000{i}", "kind": "command",
-            "run_id": None, "state": "running", "submitted": now - i * 10,
+            "run_id": f"run-{i}", "state": "running",
+            "submitted": now - i * 10,
             "started": now - 5, "ended": None, "gpu_wait": 0.0,
             "exit_code": None, "branch": "master", "log": "/tmp/x.log",
             "argv": [], "wrapper_pid": None, "child_pid": None,
@@ -629,10 +713,10 @@ class StatusUtilTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             text = self._render(self._fake_res(), rows, root)
         future = text.split("FUTURE JOBS\n", 1)[1].split("PAST JOBS", 1)[0]
-        self.assertLess(future.index("0003"), future.index("0002"))
-        self.assertLess(future.index("0002"), future.index("0001"))
-        for suffix in ("0001", "0002", "0003"):
-            self.assertEqual(text.count(suffix), 1)
+        self.assertLess(future.index("run-3"), future.index("run-2"))
+        self.assertLess(future.index("run-2"), future.index("run-1"))
+        for run_id in ("run-1", "run-2", "run-3"):
+            self.assertEqual(text.count(run_id), 1)
 
     def test_past_total_and_cap(self):
         from utils.status import render_snapshot
@@ -651,8 +735,10 @@ class StatusUtilTests(unittest.TestCase):
             text = "\n".join(render_snapshot(
                 self._fake_res(), [1], {"total": 100, "idle": 50}, rows, root))
         past = text.split("PAST JOBS\n", 1)[1]
-        self.assertRegex(past, r"DONE\s+old\s+1m\s+master\s+old-run")
-        self.assertRegex(past, r"LOST\s+lost\s+-")
+        header = past.split("\n", 1)[0]
+        self.assertEqual(header, f"{'STATE':<8} {'RUNTIME':>7} {'SESSION':<12} RUN")
+        self.assertRegex(past, r"DONE\s+1m\s+master\s+old-run")
+        self.assertRegex(past, r"LOST\s+-\s+master\s+lost-run")
         rows = []
         for i in range(21):
             ended = 1700000000.0 + i
@@ -805,8 +891,7 @@ class StatusUtilTests(unittest.TestCase):
                 self._fake_res(), rows, root,
                 cpu_cores={r["job_id"]: 1.0 for r in rows})
         current = text.split("CURRENT JOBS\n", 1)[1].split("FUTURE JOBS", 1)[0]
-        self.assertIn("120000-0001", current)
-        self.assertIn("120000-0002", current)
+        self.assertEqual(current.count("run-a"), 2)
 
     def test_log_tail_cr_normalized_and_bounded(self):
         from utils import status as st
@@ -827,13 +912,17 @@ class StatusUtilTests(unittest.TestCase):
                          cpu_cores={"job-20260910-120000-0001": 1.0})
             self.assertEqual(set(os.listdir(root)), before)
 
-    def test_future_plan_without_runtime_or_progress(self):
+    def test_future_has_status_session_run_only(self):
         with tempfile.TemporaryDirectory() as root:
             text = self._render(self._fake_res(), self._rows(), root)
         future = text.split("FUTURE JOBS\n", 1)[1].split("PAST JOBS", 1)[0]
-        self.assertIn("16 scenes x ?", future)
-        self.assertNotIn("PROGRESS", future)
-        self.assertNotRegex(future, r"\d+m\s+\d+\.\d+c")
+        header = future.rstrip().split("\n", 1)[0]
+        self.assertEqual(header, f"{'STATUS':<6} {'SESSION':<12} RUN")
+        self.assertIn("WAIT", future)
+        self.assertIn("master", future)
+        self.assertIn("run-a", future)
+        for omitted in ("JOB", "PLAN", "RUNTIME", "CPUc", "PROGRESS"):
+            self.assertNotIn(omitted, header)
 
     def test_eta_dash_without_two_timings(self):
         import json
