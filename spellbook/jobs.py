@@ -13,7 +13,6 @@ Physical GPU 0 is never managed (see spellbook/utils/gpu.py).
 """
 import argparse
 import fcntl
-import hashlib
 import json
 import os
 import shutil
@@ -21,6 +20,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 
 _SPELLBOOK = os.path.dirname(os.path.abspath(__file__))
 if _SPELLBOOK not in sys.path:
@@ -31,6 +31,7 @@ ACTIVE_STATES = ("queued", "starting", "running", "cancelling")
 TERMINAL_STATES = ("succeeded", "failed", "cancelled", "lost")
 
 ENV_ALLOWLIST = ("PATH", "PYTHONPATH", "LD_LIBRARY_PATH")
+ENV_PREFIX_ALLOWLIST = ("SPELLBOOK_",)
 JOB_ID_ENV = "SPELLBOOK_JOB_ID"
 JOB_MAX_WORKERS_ENV = "SPELLBOOK_JOB_MAX_GPU_WORKERS"
 
@@ -101,10 +102,44 @@ def _git_info(cwd):
     return info
 
 
-def _spec_hash(argv, cwd, commit):
-    canon = json.dumps({"argv": argv, "cwd": cwd, "commit": commit},
-                       sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canon.encode()).hexdigest()
+def _canonical_spellbook(cwd):
+    """spellbook/ of the main checkout; linked worktrees share its git dir."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--path-format=absolute",
+             "--git-common-dir"], capture_output=True, text=True, timeout=15)
+        common = r.stdout.strip()
+        if r.returncode == 0 and common:
+            cand = os.path.join(os.path.dirname(common), "spellbook")
+            if os.path.isfile(os.path.join(cand, "jobs.py")):
+                return cand
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return _SPELLBOOK
+
+
+_IDENTITY_FLAGS = ("--engine", "--scene", "--models", "--benchmark", "--classes")
+
+
+def _flag_values(argv, flag):
+    out = []
+    for i, tok in enumerate(argv):
+        if tok != flag:
+            continue
+        for val in argv[i + 1:]:
+            if val.startswith("-"):
+                break
+            out.append(val)
+    return out
+
+
+def _run_key(argv, kind, run_id):
+    """Logical identity of a run, independent of checkout and commit."""
+    if run_id:
+        return f"{kind}:{run_id}"
+    parts = [f"{f}={','.join(sorted(_flag_values(argv, f)))}"
+             for f in _IDENTITY_FLAGS if _flag_values(argv, f)]
+    return f"{kind}:" + "|".join(parts)
 
 
 def _iter_jobs(scannet_root=None):
@@ -140,13 +175,34 @@ def _unit_active(unit):
     return r.returncode == 0
 
 
-def derive_state(job_id, job, status):
-    """Reconciled state: active units that are gone become 'lost'."""
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def derive_state(job_id, job, status, scannet_root=None):
+    """Reconciled state; a dead worker's record is written down as 'lost'."""
     state = (status or {}).get("state", "lost")
-    if state in ACTIVE_STATES and job and job.get("unit"):
-        if _unit_active(job["unit"]) is False:
-            return "lost"
-    return state
+    if state not in ACTIVE_STATES or not job:
+        return state
+    if job.get("unit"):
+        if _unit_active(job["unit"]) is not False:
+            return state
+    elif (status or {}).get("wrapper_pid"):
+        if _pid_alive(status["wrapper_pid"]):
+            return state
+    else:
+        return state
+    if scannet_root:
+        try:
+            _update_status(job_id, scannet_root, state="lost",
+                           ended=(status or {}).get("ended") or time.time())
+        except OSError:
+            pass
+    return "lost"
 
 
 def _update_status(job_id, scannet_root, **fields):
@@ -168,7 +224,7 @@ def _launch_unit(job_id, job):
         "--property=Type=exec",
         "--property=KillMode=control-group",
         "--property=TimeoutStopSec=30s",
-        job["python"], os.path.join(_SPELLBOOK, "jobs.py"),
+        job["python"], job.get("runner") or os.path.join(_SPELLBOOK, "jobs.py"),
         "--scannet-root", job["scannet_root"], "_run", job_id,
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -179,7 +235,7 @@ def _launch_unit(job_id, job):
 
 def submit(argv, cwd=None, kind="command", run_id=None, scannet_root=None,
            launch=True, retry_of=None):
-    """Submit a detached job; returns the job id (existing id on duplicate)."""
+    """Submit a detached job; raises ValueError when a job already owns the run."""
     if not argv or not all(isinstance(a, str) and a for a in argv):
         raise ValueError("submit requires a non-empty argv list of strings")
     if kind not in ("predict", "reconstruct", "extract", "command"):
@@ -196,8 +252,9 @@ def submit(argv, cwd=None, kind="command", run_id=None, scannet_root=None,
     root = _scannet_root(scannet_root)
 
     git = _git_info(cwd)
-    spec_hash = _spec_hash(argv, cwd, git["commit"])
-    env = {k: os.environ[k] for k in ENV_ALLOWLIST if k in os.environ}
+    run_key = _run_key(argv, kind, run_id)
+    env = {k: v for k, v in os.environ.items()
+           if k in ENV_ALLOWLIST or k.startswith(ENV_PREFIX_ALLOWLIST)}
     now = time.time()
 
     lock_path = submit_lock_path(root)
@@ -205,13 +262,14 @@ def submit(argv, cwd=None, kind="command", run_id=None, scannet_root=None,
     with open(lock_path, "a+") as lockf:
         fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
         try:
-            for job_id, job, status in _iter_jobs(root):
-                if not job or not status:
+            for jid, j, st in _iter_jobs(root):
+                if not j or not st:
                     continue
-                if job.get("spec_hash") == spec_hash and \
-                        derive_state(job_id, job, status) in ACTIVE_STATES:
-                    print(f"[jobs] duplicate of active {job_id}; not relaunched")
-                    return job_id
+                if j.get("run_key") == run_key and \
+                        derive_state(jid, j, st, root) in ACTIVE_STATES:
+                    raise ValueError(
+                        f"active job {jid} already owns {run_key}; "
+                        f"use a different --run-id")
             job_id = _new_job_id()
             job = {
                 "schema": SCHEMA_VERSION,
@@ -220,14 +278,15 @@ def submit(argv, cwd=None, kind="command", run_id=None, scannet_root=None,
                 "argv": argv,
                 "cwd": cwd,
                 "python": sys.executable,
+                "runner": os.path.join(_canonical_spellbook(cwd), "jobs.py"),
                 "scannet_root": root,
                 "submitted": now,
-                "spec_hash": spec_hash,
+                "run_key": run_key,
                 "run_id": run_id,
                 "git": git,
                 "env": env,
                 "retry_of": retry_of,
-                "unit": f"spellbook-job-{job_id}.service",
+                "unit": f"spellbook-job-{job_id}.service" if launch else None,
             }
             d = job_dir(job_id, root)
             os.makedirs(d, exist_ok=False)
@@ -314,6 +373,39 @@ def _run(job_id, scannet_root=None):
     return rc if isinstance(rc, int) and 0 < rc < 256 else 1
 
 
+@contextmanager
+def job_context(argv, cwd=None, kind="command", run_id=None, scannet_root=None):
+    """Run inline under a durable job record.
+
+    No-op when already inside a job: the detached wrapper sets JOB_ID_ENV
+    before spawning the child, so the child adopts the existing record
+    instead of creating a second one.
+    """
+    if os.environ.get(JOB_ID_ENV):
+        yield os.environ[JOB_ID_ENV]
+        return
+    root = _scannet_root(scannet_root)
+    job_id = submit(argv, cwd=cwd, kind=kind, run_id=run_id,
+                    scannet_root=root, launch=False)
+    _update_status(job_id, root, state="running", started=time.time(),
+                   wrapper_pid=os.getpid(), gpu_wait=0.0)
+    os.environ[JOB_ID_ENV] = job_id
+    try:
+        yield job_id
+    except KeyboardInterrupt:
+        _update_status(job_id, root, state="cancelled", ended=time.time())
+        raise
+    except BaseException as exc:
+        _update_status(job_id, root, state="failed", ended=time.time(),
+                       error=str(exc)[:500])
+        raise
+    else:
+        _update_status(job_id, root, state="succeeded", ended=time.time(),
+                       exit_code=0)
+    finally:
+        os.environ.pop(JOB_ID_ENV, None)
+
+
 def list_jobs(scannet_root=None):
     rows = []
     for job_id, job, status in _iter_jobs(scannet_root):
@@ -323,7 +415,7 @@ def list_jobs(scannet_root=None):
             "job_id": job_id,
             "kind": job.get("kind"),
             "run_id": job.get("run_id"),
-            "state": derive_state(job_id, job, status),
+            "state": derive_state(job_id, job, status, scannet_root),
             "submitted": status.get("submitted"),
             "started": status.get("started"),
             "ended": status.get("ended"),
@@ -366,18 +458,26 @@ def cancel_job(job_id, scannet_root=None, timeout=30):
         status = _read_json(os.path.join(job_dir(job_id, root), "status.json"))
     except (OSError, ValueError):
         status = {}
-    state = derive_state(job_id, job, status)
+    state = derive_state(job_id, job, status, root)
     if state in TERMINAL_STATES:
         print(f"[jobs] {job_id} already {state}")
         return state
     _update_status(job_id, root, state="cancelling")
-    subprocess.run(["systemctl", "--user", "stop", job["unit"]],
-                   capture_output=True, timeout=timeout + 10)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _unit_active(job["unit"]) is False:
-            break
-        time.sleep(0.5)
+    if job.get("unit"):
+        subprocess.run(["systemctl", "--user", "stop", job["unit"]],
+                       capture_output=True, timeout=timeout + 10)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if _unit_active(job["unit"]) is False:
+                break
+            time.sleep(0.5)
+    else:
+        pid = status.get("wrapper_pid")
+        if pid:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
     _update_status(job_id, root, state="cancelled", ended=time.time())
     print(f"[jobs] {job_id} cancelled")
     return "cancelled"
@@ -386,11 +486,13 @@ def cancel_job(job_id, scannet_root=None, timeout=30):
 def retry_job(job_id, scannet_root=None):
     root = _scannet_root(scannet_root)
     job = _read_json(os.path.join(job_dir(job_id, root), "job.json"))
+    if not os.path.isdir(job["cwd"]):
+        raise ValueError(f"{job_id} cwd is gone: {job['cwd']}")
     try:
         status = _read_json(os.path.join(job_dir(job_id, root), "status.json"))
     except (OSError, ValueError):
         status = {}
-    if derive_state(job_id, job, status) in ACTIVE_STATES:
+    if derive_state(job_id, job, status, root) in ACTIVE_STATES:
         raise ValueError(f"{job_id} is still active; cancel it before retry")
     new_id = _new_job_id()
     now = time.time()

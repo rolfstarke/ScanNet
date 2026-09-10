@@ -56,6 +56,8 @@ class SubmitTests(unittest.TestCase):
             self.assertEqual(job["kind"], "command")
             self.assertTrue(os.path.isabs(job["argv"][0]))
             self.assertEqual(job["cwd"], root)
+            self.assertEqual(job["run_key"], "command:")
+            self.assertTrue(os.path.isfile(job["runner"]))
             self.assertEqual(status["state"], "queued")
             self.assertFalse(os.path.isfile(os.path.join(d, "job.json.tmp")))
 
@@ -89,9 +91,40 @@ class SubmitTests(unittest.TestCase):
             first = _submit(root)
             jobs._update_status(first, root, state="running")
             with mock.patch("jobs._unit_active", return_value=True):
-                second = _submit(root)
-            self.assertEqual(first, second)
+                with self.assertRaises(ValueError) as ctx:
+                    _submit(root)
+            self.assertIn(first, str(ctx.exception))
             self.assertEqual(len(os.listdir(os.path.join(root, "derived", "jobs"))), 1)
+
+    def test_submit_refuses_duplicate_run_id(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = _submit(root, kind="predict", run_id="dup-run")
+            with self.assertRaises(ValueError) as ctx:
+                _submit(root, kind="predict", run_id="dup-run")
+            self.assertIn(first, str(ctx.exception))
+            self.assertEqual(len(os.listdir(os.path.join(root, "derived", "jobs"))), 1)
+
+    def test_submit_allows_different_run_ids(self):
+        with tempfile.TemporaryDirectory() as root:
+            _submit(root, kind="predict", run_id="run-a")
+            _submit(root, kind="predict", run_id="run-b")
+            self.assertEqual(len(os.listdir(os.path.join(root, "derived", "jobs"))), 2)
+
+    def test_run_key_ignores_cwd_and_commit(self):
+        argv = [sys.executable, "spellbook/main.py", "--engine", "metashape",
+                "--scene", "9004"]
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as other:
+            _submit(root, argv=argv, cwd=root, kind="reconstruct")
+            with self.assertRaises(ValueError):
+                _submit(root, argv=argv, cwd=other, kind="reconstruct")
+
+    def test_reconstruct_identity_from_flags(self):
+        argv = [sys.executable, "main.py", "--engine", "metashape",
+                "--scene", "9004"]
+        self.assertEqual(
+            jobs._run_key(argv, "reconstruct", None),
+            "reconstruct:--engine=metashape|--scene=9004")
 
 
 class RunWrapperTests(unittest.TestCase):
@@ -152,6 +185,7 @@ class RunWrapperTests(unittest.TestCase):
                 root, "derived", "jobs", job_id, "job.json"))
             self.assertEqual(new_job["argv"], old_job["argv"])
             self.assertEqual(new_job["run_id"], "run-x")
+            self.assertEqual(new_job["run_key"], old_job["run_key"])
             self.assertEqual(new_job["retry_of"], job_id)
 
     def test_retry_refuses_active(self):
@@ -161,6 +195,17 @@ class RunWrapperTests(unittest.TestCase):
             with mock.patch("jobs._unit_active", return_value=True):
                 with self.assertRaises(ValueError):
                     jobs.retry_job(job_id, scannet_root=root)
+
+    def test_retry_refuses_missing_cwd(self):
+        with tempfile.TemporaryDirectory() as root:
+            nested = os.path.join(root, "work")
+            os.makedirs(nested)
+            job_id = _submit(root, cwd=nested)
+            import shutil
+            shutil.rmtree(nested)
+            with self.assertRaises(ValueError) as ctx:
+                jobs.retry_job(job_id, scannet_root=root)
+            self.assertIn("cwd is gone", str(ctx.exception))
 
 
 class GpuWaitTests(unittest.TestCase):
@@ -231,6 +276,96 @@ class WorkerLimitTests(unittest.TestCase):
                     detached_worker_limit(4)
 
 
+class JobContextTests(unittest.TestCase):
+    def _clean_env(self):
+        return mock.patch.dict(os.environ, {}, clear=False)
+
+    def test_job_context_creates_and_completes_record(self):
+        with tempfile.TemporaryDirectory() as root, self._clean_env():
+            os.environ.pop("SPELLBOOK_JOB_ID", None)
+            with jobs.job_context([sys.executable, "-c", "print('hi')"],
+                                  cwd=root, kind="command",
+                                  scannet_root=root) as job_id:
+                self.assertEqual(os.environ.get("SPELLBOOK_JOB_ID"), job_id)
+                status = jobs._read_json(os.path.join(
+                    root, "derived", "jobs", job_id, "status.json"))
+                self.assertEqual(status["state"], "running")
+            self.assertNotIn("SPELLBOOK_JOB_ID", os.environ)
+            job = jobs._read_json(os.path.join(
+                root, "derived", "jobs", job_id, "job.json"))
+            status = jobs._read_json(os.path.join(
+                root, "derived", "jobs", job_id, "status.json"))
+            self.assertIsNone(job["unit"])
+            self.assertEqual(status["state"], "succeeded")
+
+    def test_job_context_adopts_existing_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.dict(os.environ, {"SPELLBOOK_JOB_ID": "job-x"},
+                                 clear=False), \
+                    mock.patch("jobs.submit") as submit, \
+                    mock.patch("jobs._update_status") as update:
+                with jobs.job_context([sys.executable, "-c", "pass"],
+                                      cwd=root,
+                                      scannet_root=root) as job_id:
+                    self.assertEqual(job_id, "job-x")
+            submit.assert_not_called()
+            update.assert_not_called()
+
+    def test_job_context_marks_failed_on_exception(self):
+        with tempfile.TemporaryDirectory() as root, self._clean_env():
+            os.environ.pop("SPELLBOOK_JOB_ID", None)
+            with self.assertRaises(RuntimeError):
+                with jobs.job_context([sys.executable, "-c", "pass"],
+                                      cwd=root, scannet_root=root):
+                    raise RuntimeError("boom")
+            self.assertNotIn("SPELLBOOK_JOB_ID", os.environ)
+            rows = jobs.list_jobs(root)
+            self.assertEqual(rows[0]["state"], "failed")
+
+    def test_lease_requires_job_record(self):
+        from utils.gpu import gpu_lease
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch("utils.gpu._present_gpus", return_value={1}), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SPELLBOOK_JOB_ID", None)
+            with self.assertRaises(RuntimeError) as ctx:
+                with gpu_lease([1], root):
+                    pass
+            self.assertIn("job record", str(ctx.exception))
+
+    def test_derive_state_persists_lost(self):
+        with tempfile.TemporaryDirectory() as root:
+            job_id = _submit(root)
+            jobs._update_status(job_id, root, state="running",
+                                wrapper_pid=99999999)
+            rows = jobs.list_jobs(root)
+            self.assertEqual(rows[0]["state"], "lost")
+            status = jobs._read_json(os.path.join(
+                root, "derived", "jobs", job_id, "status.json"))
+            self.assertEqual(status["state"], "lost")
+
+    def test_foreground_record_lost_when_pid_dead(self):
+        with tempfile.TemporaryDirectory() as root:
+            job_id = _submit(root)
+            jobs._update_status(job_id, root, state="running",
+                                wrapper_pid=99999999)
+            job = jobs._read_json(os.path.join(
+                root, "derived", "jobs", job_id, "job.json"))
+            self.assertIsNone(job.get("unit"))
+            status = jobs._read_json(os.path.join(
+                root, "derived", "jobs", job_id, "status.json"))
+            self.assertEqual(
+                jobs.derive_state(job_id, job, status, root), "lost")
+
+    def test_canonical_runner_resolves_main_checkout(self):
+        runner = jobs._canonical_spellbook(jobs._SPELLBOOK)
+        self.assertTrue(runner.endswith("spellbook"))
+        self.assertTrue(os.path.isfile(os.path.join(runner, "jobs.py")))
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(jobs._canonical_spellbook(root),
+                             jobs._SPELLBOOK)
+
+
 class ResourceTests(unittest.TestCase):
     def test_lease_missing_is_free_and_not_created(self):
         with tempfile.TemporaryDirectory() as root:
@@ -292,6 +427,7 @@ class ResourceTests(unittest.TestCase):
             self.assertIn("reserved", text)
             self.assertIn("unleased", text)
             self.assertIn("run-a", text)
+            self.assertIn("ACTIVE JOBS (1)", text)
             self.assertRegex(text, r"QUEUE\s+-\s+-\s+run-a")
 
 
@@ -349,7 +485,7 @@ class StatusUtilTests(unittest.TestCase):
         self.assertIn("1m search3d     smoke-search3d", text)
         self.assertNotIn("python", text)
 
-    def test_owned_job_is_not_repeated_as_waiting(self):
+    def test_owned_job_shows_gpu_label(self):
         from utils.status import render_snapshot
         fake = self._fake_res()
         fake.gpu_leases.return_value = {1: 42}
@@ -360,12 +496,26 @@ class StatusUtilTests(unittest.TestCase):
             "started": 1699999970.0,
             "job_id": "job-1",
         }
+        rows = self._rows() + [{
+            "job_id": "job-2", "kind": "predict", "run_id": "run-b",
+            "state": "running", "submitted": 1699999940.0,
+            "started": 1699999950.0, "ended": None, "exit_code": None,
+            "branch": "master", "log": "/tmp/job-2/job.log",
+        }]
         with tempfile.TemporaryDirectory() as root, \
                 mock.patch("utils.status.time.time", return_value=1700000000.0):
             text = "\n".join(render_snapshot(
-                fake, [1], {"total": 100, "idle": 50}, self._rows(), root))
-        self.assertIn("run-a", text)
-        self.assertNotIn("STATE    TIME", text)
+                fake, [1], {"total": 100, "idle": 50}, rows, root))
+        self.assertIn("ACTIVE JOBS (2)", text)
+        self.assertRegex(text, r"GPU1\s+\S+\s+master\s+run-a")
+        self.assertRegex(text, r"WAIT\s+\S+\s+master\s+run-b")
+
+    def test_active_section_always_rendered(self):
+        from utils.status import render_snapshot
+        with tempfile.TemporaryDirectory() as root:
+            text = "\n".join(render_snapshot(
+                self._fake_res(), [1], {"total": 100, "idle": 50}, [], root))
+        self.assertIn("ACTIVE JOBS (0)", text)
 
     def test_recent_history_uses_process_runtime(self):
         from utils.status import render_snapshot
@@ -470,10 +620,14 @@ class StatusUtilTests(unittest.TestCase):
                 "--run-id", "run-x"]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("predict.runner.predict", return_value=[]) as predict, \
-                mock.patch("jobs.submit") as submit:
+                mock.patch("jobs.submit", return_value="job-fg") as submit, \
+                mock.patch("jobs._update_status"), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SPELLBOOK_JOB_ID", None)
             main_mod.main()
         predict.assert_called_once()
-        submit.assert_not_called()
+        submit.assert_called_once()
+        self.assertNotIn("SPELLBOOK_JOB_ID", os.environ)
 
 
 if __name__ == "__main__":

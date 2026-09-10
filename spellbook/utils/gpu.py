@@ -138,6 +138,10 @@ def gpu_lease(gpu_pool, scannet_root):
         raise RuntimeError(
             f"configured gpu_pool {gpu_pool} missing physical GPU(s) {missing} "
             f"(found {sorted(present)})")
+    if not os.environ.get(JOB_ID_ENV):
+        raise RuntimeError(
+            "managed GPU lease requires a job record; launch through "
+            "spellbook/main.py instead of calling this module directly")
     lock_dir = os.path.join(scannet_root, LOCK_ROOT)
     os.makedirs(lock_dir, exist_ok=True)
     waited = False

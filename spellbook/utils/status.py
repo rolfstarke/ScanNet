@@ -78,7 +78,7 @@ def render_snapshot(res, pool, prev_cpu, rows, scannet_root):
     lock_dir = os.path.join(scannet_root, "derived", "locks", "gpus")
     leases = res.gpu_leases(lock_dir, pool)
     rows_by_id = {row["job_id"]: row for row in rows}
-    owner_jobs = set()
+    gpu_by_job = {}
 
     lines.append("GPU UTIL      MEMORY TEMP    TIME SESSION      RUN")
     for i in sorted(set(stats) | set(pool) | {0}):
@@ -95,7 +95,7 @@ def render_snapshot(res, pool, prev_cpu, rows, scannet_root):
             owner = res.process_info(leases[i])
             row = rows_by_id.get(owner.get("job_id"))
             if row:
-                owner_jobs.add(row["job_id"])
+                gpu_by_job[row["job_id"]] = i
             started = owner.get("started")
             elapsed = dur(now - started) if started else "-"
             session = _session(owner, row)
@@ -108,19 +108,21 @@ def render_snapshot(res, pool, prev_cpu, rows, scannet_root):
                      f"{st['temp']:>3.0f}C {elapsed:>7} "
                      f"{session[:12]:<12} {run}")
 
-    waiting = [row for row in rows
-               if row["state"] in ACTIVE_JOB_STATES
-               and row["job_id"] not in owner_jobs]
-    if waiting:
-        lines.append("")
-        lines.append("STATE    TIME SESSION      RUN")
-    labels = {"queued": "QUEUE", "starting": "START", "running": "WAIT",
-              "cancelling": "STOP"}
-    for row in waiting:
+    active = [row for row in rows if row["state"] in ACTIVE_JOB_STATES]
+    lines.append("")
+    lines.append(f"ACTIVE JOBS ({len(active)})")
+    lines.append("STATE    TIME SESSION      RUN")
+    labels = {"queued": "QUEUE", "starting": "START", "cancelling": "STOP"}
+    for row in active:
         started = row.get("started")
         elapsed = dur(now - started) if started else "-"
         session = short_branch(row.get("branch"))
-        lines.append(f"{labels[row['state']]:<5} {elapsed:>7} "
+        if row["state"] == "running":
+            gpu = gpu_by_job.get(row["job_id"])
+            label = f"GPU{gpu}" if gpu is not None else "WAIT"
+        else:
+            label = labels[row["state"]]
+        lines.append(f"{label:<5} {elapsed:>7} "
                      f"{session[:12]:<12} {row.get('run_id') or row['kind']}")
 
     recent = sorted(

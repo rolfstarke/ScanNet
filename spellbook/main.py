@@ -112,6 +112,21 @@ def main():
         print("monitor: python spellbook/main.py --status")
         return
 
+    if args.predict or args.engine or args.extract_frames or args.gpu_check:
+        from jobs import job_context
+        kind = ("predict" if args.predict else
+                "reconstruct" if args.engine else
+                "extract" if args.extract_frames else "command")
+        child = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
+        if "--foreground" not in child:
+            child.append("--foreground")
+        with job_context(child, cwd=os.getcwd(), kind=kind,
+                         run_id=args.run_id):
+            return _execute(args, parser)
+    return _execute(args, parser)
+
+
+def _execute(args, parser):
     if args.compare:
         conflicts = [name for name, present in (
             ("--visualize", args.visualize),

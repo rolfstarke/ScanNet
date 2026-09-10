@@ -137,6 +137,7 @@ class PruneTests(unittest.TestCase):
 class MainPredictTests(unittest.TestCase):
     def test_omitted_scene_uses_full_tuple(self):
         import main as spellbook_main
+        from contextlib import contextmanager
         captured = {}
 
         def fake_predict(scenes, models, classes, benchmark, run_id, **kwargs):
@@ -144,17 +145,31 @@ class MainPredictTests(unittest.TestCase):
             captured["classes"] = classes
             return [("mosaic3d", scenes[0], "/tmp", 0.1, True)]
 
-        argv = ["prog", "--predict", "--models", "mosaic3d", "--benchmark", "ScanNet200"]
+        @contextmanager
+        def _noop_job(*a, **k):
+            yield "job-test"
+
+        argv = ["prog", "--foreground", "--predict", "--models", "mosaic3d",
+                "--benchmark", "ScanNet200"]
         with mock.patch.object(sys, "argv", argv), \
-                mock.patch("predict.runner.predict", side_effect=fake_predict):
+                mock.patch("predict.runner.predict", side_effect=fake_predict), \
+                mock.patch("jobs.job_context", _noop_job):
             spellbook_main.main()
         self.assertEqual(captured["scenes"], list(LOCKED))
         self.assertIsNone(captured["classes"])
 
     def test_classes_rejected(self):
         import main as spellbook_main
-        argv = ["prog", "--predict", "--models", "mosaic3d", "--classes", "chair"]
-        with mock.patch.object(sys, "argv", argv):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _noop_job(*a, **k):
+            yield "job-test"
+
+        argv = ["prog", "--foreground", "--predict", "--models", "mosaic3d",
+                "--classes", "chair"]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch("jobs.job_context", _noop_job):
             with self.assertRaises(SystemExit):
                 spellbook_main.main()
 
