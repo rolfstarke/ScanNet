@@ -11,13 +11,39 @@ GPU job survives its orchestration parent; the child must keep the descriptor op
 for the whole workload.
 """
 import fcntl
+import json
 import os
 import subprocess
 import time
 from contextlib import contextmanager
 
 LOCK_ROOT = os.path.join("derived", "locks", "gpus")
-POLL_SECONDS = 10
+POLL_SECONDS = 1
+
+JOB_ID_ENV = "SPELLBOOK_JOB_ID"
+JOB_MAX_WORKERS_ENV = "SPELLBOOK_JOB_MAX_GPU_WORKERS"
+
+
+def detached_worker_limit(pool_size):
+    """Max concurrent GPU tasks for this process. Foreground default is
+    `pool_size`; a detached job (`jobs.py _run`) sets both
+    SPELLBOOK_JOB_ID and SPELLBOOK_JOB_MAX_GPU_WORKERS=1 so one job can
+    hold at most one managed GPU lease. A worker limit without a job id
+    is rejected as an invalid internal override."""
+    raw = os.environ.get(JOB_MAX_WORKERS_ENV)
+    if raw is None:
+        return pool_size
+    if not os.environ.get(JOB_ID_ENV):
+        raise RuntimeError(
+            f"{JOB_MAX_WORKERS_ENV} is set without {JOB_ID_ENV}; refusing to run")
+    try:
+        limit = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{JOB_MAX_WORKERS_ENV} must be an integer, got {raw!r}")
+    if not 1 <= limit <= pool_size:
+        raise RuntimeError(
+            f"{JOB_MAX_WORKERS_ENV}={limit} outside 1..{pool_size}; refusing to run")
+    return limit
 
 
 def _present_gpus():
@@ -55,6 +81,49 @@ class Lease:
             self._fd = None
 
 
+def _record_gpu_wait(scannet_root, wait_seconds):
+    """Accumulate one GPU-lease wait into the owning detached job, if any.
+
+    Never raises: detached accounting must not break the lease. Uses an
+    atomic replace so a concurrent wrapper status update cannot corrupt
+    the record (last-writer-wins on content, same as jobs._update_status).
+    """
+    job_id = os.environ.get(JOB_ID_ENV)
+    if not job_id or not scannet_root:
+        return
+    try:
+        wait = float(wait_seconds)
+    except (TypeError, ValueError):
+        return
+    if wait < 0:
+        return
+    path = os.path.join(str(scannet_root), "derived", "jobs", job_id,
+                        "status.json")
+    try:
+        with open(path) as f:
+            status = json.load(f)
+    except (OSError, ValueError):
+        return
+    try:
+        total = float(status.get("gpu_wait") or 0.0) + wait
+    except (TypeError, ValueError):
+        total = wait
+    status["gpu_wait"] = total
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(status, f, sort_keys=True, separators=(",", ":"))
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 @contextmanager
 def gpu_lease(gpu_pool, scannet_root):
     """Context manager acquiring the first free GPU in `gpu_pool` (settings order).
@@ -72,6 +141,7 @@ def gpu_lease(gpu_pool, scannet_root):
     lock_dir = os.path.join(scannet_root, LOCK_ROOT)
     os.makedirs(lock_dir, exist_ok=True)
     waited = False
+    request_ts = time.time()
     while True:
         for g in gpu_pool:
             fd = os.open(os.path.join(lock_dir, f"gpu-{g}.lock"),
@@ -85,6 +155,10 @@ def gpu_lease(gpu_pool, scannet_root):
                 print(f"[gpu] acquired lease for GPU {g} (after waiting)")
             else:
                 print(f"[gpu] acquired lease for GPU {g}")
+            try:
+                _record_gpu_wait(scannet_root, time.time() - request_ts)
+            except Exception:
+                pass
             lease = Lease(fd, g)
             try:
                 yield lease

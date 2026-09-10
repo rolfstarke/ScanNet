@@ -48,7 +48,69 @@ def main():
     parser.add_argument("--compare", action="store_true",
                         help="generate the offline numerical comparison dashboard "
                              "from existing artifacts and open it in the browser")
+    parser.add_argument("--foreground", action="store_true",
+                        help="run prediction/reconstruction/extract-frames inline in "
+                             "this shell with full pool-sized workers (may occupy "
+                             "all 4 managed GPUs); without it these commands detach "
+                             "into a systemd job")
+    parser.add_argument("--status", action="store_true",
+                        help="print live CPU/GPU-to-run ownership and active jobs "
+                             "without a GPU plus the 20 most recent jobs, then exit; "
+                             "live-refresh with 'watch -n 2 python spellbook/main.py --status'")
     args = parser.parse_args()
+
+    if args.status:
+        conflicts = [name for name, present in (
+            ("--visualize", args.visualize),
+            ("--predict", args.predict),
+            ("--gpu-check", args.gpu_check),
+            ("--engine", args.engine),
+            ("--extract-frames", args.extract_frames),
+            ("--replace", args.replace),
+            ("--scene", args.scene),
+            ("--models", args.models),
+            ("--classes", args.classes),
+            ("--benchmark", args.benchmark),
+            ("--run-id", args.run_id),
+            ("--run-parameters", args.run_parameters),
+            ("--issue", args.issue),
+            ("--foreground", args.foreground),
+            ("--compare", args.compare),
+        ) if present]
+        if conflicts:
+            parser.error("--status is exclusive with " + ", ".join(conflicts))
+        from utils.status import show_once
+        show_once()
+        return
+
+    if not args.foreground and \
+            (args.predict or args.engine or args.extract_frames):
+        if args.visualize or args.compare or args.gpu_check or args.status:
+            parser.error("detached submit is only for --predict, --engine, or --extract-frames")
+        if args.predict and not args.models:
+            parser.error("--predict requires --models")
+        if args.engine and not args.scene:
+            parser.error("--engine requires --scene")
+        if args.extract_frames and not args.scene:
+            parser.error("--extract-frames requires --scene")
+        if args.predict:
+            kind, run_id = "predict", args.run_id or time.strftime("run-%Y%m%d-%H%M%S")
+        elif args.engine:
+            kind, run_id = "reconstruct", None
+        elif args.extract_frames:
+            kind, run_id = "extract", None
+        else:
+            parser.error("unreachable")
+        child_argv = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:] + \
+            ["--foreground"]
+        if args.predict and not args.run_id:
+            child_argv += ["--run-id", run_id]
+        from jobs import submit as submit_job
+        job_id = submit_job(child_argv, cwd=os.getcwd(), kind=kind,
+                            run_id=run_id)
+        print(f"submitted {job_id} run_id={run_id}")
+        print("monitor: python spellbook/main.py --status")
+        return
 
     if args.compare:
         conflicts = [name for name, present in (
@@ -73,8 +135,11 @@ def main():
         root = load_settings()["scannet_root"]
         path = generate_report(root)
         print(f"comparison -> {path}")
-        if not open_report(path):
+        opened = open_report(path)
+        if not opened:
             print("no display or browser found; open the file above manually")
+        elif opened != path:
+            print(f"opened browser copy -> {opened}")
         return
 
     from evaluation.benchmark import (
@@ -113,6 +178,8 @@ def main():
     elif args.visualize:
         if args.scene:
             parser.error("--visualize does not take --scene")
+        from utils.glx import ensure_nvidia_glx
+        ensure_nvidia_glx()
         from utils.visualize import visualize
         visualize(benchmark=benchmark, run_id=args.run_id)
     elif args.predict:
