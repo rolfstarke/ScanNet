@@ -127,6 +127,86 @@ def gpu_leases(lock_dir, pool):
     return _lock_owner_pids(paths)
 
 
+def job_cgroup_path(pid):
+    """Unified cgroup-v2 directory for a live process; None when unusable.
+
+    Read-only: parses the ``0::/...`` entry of ``/proc/<pid>/cgroup`` and
+    joins it beneath ``/sys/fs/cgroup``. Rejects v1 layouts, deleted
+    cgroups, escapes, and missing processes without raising.
+    """
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return None
+    try:
+        with open(f"/proc/{pid_int}/cgroup") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3 or parts[0] != "0" or parts[1] != "":
+            continue
+        rel = parts[2]
+        if not rel.startswith("/") or ".." in rel.split("/") \
+                or "(deleted)" in rel:
+            return None
+        path = os.path.join("/sys/fs/cgroup", rel.lstrip("/"))
+        try:
+            if not os.path.isdir(path):
+                return None
+        except OSError:
+            return None
+        return path
+    return None
+
+
+def read_cpu_usec(cgroup_path):
+    """Cumulative ``cpu.stat:usage_usec`` for a cgroup; None on any failure."""
+    if not cgroup_path or not isinstance(cgroup_path, str):
+        return None
+    try:
+        if ".." in cgroup_path.split(os.sep):
+            return None
+        with open(os.path.join(cgroup_path, "cpu.stat")) as f:
+            for line in f:
+                if line.startswith("usage_usec"):
+                    value = int(line.split()[1])
+                    return value if value >= 0 else None
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def cgroup_pids(cgroup_path, limit=64):
+    """Live PIDs in a cgroup, bounded; empty list when unavailable."""
+    if not cgroup_path or not isinstance(cgroup_path, str):
+        return []
+    try:
+        with open(os.path.join(cgroup_path, "cgroup.procs")) as f:
+            out = []
+            for line in f:
+                line = line.strip()
+                if not line.isdigit():
+                    continue
+                out.append(int(line))
+                if len(out) >= limit:
+                    break
+            return out
+    except (OSError, ValueError):
+        return []
+
+
+def proc_cmdline(pid):
+    """Argv of a live process; empty list on any failure."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            return [part.decode(errors="replace")
+                    for part in f.read().split(b"\0") if part]
+    except (OSError, ValueError):
+        return []
+
+
 def process_info(pid):
     """Command, session location, job id, and start time for a live process."""
     if not pid:

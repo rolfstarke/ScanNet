@@ -423,6 +423,11 @@ def list_jobs(scannet_root=None):
             "exit_code": status.get("exit_code"),
             "branch": (job.get("git") or {}).get("branch"),
             "log": os.path.join(job_dir(job_id, _scannet_root(scannet_root)), "job.log"),
+            "argv": job.get("argv"),
+            "cwd": job.get("cwd"),
+            "wrapper_pid": status.get("wrapper_pid"),
+            "child_pid": status.get("child_pid"),
+            "retry_of": job.get("retry_of"),
         })
     return rows
 
@@ -532,11 +537,11 @@ def _cmd_submit(args):
     print(job_id)
 
 
-def render_snapshot(res, pool, prev_cpu, scannet_root=None):
+def render_snapshot(res, pool, prev_cpu, scannet_root=None, *args, **kwargs):
     """One dashboard frame; kept for compatibility, delegates to utils.status."""
     from utils.status import render_snapshot as _render
     return _render(res, pool, prev_cpu, list_jobs(scannet_root),
-                   _scannet_root(scannet_root))
+                   _scannet_root(scannet_root), *args, **kwargs)
 
 
 def main(argv=None):
