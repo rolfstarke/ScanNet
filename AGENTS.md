@@ -4,7 +4,7 @@
 - second priority: the repositoriy tools and utils of the prediction models and reconstruction methods.
 - third priority: ov3discomp tools and utils.
 - all your code should go to spellbook/
-- always stick to the datastructure of /data/scannet
+- always stick to the datastructure of /data/scannetdata
 - always make sure to keep ScanNet fully intact and operable with all additions
 
 ### task workflow
