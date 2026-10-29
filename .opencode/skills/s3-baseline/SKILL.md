@@ -6,7 +6,7 @@ description: Use to reproduce official reconstruction and prediction quality loc
 ## Method baseline
 
 - For reconstruction, the goal is to achieve ScanNet-like quality; for prediction, the goal is to achieve officially reported prediction AP on ScanNet.
-- Before execution, exhaustively research the current repository, relevant chats, open and closed issues, previous attempts, reports, artifacts, the method's repository, and official online solutions. launch multiple parallel @explore and @scout subagents.
+- Before execution, exhaustively research the current repository, relevant chats, open and closed issues, previous attempts, reports, artifacts, the method's repository, and official online solutions. Launch multiple parallel subagents.
 - Fix only integration defects required to run the official-default pipeline, and integrate them into the existing data structure and repository.
 - Debug and rerun up to 5 times or until the baseline target is met; record every attempt shortly in the `<method>-baseline` issue, and close it after baseline is achieved.
 - Retain only one baseline run per method and store its settings in the existing adapter or wrapper; retain the existing naming: reconstruction baselines use the engine-specific scan ID with run number 0, while prediction baselines use baseline-<method>.
