@@ -7,8 +7,8 @@ description: Use when improving a ScanNet reconstruction or prediction method.
 
 - First, give a rough time estimate in the chat.
 - Improve one method at a time in six-run batches: three parameter-tuning runs and three runs testing independent high-risk, high-upside improvements.
-- Before each batch, exhaustively analyze the current best run's shortcomings and read all previous attempts in the `<method>-optimization` issue. Use multiple parallel subagents.
-- Based on the analysis and a deep web search, formulate improvement hypotheses. Use multiple parallel subagents.
+- Before each batch, exhaustively analyze the current best run's shortcomings and read all previous attempts in the `<method>-optimization` issue. Use multiple parallel @explore subagents.
+- Based on the analysis and a deep web search, formulate improvement hypotheses. Use multiple parallel @scout subagents.
 - Big changes are allowed, but always stay inside the worktree and roll them back if unsuccessful.
 - Treat the baseline and all prior winners as immutable. Add the current batch's best candidate only if it improves the global best; otherwise add none.
 - **Reconstruction:** use existing scan slots and `geometry_score.yaml`. Retain the new winner's scan and `<scan>/recon/run.json`, if any; delete all other current-batch candidate scans. Deleted candidate scan slots may be reassigned.
