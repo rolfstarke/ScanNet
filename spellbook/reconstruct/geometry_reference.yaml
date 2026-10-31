@@ -1,19 +1,18 @@
-metric: observed_surface_voxel_mean_bidirectional_distance_v1
-voxel_mm: 10
+metric: observed_surface_voxel_mean_bidirectional_distance_v2
+voxel_mm: 20
+plot_distance_max_cm: 100
 max_surface_voxels: 12000000
 max_poses: 120
 min_views: 2
-ray_width: 240
-ray_height: 150
 scenes:
   scene9004:
     retained_runs: 10
     cad_source: /data/scannetdata/custom/reference/LG2C_Raum312_v2.3dm
     cad_source_sha256: ff00c139adededf46f94f69c7872a566f2da2617224305b6dd8583d5dd04994a
     cad_ply: /data/scannetdata/custom/reference/scene9004_cad.ply
-    visible_voxels: /data/scannetdata/custom/reference/scene9004_visible_voxels.npz
+    visible_voxels: /data/scannetdata/custom/reference/scene9004_visible_voxels_20mm.npz
     reference_sha256: 766131128d262b8a7c0cf75243f88c3b269f4c88058c62d9750b380c8b4eb24d
-    visible_voxels_sha256: d4d7fbf0f58d3226c1f74210b189cdd307d0a31bcc3ac94106d47239cba066d3
+    visible_voxels_sha256: 8dc351e24f54c3d4b7069507ad3e574f66001f144567a7f09144bacb195ee1c4
     grid_origin_m:
     - -7.16
     - -4.82
@@ -38,4 +37,4 @@ scenes:
     curves_omitted: 8
     visibility_yaw_deg: 270
     visibility_n_poses: 120
-    visibility_n_cells: 231360
+    visibility_n_cells: 863305

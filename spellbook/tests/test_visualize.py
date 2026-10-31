@@ -408,8 +408,8 @@ class GeometryHelperTests(unittest.TestCase):
 class CadReportTests(unittest.TestCase):
     def _reference(self):
         return {
-            "metric": "observed_surface_voxel_mean_bidirectional_distance_v1",
-            "voxel_mm": 10,
+            "metric": "observed_surface_voxel_mean_bidirectional_distance_v2",
+            "voxel_mm": 20,
             "scenes": {
                 "scene9004": {
                     "reference_sha256": "aaa",
@@ -420,14 +420,14 @@ class CadReportTests(unittest.TestCase):
 
     def _doc(self, **extra):
         doc = {
-            "metric": "observed_surface_voxel_mean_bidirectional_distance_v1",
+            "metric": "observed_surface_voxel_mean_bidirectional_distance_v2",
             "mean_bidirectional_distance_cm": 17.3,
             "accuracy_mean_cm": 21.88,
             "completeness_mean_cm": 12.7,
             "scene": "scene9004_10",
             "reference_sha256": "aaa",
             "visible_voxels_sha256": "bbb",
-            "voxel_mm": 10,
+            "voxel_mm": 20,
         }
         doc.update(extra)
         return doc

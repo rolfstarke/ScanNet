@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SPELLBOOK = os.path.dirname(os.path.dirname(HERE))
 REPO = os.path.dirname(SPELLBOOK)
 ROOT = "/data/scannetdata"
-PARAMS = os.path.join(SPELLBOOK, "tmp", "recovery", "params")
+PARAMS = os.path.join(HERE, "params")
 STATE = os.path.join(HERE, "state.json")
 LOGS = os.path.join(HERE, "logs")
 RESERVED = os.path.join(HERE, "reserved_gpus")
@@ -215,7 +215,7 @@ def main():
     os.makedirs(LOGS, exist_ok=True)
     only = {int(a) for a in sys.argv[1:]}
     pending = [o for o in QUEUE if (not only or o in only)
-               and load_state().get(str(o), {}).get("state") not in ("done", "failed")]
+               and load_state().get(str(o), {}).get("state") not in ("done", "failed", "archived")]
     for wait_s in (GPU_WAIT_S, DEFERRED_WAIT_S):
         deferred = []
         for order in pending:

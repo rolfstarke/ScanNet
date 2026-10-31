@@ -19,11 +19,16 @@ from . import SCANS_DIR
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "geometry_reference.yaml")
-METRIC = "observed_surface_voxel_mean_bidirectional_distance_v1"
+METRIC = "observed_surface_voxel_mean_bidirectional_distance_v2"
 SCORE_KEY = "mean_bidirectional_distance_cm"
 CAD_RGB = np.array([0.92, 0.12, 0.72])   # magenta
 RECON_RGB = np.array([0.08, 0.78, 0.90])  # cyan
 CEILING_HEIGHT_M = 2.5
+KD_WORKERS = 8
+SPLIT_CHUNK = 1 << 20          # triangles handled per step of surface_voxels
+INDEX_BITS = 21                # per-axis bits of a packed cell index
+PLOT_CELL_M = 0.05             # fixed projection cell of the occupancy panels
+PLOT_FULL_CELLS = 20           # stacked cells per projected column at full colour (1 m of wall)
 
 
 def load_config(path=None):
@@ -86,8 +91,29 @@ def apply_T(pts, T):
     return (T[:3, :3] @ np.asarray(pts, dtype=np.float64).T).T + T[:3, 3]
 
 
+def pack_cells(idx):
+    """Unique int64 key per (N,3) cell index; inverse is unpack_cells."""
+    off = 1 << (INDEX_BITS - 1)
+    idx = np.asarray(idx, dtype=np.int64) + off
+    if idx.size and (idx.min() < 0 or idx.max() >= (1 << INDEX_BITS)):
+        raise RuntimeError("cell index outside the packable range")
+    return (idx[:, 0] << (2 * INDEX_BITS)) | (idx[:, 1] << INDEX_BITS) | idx[:, 2]
+
+
+def unpack_cells(keys):
+    off, mask = 1 << (INDEX_BITS - 1), (1 << INDEX_BITS) - 1
+    keys = np.asarray(keys, dtype=np.int64)
+    return (np.stack([keys >> (2 * INDEX_BITS), (keys >> INDEX_BITS) & mask, keys & mask], 1)
+            - off).astype(np.int32)
+
+
 def surface_voxels(mesh, origin, voxel_m, bounds_min=None, bounds_max=None, max_voxels=None):
-    """Sorted (N,3) int32 surface voxel indices via barycentric triangle sampling."""
+    """Sorted (N,3) int32 cells a triangle's surface passes through.
+
+    Triangles are bisected on their longest edge until they sit inside one cell (convex, so that
+    cell holds all of it) or their longest edge is at most half a cell, so occupancy has no
+    gaps at any triangle size and each triangle costs only what its cell crossings need.
+    """
     V = np.asarray(mesh.vertices, dtype=np.float64)
     F = np.asarray(mesh.triangles, dtype=np.int64)
     if len(F) == 0:
@@ -97,32 +123,49 @@ def surface_voxels(mesh, origin, voxel_m, bounds_min=None, bounds_max=None, max_
         lo, hi = np.asarray(bounds_min, float), np.asarray(bounds_max, float)
         if (V < lo - 1e-9).any() or (V > hi + 1e-9).any():
             raise RuntimeError("mesh vertices outside configured evaluation bounds")
-    a, b, c = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
-    edge = np.maximum.reduce([np.linalg.norm(b - a, axis=1),
-                              np.linalg.norm(c - b, axis=1),
-                              np.linalg.norm(a - c, axis=1)])
-    levels = np.clip(np.ceil(edge / max(voxel_m, 1e-9)).astype(np.int32), 1, 64)
-    chunks = [V]
-    for k in np.unique(levels):
-        sel = F[levels == k]
-        aa, bb, cc = V[sel[:, 0]], V[sel[:, 1]], V[sel[:, 2]]
-        if k == 1:
-            chunks.extend([aa, bb, cc, (aa + bb + cc) / 3.0])
-            continue
-        u = (np.arange(k, dtype=np.float64) + 0.5) / k
-        uu, vv = np.meshgrid(u, u, indexing="xy")
-        mask = (uu + vv) <= 1.0 + 1e-12
-        wu, wv = uu[mask], vv[mask]
-        ww = 1.0 - wu - wv
-        p = (aa[:, None] * ww[None, :, None] + bb[:, None] * wu[None, :, None]
-             + cc[:, None] * wv[None, :, None])
-        chunks.append(p.reshape(-1, 3))
-    idx = np.unique(np.floor((np.concatenate(chunks) - origin) / voxel_m).astype(np.int32), axis=0)
-    if idx.size == 0:
+    limit2 = (0.5 * voxel_m) ** 2
+
+    def cells(pts):
+        return pack_cells(np.floor((pts - origin) / voxel_m))
+
+    kept, pending, stack = [], 0, [V[F[i:i + SPLIT_CHUNK]]
+                                   for i in range(0, len(F), SPLIT_CHUNK)]
+    while stack:
+        tri = stack.pop()                                        # (N,3,3)
+        keys = cells(tri.reshape(-1, 3)).reshape(-1, 3)
+        same = (keys[:, 0] == keys[:, 1]) & (keys[:, 1] == keys[:, 2])
+        kept.append(np.unique(keys[same, 0]))
+        tri, keys = tri[~same], keys[~same]
+        if len(tri):
+            e2 = np.stack([((tri[:, 1] - tri[:, 2]) ** 2).sum(1),    # edge opposite vertex 0,1,2
+                           ((tri[:, 2] - tri[:, 0]) ** 2).sum(1),
+                           ((tri[:, 0] - tri[:, 1]) ** 2).sum(1)], 1)
+            leaf = e2.max(1) <= limit2
+            kept.append(np.unique(np.concatenate(
+                [keys[leaf].ravel(), cells(tri[leaf].mean(1))])))
+            tri, e2 = tri[~leaf], e2[~leaf]
+            if len(tri):
+                # Roll each triangle so its longest edge is v1-v2, then split at that midpoint.
+                roll = (e2.argmax(1)[:, None] + np.arange(3)) % 3
+                tri = tri[np.arange(len(tri))[:, None], roll]
+                mid = 0.5 * (tri[:, 1] + tri[:, 2])
+                left, right = tri.copy(), tri
+                left[:, 2] = mid
+                right[:, 1] = mid
+                both = np.concatenate([left, right])
+                stack.extend(both[i:i + SPLIT_CHUNK]
+                             for i in range(0, len(both), SPLIT_CHUNK))
+        pending += sum(len(k) for k in kept[-2:])
+        if pending > (1 << 25):
+            kept, pending = [np.unique(np.concatenate(kept))], 0
+            if max_voxels is not None and len(kept[0]) > max_voxels:
+                raise RuntimeError(f"surface voxels {len(kept[0])} exceed cap {max_voxels}")
+    keys = np.unique(np.concatenate(kept))
+    if keys.size == 0:
         raise RuntimeError("surface voxelization produced zero cells")
-    if max_voxels is not None and len(idx) > max_voxels:
-        raise RuntimeError(f"surface voxels {len(idx)} exceed cap {max_voxels}")
-    return idx[np.lexsort((idx[:, 2], idx[:, 1], idx[:, 0]))]
+    if max_voxels is not None and len(keys) > max_voxels:
+        raise RuntimeError(f"surface voxels {len(keys)} exceed cap {max_voxels}")
+    return unpack_cells(keys)                                    # keys sort as x, y, z
 
 
 def voxel_centres(idx, origin, voxel_m):
@@ -132,8 +175,8 @@ def voxel_centres(idx, origin, voxel_m):
 def mean_bidirectional_distance_cm(ref, recon):
     if len(ref) == 0 or len(recon) == 0:
         raise RuntimeError("empty cell set in mean bidirectional distance")
-    d_rec = cKDTree(ref).query(recon, k=1, workers=-1)[0]
-    d_ref = cKDTree(recon).query(ref, k=1, workers=-1)[0]
+    d_rec = cKDTree(ref).query(recon, k=1, workers=KD_WORKERS)[0]
+    d_ref = cKDTree(recon).query(ref, k=1, workers=KD_WORKERS)[0]
     acc, comp = float(np.mean(d_rec)) * 100.0, float(np.mean(d_ref)) * 100.0
     score = 0.5 * (acc + comp)
     if not np.isfinite(score) or score < 0:
@@ -192,7 +235,7 @@ def align_cad_to_recon(cad_pts, recon_pts):
 
 
 def _occupancy_panel(ax, cad, rec, dims, cell):
-    """Integer-grid occupancy; cover-weighted magenta/cyan mix; α shared via Nmax."""
+    """Integer-grid occupancy; cover-weighted magenta/cyan mix; fixed α across scans."""
     c2, r2 = cad[:, list(dims)], rec[:, list(dims)]
     all2 = np.vstack([c2, r2])
     lo = np.floor(all2.min(0) / cell) * cell
@@ -210,8 +253,7 @@ def _occupancy_panel(ax, cad, rec, dims, cell):
         return out
 
     a_c, a_r = cov(c2), cov(r2)
-    n_max = max(float(a_c.max()), float(a_r.max()), 1.0)
-    a_c, a_r = a_c / n_max, a_r / n_max
+    a_c, a_r = np.minimum(a_c / PLOT_FULL_CELLS, 1.0), np.minimum(a_r / PLOT_FULL_CELLS, 1.0)
     w = a_c + a_r
     alpha = np.clip(w, 0, 1)
     rgb = np.ones((n1, n0, 3))
@@ -225,8 +267,10 @@ def _occupancy_panel(ax, cad, rec, dims, cell):
 
 
 def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, score,
-                           accuracy_mean, completeness_mean):
-    """Plan | elev on top; full-width isometric recon (distance-coloured) below."""
+                           accuracy_mean, completeness_mean, distance_max_cm):
+    """Plan | elev on top; full-width isometric recon (distance-coloured) below.
+
+    All colour scales are fixed so reports of different scans compare directly."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -234,8 +278,7 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     from matplotlib.patches import Patch
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-    extent = float(np.ptp(np.vstack([ref_centres[:, :2], recon_centres[:, :2]]), 0).max())
-    cell = float(np.clip(extent / 100.0, 0.05, 0.12))
+    cell = PLOT_CELL_M
 
     def coarse(p):
         qi = np.unique(np.floor(np.asarray(p, float) / cell).astype(np.int64), axis=0)
@@ -253,10 +296,9 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     F2 = F[kv[F[:, 0]] & kv[F[:, 1]] & kv[F[:, 2]]]
     if len(F2) == 0:
         raise RuntimeError("no faces left after ceiling hide")
-    d_cm = cKDTree(ref_centres).query(V, k=1, workers=-1)[0] * 100.0
+    d_cm = cKDTree(ref_centres).query(V, k=1, workers=KD_WORKERS)[0] * 100.0
     d_face = d_cm[F2].mean(1)
-    p95 = max(float(np.percentile(d_face, 95)), 1e-3)
-    t = np.clip(d_face / p95, 0, 1)
+    t = np.clip(d_face / distance_max_cm, 0, 1)
     fcol = CAD_RGB * (1 - t)[:, None] + RECON_RGB * t[:, None]
 
     # Zoom to recon faces inside CAD room
@@ -275,7 +317,7 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     lo, hi = plo - 0.04 * span, phi + 0.04 * span
 
     S, iso_h, gap = 5.0, 2.1 * 5.0, 0.28
-    fig_w, fig_h = 2 * S + gap + 1.3, S + gap + iso_h + 1.3
+    fig_w, fig_h = 2 * S + gap + 1.7, S + gap + iso_h + 1.3  # right margin holds the colorbar
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
     ml, mb = 0.55 / fig_w, 0.72 / fig_h
     sx, sy, gx, gy = S / fig_w, S / fig_h, gap / fig_w, gap / fig_h
@@ -308,22 +350,21 @@ def render_geometry_report(path, ref_centres, recon_centres, mesh, scene_id, sco
     ax_i.grid(False)
     ax_i.set_facecolor("white")
     ax_i.set_title(
-        f"isometric recon · distance to CAD  (ceiling floor+{CEILING_HEIGHT_M:.1f}m) · "
-        f"p95={p95:.1f} cm", fontsize=10, pad=4)
+        f"{scene_id} isometric recon · distance to CAD  (ceiling floor+{CEILING_HEIGHT_M:.1f}m)",
+        fontsize=10, pad=4)
 
     cax = fig.add_axes([x0 + 2 * sx + gx + 0.012, y_iso + 0.06 * ih, 0.014, 0.88 * ih])
     sm = plt.cm.ScalarMappable(
         cmap=LinearSegmentedColormap.from_list("nf", [CAD_RGB, RECON_RGB]),
-        norm=plt.Normalize(0, p95))
+        norm=plt.Normalize(0, distance_max_cm))
     sm.set_array([])
-    fig.colorbar(sm, cax=cax).set_label("distance to CAD (cm)", fontsize=9)
+    fig.colorbar(sm, cax=cax, extend="max").set_label("distance to CAD (cm)", fontsize=9)
     fig.legend([Patch(color=CAD_RGB), Patch(color=RECON_RGB)],
                ["CAD (magenta)", "recon (cyan)"],
                loc="lower center", ncol=2, bbox_to_anchor=(0.5, 0.01), frameon=False)
     fig.suptitle(
-        f"{scene_id}  {SCORE_KEY}={score:.2f}  "
-        f"(acc={accuracy_mean:.2f}  comp={completeness_mean:.2f})  cell={cell:.2f}m",
-        y=0.97)
+        f"{METRIC}\nscore={score:.2f}  acc={accuracy_mean:.2f}  comp={completeness_mean:.2f} cm",
+        y=0.985, fontsize=11)
     fig.savefig(path, dpi=160, facecolor="white")
     plt.close(fig)
 
@@ -379,20 +420,18 @@ def score_scan_at(scan_dir, scan_id=None, config_path=None):
     recon_centres = recon_surface_centres(mesh_a, voxel_m, cfg.get("max_surface_voxels"))
 
     origin = np.asarray(sc["grid_origin_m"], float)
-    cad_mesh = load_mesh(sc["cad_ply"])
-    cad_idx = surface_voxels(cad_mesh, origin, voxel_m, sc.get("bounds_min_m"),
-                             sc.get("bounds_max_m"), cfg.get("max_surface_voxels"))
-    cad_set = set(map(tuple, cad_idx.tolist()))
-    vis_idx = np.array([i for i in np.load(sc["visible_voxels"])["indices"].astype(np.int32)
-                        if tuple(i) in cad_set], dtype=np.int32)
+    vis_idx = np.load(sc["visible_voxels"])["indices"].astype(np.int32)  # CAD cells, sha-checked
     if len(vis_idx) == 0:
         raise RuntimeError("empty visible CAD cell set after intersection")
     cad_centres = voxel_centres(vis_idx, origin, voxel_m)
 
     T_c2r, yaw0 = align_cad_to_recon(cad_centres, recon_centres)
     T_r2c = np.linalg.inv(T_c2r)
-    recon_cad = apply_T(recon_centres, T_r2c)
     mesh_cad = transform_mesh(mesh_a, T_r2c)
+    # Occupancy of the aligned recon on the GT lattice, so both sides are cells of one grid.
+    recon_cad = voxel_centres(surface_voxels(mesh_cad, origin, voxel_m,
+                                             max_voxels=cfg.get("max_surface_voxels")),
+                              origin, voxel_m)
     score, acc, comp = mean_bidirectional_distance_cm(cad_centres, recon_cad)
 
     recon_dir = os.path.join(root, "recon")
@@ -403,7 +442,7 @@ def score_scan_at(scan_dir, scan_id=None, config_path=None):
     os.close(fd)
     try:
         render_geometry_report(tmp_png, cad_centres, recon_cad, mesh_cad, scan_id,
-                               score, acc, comp)
+                               score, acc, comp, float(cfg["plot_distance_max_cm"]))
         doc = {
             "metric": METRIC,
             SCORE_KEY: float(round(score, 6)),

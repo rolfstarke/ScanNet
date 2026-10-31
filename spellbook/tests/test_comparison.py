@@ -42,14 +42,14 @@ def _write_csv(path, ap="0.5", ap50="0.6", ap25="0.7"):
 
 def _geometry_doc(scan_id, mean="15.0", acc="20.0", comp="10.0"):
     return {
-        "metric": "observed_surface_voxel_mean_bidirectional_distance_v1",
+        "metric": "observed_surface_voxel_mean_bidirectional_distance_v2",
         "mean_bidirectional_distance_cm": float(mean),
         "accuracy_mean_cm": float(acc),
         "completeness_mean_cm": float(comp),
         "scene": scan_id,
         "reference_sha256": "766131128d262b8a7c0cf75243f88c3b269f4c88058c62d9750b380c8b4eb24d",
-        "visible_voxels_sha256": "d4d7fbf0f58d3226c1f74210b189cdd307d0a31bcc3ac94106d47239cba066d3",
-        "voxel_mm": 10,
+        "visible_voxels_sha256": "8dc351e24f54c3d4b7069507ad3e574f66001f144567a7f09144bacb195ee1c4",
+        "voxel_mm": 20,
     }
 
 

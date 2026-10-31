@@ -3,6 +3,9 @@
 The original mask was raycast from the lost scene9004_04 ZED scan. It is rebuilt here from all
 pool poses; the open3d B1 baseline scan (pool poses, fixed floor transform) only supplies the
 mesh used to gauge-align that frame to the CAD.
+
+Inverse visibility, so the mask is as dense as the grid: every CAD cell centre inside a camera's
+image is tested with one ray from that camera against the CAD.
 """
 import os
 import sys
@@ -15,11 +18,11 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from reconstruct.geometry_score import (  # noqa: E402
     align_cad_to_recon, file_sha256, load_config, load_mesh, parse_axis_alignment,
-    recon_surface_centres, surface_voxels, transform_mesh, voxel_centres)
+    KD_WORKERS, recon_surface_centres, surface_voxels, transform_mesh, voxel_centres)
 
 OLD = "/data/scannetdata/scans/scene9004_40"
 POOL = "/data/scannetdata/derived/reconstruction/frames/scene9004/frames"
-OUT = "/data/scannetdata/custom/reference/scene9004_visible_voxels.npz"
+OUT = "/data/scannetdata/custom/reference/scene9004_visible_voxels_20mm.npz"
 CFG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "reconstruct", "geometry_reference.yaml")
 
@@ -73,15 +76,11 @@ def main():
     K = np.loadtxt(os.path.join(POOL, "intrinsic_depth.txt"))[:3, :3]
     d0 = cv2.imread(os.path.join(POOL, "depth", "0.png"), cv2.IMREAD_UNCHANGED)
     src_h, src_w = d0.shape[:2]
-    rw, rh = int(cfg["ray_width"]), int(cfg["ray_height"])
-    Ks = K.copy().astype(np.float64)
-    Ks[0, :] *= rw / src_w
-    Ks[1, :] *= rh / src_h
 
     n = len(aligned_poses)
     n_sel = min(int(cfg["max_poses"]), n)
     sel = np.unique(np.round(np.linspace(0, n - 1, n_sel)).astype(int))
-    print(f"[ref] casting {len(sel)} poses at {rw}x{rh}", flush=True)
+    print(f"[ref] casting to {len(cad_centres)} cells from {len(sel)} poses", flush=True)
 
     # CPU only: never touch user-reserved GPU 0 during reference build.
     device = o3d.core.Device("CPU:0")
@@ -91,44 +90,37 @@ def main():
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(cad_t)
 
-    hit_counts = {}
+    views = np.zeros(len(cad_centres), dtype=np.int32)
     for k, pi in enumerate(sel):
         P = aligned_poses[int(pi)]
-        # extrinsic = world_to_camera = inv(camera_to_world)
-        ext = np.linalg.inv(P).astype(np.float64)
-        rays = o3d.t.geometry.RaycastingScene.create_rays_pinhole(
-            intrinsic_matrix=o3d.core.Tensor(Ks),
-            extrinsic_matrix=o3d.core.Tensor(ext),
-            width_px=rw, height_px=rh)
-        rays = rays.to(device)
-        ans = scene.cast_rays(rays)
-        t_hit = ans["t_hit"].numpy()
-        ok = np.isfinite(t_hit.reshape(-1))
-        if not ok.any():
+        cam = (cad_centres - P[:3, 3]) @ P[:3, :3]               # world -> camera (x right, y down, z fwd)
+        z = cam[:, 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u = K[0, 0] * cam[:, 0] / z + K[0, 2]
+            v = K[1, 1] * cam[:, 1] / z + K[1, 2]
+        inside = np.flatnonzero((z > 0) & (u >= 0) & (u < src_w) & (v >= 0) & (v < src_h))
+        if len(inside) == 0:
             continue
-        rnp = rays.numpy().reshape(-1, 6)
-        origins = rnp[ok, :3]
-        dirs = rnp[ok, 3:]
-        pts = origins + dirs * t_hit.reshape(-1)[ok, None]
-        idx = np.floor((pts - origin) / voxel_m).astype(np.int32)
-        for cell in map(tuple, np.unique(idx, axis=0)):
-            hit_counts[cell] = hit_counts.get(cell, 0) + 1
+        to_cell = cad_centres[inside] - P[:3, 3]
+        dist = np.linalg.norm(to_cell, axis=1)
+        rays = np.concatenate([np.broadcast_to(P[:3, 3], to_cell.shape), to_cell / dist[:, None]],
+                              1).astype(np.float32)
+        t_hit = scene.cast_rays(o3d.core.Tensor(rays), nthreads=KD_WORKERS)["t_hit"].numpy()
+        views[inside[t_hit >= dist - voxel_m]] += 1              # inf (no hit) counts as unoccluded
         if (k + 1) % 20 == 0 or k + 1 == len(sel):
-            print(f"[ref] {k + 1}/{len(sel)} poses, unique cells so far={len(hit_counts)}", flush=True)
+            print(f"[ref] {k + 1}/{len(sel)} poses, cells seen so far={(views > 0).sum()}", flush=True)
 
     min_views = int(cfg["min_views"])
-    cad_set = set(map(tuple, cad_idx.tolist()))
-    kept = sorted(c for c, nviews in hit_counts.items()
-                  if nviews >= min_views and c in cad_set)
-    if len(kept) < 1000:
-        sys.exit(f"too few visible cells: {len(kept)}")
-    arr = np.array(kept, dtype=np.int32)
+    arr = cad_idx[views >= min_views]
+    if len(arr) < 1000:
+        sys.exit(f"too few visible cells: {len(arr)}")
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     np.savez_compressed(OUT, indices=arr)
     sha = file_sha256(OUT)
 
     with open(CFG) as f:
         cfgw = yaml.safe_load(f)
+    cfgw["scenes"]["scene9004"]["visible_voxels"] = OUT
     cfgw["scenes"]["scene9004"]["visible_voxels_sha256"] = sha
     cfgw["scenes"]["scene9004"]["visibility_yaw_deg"] = int(yaw)
     cfgw["scenes"]["scene9004"]["visibility_n_poses"] = int(len(sel))

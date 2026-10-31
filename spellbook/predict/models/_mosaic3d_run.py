@@ -56,7 +56,7 @@ ALLOWED_PARAMS = frozenset({
     "mask3d_confidence", "checkpoint", "preset", "rescore_mode", "dedup_iou", "prompt_mode",
 })
 
-# [inferred] geometric proxy constants (see spellbook/tmp/recovery/mosaic3d-derivation.md)
+# [inferred] geometric proxy constants (see #33; local notes: spellbook/archive/recovery/mosaic3d-derivation.md)
 GEOM_VOXEL = 0.05        # connectivity grid (m); 26-neighbourhood on occupied voxels
 GEOM2_HALF_POINTS = 200  # geom2 size prior n / (n + n0)
 
