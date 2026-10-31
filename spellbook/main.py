@@ -30,7 +30,8 @@ def main():
     parser.add_argument("--run-parameters", type=str, default=None,
                         help="JSON file mapping each --models entry to its parameters")
     parser.add_argument("--issue", type=int, default=None,
-                        help="GitHub issue number to record on the prediction run manifest")
+                        help="GitHub issue number to record on the prediction run manifest "
+                             "or the reconstruction recon/run.json")
     parser.add_argument("--engine", nargs="+", default=None,
                         choices=["zed", "metashape", "rtabmap", "isaac", "open3d",
                                  "bundlefusion"],
@@ -42,6 +43,9 @@ def main():
                              "shared pool (never from engine worktrees)")
     parser.add_argument("--replace", action="store_true",
                         help="re-extract frames even if a complete set exists")
+    parser.add_argument("--offline-score", action="store_true",
+                        help="with --engine: skip the inline scene9004 geometry score "
+                             "(score later with reconstruct.geometry_score --scan-dir)")
     parser.add_argument("--scene", nargs="+",
                         help="scene numbers (e.g., 0046_00 or 9004 9009); explicit "
                              "prediction subsets are non-comparable")
@@ -67,6 +71,7 @@ def main():
             ("--engine", args.engine),
             ("--extract-frames", args.extract_frames),
             ("--replace", args.replace),
+            ("--offline-score", args.offline_score),
             ("--scene", args.scene),
             ("--models", args.models),
             ("--classes", args.classes),
@@ -135,6 +140,7 @@ def _execute(args, parser):
             ("--engine", args.engine),
             ("--extract-frames", args.extract_frames),
             ("--replace", args.replace),
+            ("--offline-score", args.offline_score),
             ("--scene", args.scene),
             ("--models", args.models),
             ("--classes", args.classes),
@@ -164,10 +170,12 @@ def _execute(args, parser):
     benchmark = args.benchmark or load_settings()["default"]
     spec = resolve_benchmark(benchmark)
 
-    if args.run_parameters is not None or args.issue is not None:
-        if not args.predict:
-            parser.error("--run-parameters and --issue require --predict")
-        if args.issue is not None and args.issue <= 0:
+    if args.run_parameters is not None and not args.predict:
+        parser.error("--run-parameters requires --predict")
+    if args.issue is not None:
+        if not (args.predict or args.engine):
+            parser.error("--issue requires --predict or --engine")
+        if args.issue <= 0:
             parser.error("--issue must be a positive integer")
 
     if args.gpu_check:
@@ -223,7 +231,8 @@ def _execute(args, parser):
             parser.error("--engine requires --scene")
         from reconstruct.batch import run_batch
         ok, failed = run_batch([int(s) for s in args.scene], args.engine,
-                               args.replace)
+                               args.replace, issue=args.issue,
+                               offline_score=args.offline_score)
         sys.exit(1 if failed else 0)
     else:
         parser.print_help()

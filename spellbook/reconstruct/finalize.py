@@ -2,19 +2,33 @@
 
 The .sens color stream reuses the exact JPEG bytes already on disk (frames/color/<i>.jpg);
 depth is re-compressed from the PNG pixels (lossless). Frame indices = engine `keep` order.
+
+Fast valid .sens (threaded finalize, #47/#22 2026-09-16..26): zlib level 1, frames read +
+compressed by a thread pool (cv2.imread and zlib release the GIL) but written strictly in
+`keep` order through a bounded look-ahead window, atomic tmp+fsync+replace publish (in
+extract.write_sens_frames). 9004 _pipeline 94.4 s / 9009 65.5 s; the serial level-6 writer
+blew the 3x cap in #47 attempts 2/3.
 """
 import os
 import struct
 import zlib
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from .extract import _COLOR_JPEG, _DEPTH_ZLIB, _DEPTH_SHIFT, write_sens
+from .extract import _COLOR_JPEG, _DEPTH_ZLIB, _DEPTH_SHIFT, write_sens_frames
 
 TXT_KEYS = ("axisAlignment", "colorHeight", "colorWidth", "depthHeight", "depthWidth",
             "fx_color", "fx_depth", "fy_color", "fy_depth", "mx_color", "mx_depth",
             "my_color", "my_depth", "numColorFrames", "numDepthFrames",
             "numIMUmeasurements", "sceneType")
+
+ZLIB_LEVEL = 1
+# [inferred] worker count / window: not recorded in the issues; bounded so memory stays at
+# ~window frames (~1.5 MB each) regardless of scan length.
+FINALIZE_WORKERS = max(1, min(16, os.cpu_count() or 1))
+FINALIZE_WINDOW = 4 * FINALIZE_WORKERS
 
 
 def _read_frame_bytes(frames_dir, i):
@@ -26,15 +40,35 @@ def _read_frame_bytes(frames_dir, i):
     d = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
     if d is None or d.dtype != np.uint16:
         raise RuntimeError(f"bad depth frame {i}")
-    return color, zlib.compress(d.astype("<u2").tobytes(), level=6)
+    return color, zlib.compress(d.astype("<u2").tobytes(), level=ZLIB_LEVEL)
 
 
-def _frame_dims(frames_dir):
+def _frame_dims(frames_dir, first=0):
     import cv2
-    d = cv2.imread(os.path.join(frames_dir, "depth", "0.png"), cv2.IMREAD_UNCHANGED)
+    d = cv2.imread(os.path.join(frames_dir, "depth", f"{first}.png"), cv2.IMREAD_UNCHANGED)
     if d is None:
-        raise RuntimeError("cannot read depth frame 0 for dimensions")
+        raise RuntimeError(f"cannot read depth frame {first} for dimensions")
     return d.shape[1], d.shape[0]
+
+
+def ordered_frames(frames_dir, keep, workers=None, window=None):
+    """Yield (color_bytes, depth_bytes) for `keep` in order; reading/compression runs on a
+    thread pool with at most `window` frames in flight."""
+    workers = workers or FINALIZE_WORKERS
+    window = max(1, window or FINALIZE_WINDOW)
+    keep = list(keep)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        pending = deque()
+        it = iter(keep)
+        for i in it:
+            pending.append(ex.submit(_read_frame_bytes, frames_dir, i))
+            if len(pending) >= window:
+                break
+        while pending:
+            yield pending.popleft().result()
+            nxt = next(it, None)
+            if nxt is not None:
+                pending.append(ex.submit(_read_frame_bytes, frames_dir, nxt))
 
 
 def write_txt(path, K, num_frames, axis_alignment, scene_type, width, height):
@@ -62,19 +96,19 @@ def write_txt(path, K, num_frames, axis_alignment, scene_type, width, height):
 
 
 def finalize(scan_root, scan_id, frames_dir, K, poses, keep):
-    """Write <id>.sens for frames `keep` (original extract indices) with engine poses."""
+    """Write <id>.sens for frames `keep` (original extract indices) with engine poses.
+    Also persists recon/final_poses.npy and recon/keep.npy (frame index per .sens frame)."""
     frames_dir = os.path.abspath(frames_dir)
-    width, height = _frame_dims(frames_dir)
-    color_bytes = []
-    depth_bytes = []
-    for i in keep:
-        c, d = _read_frame_bytes(frames_dir, i)
-        color_bytes.append(c)
-        depth_bytes.append(d)
+    keep = [int(i) for i in keep]
+    if len(poses) != len(keep):
+        raise RuntimeError(f"finalize: {len(poses)} poses vs {len(keep)} keep")
+    width, height = _frame_dims(frames_dir, keep[0])
     sens_path = os.path.join(scan_root, f"{scan_id}.sens")
-    write_sens(sens_path, poses, color_bytes, depth_bytes,
-               [0] * len(keep), [0] * len(keep), K, width, height)
+    write_sens_frames(sens_path, poses,
+                      ((0, 0, c, d) for c, d in ordered_frames(frames_dir, keep)),
+                      K, width, height)
     recon = os.path.join(scan_root, "recon")
     os.makedirs(recon, exist_ok=True)
     np.save(os.path.join(recon, "final_poses.npy"), poses)
+    np.save(os.path.join(recon, "keep.npy"), np.asarray(keep, dtype=np.int64))
     return sens_path, width, height

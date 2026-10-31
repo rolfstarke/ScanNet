@@ -1,6 +1,6 @@
 """Orchestrates --predict: runs each requested model as a subprocess in its own conda env,
 writing ScanNet official benchmark submissions to
-/data/scannet/predictions/<Benchmark>/<run-id>/<model>/ (flat <scene>.txt files +
+<scannet_root>/predictions/<Benchmark>/<run-id>/<model>/ (flat <scene>.txt files +
 predicted_masks/, directly zippable for scan-net.org).
 
 Tasks are the (model x scene) cross-product, dispatched in parallel over the shared
@@ -23,7 +23,7 @@ from evaluation.benchmark import (
     validate_prediction_scenes,
 )
 
-SCANS_DIR = "/data/scannet/scans"
+SCANS_DIR = os.path.join(load_settings()["scannet_root"], "scans")
 
 LEASE_FD_ENV = "SPELLBOOK_GPU_LEASE_FD"
 
@@ -32,9 +32,10 @@ SUPPORTED_MODELS = list(PREDICTION_METHODS)
 MODEL_PYTHON = {
     "mosaic3d": "/data/mosaic3d/conda/envs/mosaic3d/bin/python",
     "openins3d": "/data/openins3d/conda/envs/openins3d/bin/python",
-    "openmask3d": "/home/rolf/anaconda3/envs/openmask3d/bin/python",
+    "openmask3d": "/data/openmask3d/conda/envs/openmask3d/bin/python",
     "openyolo3d": "/data/openyolo3D/conda/envs/openyolo3d/bin/python",
     "open3dis": "/data/open3dis/conda/envs/open3dis/bin/python",
+    "sam3dis": "/data/sam3dis/conda/envs/sam3dis/bin/python",
 }
 
 MODEL_RUN_SCRIPT = {
@@ -43,6 +44,7 @@ MODEL_RUN_SCRIPT = {
     "openmask3d": "models/_openmask3d_run.py",
     "openyolo3d": "models/_openyolo3d_run.py",
     "open3dis": "models/_open3dis_run.py",
+    "sam3dis": "models/_sam3dis_run.py",
 }
 
 MODEL_NEEDS_FRAMES = {
@@ -51,34 +53,50 @@ MODEL_NEEDS_FRAMES = {
     "openmask3d": True,
     "openyolo3d": True,
     "open3dis": True,
+    "sam3dis": True,
 }
 
 OPENYOLO3D_CUDA_HOME = "/data/openyolo3D/cuda-11.3"
 
 MODEL_RESOURCES = {
     "mosaic3d": (
-        "/home/rolf/GIT/Mosaic3D",
-        "/home/rolf/GIT/Mosaic3D/scripts/run_custom_scene.py",
+        "/data/Mosaic3D",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "_mosaic3d_scene.py"),
         "/data/mosaic3d/ckpts/sc.ckpt",
+        "/data/openins3d/checkpoints/scannet200_val.ckpt",
     ),
     "openins3d": (
-        "/home/rolf/GIT/OpenIns3D",
-        "/home/rolf/GIT/OpenIns3D/third_party/scannet200_val.ckpt",
+        "/data/openins3d/repo-56ccc22",
+        "/data/openins3d/repo-56ccc22/third_party/scannet200_val.ckpt",
     ),
     "openyolo3d": (
-        "/home/rolf/GIT/OpenYOLO3D",
-        "/home/rolf/GIT/OpenYOLO3D/pretrained/config_scannet200.yaml",
+        "/data/OpenYOLO3D",
+        "/data/OpenYOLO3D/pretrained/config_scannet200.yaml",
         os.path.join(OPENYOLO3D_CUDA_HOME, "lib64"),
     ),
     "open3dis": (
-        "/home/rolf/GIT/Open3DIS",
-        "/home/rolf/GIT/Open3DIS/configs/ov3dis_scene4.yaml",
-        "/home/rolf/GIT/Open3DIS/open3dis/dataset/ov3dis_loader.py",
+        "/data/Open3DIS",
+        "/data/Open3DIS/configs/scannet200.yaml",
+        "/data/Open3DIS/open3dis/dataset/scannet_loader.py",
+        "/data/Open3DIS/segmenter3d/ISBNet/configs/scannet200/isbnet_scannet200.yaml",
+        "/data/pretrains/scannet200/head_scannetv2_200_val.pth",
+        "/data/pretrains/foundation_models/groundingdino_swint_ogc.pth",
+        "/data/pretrains/foundation_models/sam_vit_h_4b8939.pth",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "_open3dis_stage.py"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "_open3dis_prepare.py"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "_open3dis_config.py"),
     ),
     "openmask3d": (
-        "/home/rolf/GIT/openmask3d",
+        "/data/openmask3d",
         "/data/openmask3d/resources/scannet200_model.ckpt",
         "/data/openmask3d/resources/sam_vit_h_4b8939.pth",
+    ),
+    "sam3dis": (
+        "/data/sam3dis",
+        "/data/sam3dis/sam3dis/pipeline.py",
+        "/data/sam3",
+        "/data/sam3dis/hf_cache/hub/models--facebook--sam3/snapshots/"
+        "3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt",
     ),
 }
 
@@ -266,7 +284,7 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
     settings GPU pool.
 
     Each (benchmark, run, model) writes an official ScanNet submission directly to
-    /data/scannet/predictions/<Benchmark>/<run-id>/<model>/. `classes` is the prompt class
+    <scannet_root>/predictions/<Benchmark>/<run-id>/<model>/. `classes` is the prompt class
     list; None -> the benchmark's official protocol classes. `run_id` isolates outputs;
     None -> one auto-generated run-YYYYMMDD-HHMMSS id for the whole call.
     Returns a list of (model, scene_id, out_dir, elapsed, ok) per task."""
@@ -275,7 +293,7 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
     from evaluation.runs import run_is_evaluated, write_run_manifest
     from utils.gpu import gpu_lease
     from utils.scan_lock import (
-        ScanLock, exclusive_lock, prediction_method_lock_path, scan_lock_path,
+        ScanLock, scan_lock_path,
     )
 
     settings = load_settings()
@@ -377,34 +395,26 @@ def predict(scene_ids, models, classes, benchmark="ScanNet20", run_id=None, repl
         def work(task):
             model, scene_id = task
             out_dir, tasks_log = _task_args(model)
-            lock_ctx = exclusive_lock(prediction_method_lock_path(model, scannet_root)) \
-                if model == "open3dis" else None
-            if lock_ctx:
-                lock_ctx.__enter__()
-            try:
-                with gpu_lease(gpu_pool, scannet_root) as lease:
-                    from utils.query import clip_features_path
-                    result = _run_one(
-                        model, scene_id, frames_dir_by_scene.get(scene_id), classes,
-                        lease.index, out_dir, benchmark, tasks_log, lease,
-                        run_id, param_paths[model], scannet_root,
-                        features_out=clip_features_path(
-                            spec, run_id, model, scene_id, scannet_root=scannet_root))
-                if result[-1]:
-                    from utils.compute_time import write_prediction_timing
-                    write_prediction_timing(
-                        spec, run_id, model, scene_id, result[3], scannet_root=scannet_root)
-                    try:
-                        _finalize_prediction(
-                            model, scene_id, result[2], benchmark, run_id, tasks_log,
-                            scannet_root=scannet_root)
-                    except Exception as exc:
-                        print(f"[WARN] {model} on {scene_id} scoring failed ({exc})")
-                        return (model, scene_id, result[2], result[3], False)
-                return result
-            finally:
-                if lock_ctx:
-                    lock_ctx.__exit__(None, None, None)
+            with gpu_lease(gpu_pool, scannet_root) as lease:
+                from utils.query import clip_features_path
+                result = _run_one(
+                    model, scene_id, frames_dir_by_scene.get(scene_id), classes,
+                    lease.index, out_dir, benchmark, tasks_log, lease,
+                    run_id, param_paths[model], scannet_root,
+                    features_out=clip_features_path(
+                        spec, run_id, model, scene_id, scannet_root=scannet_root))
+            if result[-1]:
+                from utils.compute_time import write_prediction_timing
+                write_prediction_timing(
+                    spec, run_id, model, scene_id, result[3], scannet_root=scannet_root)
+                try:
+                    _finalize_prediction(
+                        model, scene_id, result[2], benchmark, run_id, tasks_log,
+                        scannet_root=scannet_root)
+                except Exception as exc:
+                    print(f"[WARN] {model} on {scene_id} scoring failed ({exc})")
+                    return (model, scene_id, result[2], result[3], False)
+            return result
 
         max_workers = max(1, min(len(gpu_pool), len(pending))) if pending else 1
         if pending:

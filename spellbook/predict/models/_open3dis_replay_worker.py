@@ -14,7 +14,7 @@ Mask names are argmax cosine(img_feat, text) with the wrapper's convention
 (`clip.tokenize` over raw class names, L2-normalised).
 
 Usage:
-    python _open3dis_replay_worker.py --config <ov3dis_scene4.yaml>
+    python _open3dis_replay_worker.py --config <run scratch open3dis_run.yaml>
         --classes-file <txt> --exp-pth <maskGdino/scene.pth>
 """
 import argparse
@@ -25,7 +25,7 @@ import os
 import sys
 import time
 
-OPEN3DIS_REPO = "/home/rolf/GIT/Open3DIS"
+OPEN3DIS_REPO = "/data/Open3DIS"
 
 _PROTO_OUT = sys.stdout
 
@@ -59,7 +59,8 @@ def _load_scene(exp_pth, classes, config_path):
         clip_model = cfg.get("foundation_model", {}).get("clip_model", clip_model)
     except (OSError, ValueError):
         pass
-    data = torch.load(exp_pth, map_location="cpu")
+    # frame keys are zero-padded names of the 5-interval tree ("00005"); key by int frame id
+    data = {int(k): v for k, v in torch.load(exp_pth, map_location="cpu").items()}
     model, _ = clip.load(clip_model, device="cuda")
     with torch.no_grad():
         text = model.encode_text(clip.tokenize(classes).cuda())
@@ -75,7 +76,7 @@ def _frame_overlay(data, text, names, fid, image_path, colors):
     t0 = time.monotonic()
     with Image.open(image_path) as im:
         rgb = np.asarray(im.convert("RGB"))
-    entry = data.get(str(fid), data.get(int(fid)))
+    entry = data.get(int(fid))
     dets = []
     if entry is not None:
         feats = entry["img_feat"]

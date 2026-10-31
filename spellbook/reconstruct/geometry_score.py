@@ -344,6 +344,15 @@ def atomic_write_text(path, text):
 
 
 def score_scan(scan_id, config_path=None):
+    """Score the canonical scan <scannet_root>/scans/<scan_id>."""
+    return score_scan_at(os.path.join(SCANS_DIR, scan_id), scan_id, config_path)
+
+
+def score_scan_at(scan_dir, scan_id=None, config_path=None):
+    """Score a scan directory anywhere on disk (deferred/offline scoring, geometry-only
+    candidates outside the allocator; #39 b6). `scan_id` names the files inside
+    (<scan_id>_vh_clean_2.ply, <scan_id>.txt) and defaults to the directory basename."""
+    scan_id = scan_id or os.path.basename(os.path.normpath(scan_dir))
     cfg = load_config(config_path)
     if cfg.get("metric") != METRIC:
         raise RuntimeError(f"config metric {cfg.get('metric')!r} != {METRIC!r}")
@@ -357,7 +366,7 @@ def score_scan(scan_id, config_path=None):
         if file_sha256(path) != sc[key]:
             raise RuntimeError(f"{label} hash mismatch against geometry_reference.yaml")
 
-    root = os.path.join(SCANS_DIR, scan_id)
+    root = os.path.abspath(scan_dir)
     mesh_path = os.path.join(root, f"{scan_id}_vh_clean_2.ply")
     txt_path = os.path.join(root, f"{scan_id}.txt")
     if not os.path.isfile(mesh_path):
@@ -435,10 +444,18 @@ def score_scan(scan_id, config_path=None):
 
 def main():
     ap = argparse.ArgumentParser(description="CAD mean bidirectional distance score")
-    ap.add_argument("--scan-id", required=True)
+    ap.add_argument("--scan-id", default=None,
+                    help="canonical scan under scannet_root/scans (or file prefix with --scan-dir)")
+    ap.add_argument("--scan-dir", default=None,
+                    help="score a scan directory anywhere on disk (offline/candidate scoring)")
     ap.add_argument("--reference-config", default=DEFAULT_CONFIG)
     args = ap.parse_args()
-    score_scan(args.scan_id, args.reference_config)
+    if args.scan_dir:
+        score_scan_at(args.scan_dir, args.scan_id, args.reference_config)
+    elif args.scan_id:
+        score_scan(args.scan_id, args.reference_config)
+    else:
+        ap.error("--scan-id or --scan-dir required")
 
 
 if __name__ == "__main__":

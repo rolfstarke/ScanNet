@@ -24,9 +24,9 @@ from utils.detect_replay import (
     DETECT_FPS, OPENYOLO3D_CONFIG, DetectClient, detection_stride,
 )
 
-OPEN3DIS_REPO = "/home/rolf/GIT/Open3DIS"
+OPEN3DIS_REPO = "/data/Open3DIS"
 OPEN3DIS_PYTHON = "/data/open3dis/conda/envs/open3dis/bin/python"
-OPEN3DIS_CONFIG = "/home/rolf/GIT/Open3DIS/configs/ov3dis_scene4.yaml"
+OPEN3DIS_SAMPLING = 5  # [inferred] Scannet200_2D_5interval (predict/models/_open3dis_config.py)
 _OPEN3DIS_WORKER = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "predict", "models",
     "_open3dis_replay_worker.py"))
@@ -214,9 +214,18 @@ class OpenYoloReplay(Replay2D):
                 pass
 
 
-def open3dis_exp_pth(run_id, scene_id):
+def open3dis_scratch(run_id, scene_id, scannet_root):
+    """Per-run Open3DIS scratch written by predict/models/_open3dis_run.py."""
+    return os.path.join(scannet_root, "derived", "open3dis", run_id, scene_id)
+
+
+def open3dis_config_path(run_id, scene_id, scannet_root):
+    return os.path.join(open3dis_scratch(run_id, scene_id, scannet_root), "open3dis_run.yaml")
+
+
+def open3dis_exp_pth(run_id, scene_id, scannet_root):
     return os.path.join(
-        OPEN3DIS_REPO, "exp", f"{run_id}_{scene_id}_ov3discomp",
+        open3dis_scratch(run_id, scene_id, scannet_root), "exp", run_id,
         "maskGdino", f"{scene_id}.pth")
 
 
@@ -233,16 +242,17 @@ class Open3DisReplay(Replay2D):
             self._scene = parent
         self._names = list(spec.class_labels)
         self._color_of = color_of
-        self._stride = 15
+        config_path = open3dis_config_path(pred["run_id"], self._scene, scannet_root)
+        self._stride = 2 * OPEN3DIS_SAMPLING
         try:
-            with open(OPEN3DIS_CONFIG) as f:
+            with open(config_path) as f:
                 cfg = yaml.safe_load(f) or {}
-            self._stride = max(1, int(
-                cfg.get("data", {}).get("img_interval", 15)))
+            self._stride = max(1, OPEN3DIS_SAMPLING * int(
+                cfg.get("data", {}).get("img_interval", 2)))
         except (OSError, ValueError, TypeError):
             pass
         self.caption = f"Grounded-SAM cached · every {self._stride}th frame"
-        pth = open3dis_exp_pth(pred["run_id"], self._scene)
+        pth = open3dis_exp_pth(pred["run_id"], self._scene, scannet_root)
         if not os.path.isfile(pth):
             raise RuntimeError(
                 f"2D output not retained for this run (missing {pth})")
@@ -250,7 +260,7 @@ class Open3DisReplay(Replay2D):
         self._client.ensure(
             self._names, key=(pred["run_id"], pred["model"], pred["label_set"],
                               self._scene),
-            config_path=OPEN3DIS_CONFIG,
+            config_path=config_path,
             python=OPEN3DIS_PYTHON, cuda_lib=None,
             script=_OPEN3DIS_WORKER,
             extra_args=("--exp-pth", pth),

@@ -25,7 +25,7 @@ import os
 import sys
 import time
 
-OPENYOLO3D_REPO = "/home/rolf/GIT/OpenYOLO3D"
+OPENYOLO3D_REPO = "/data/OpenYOLO3D"
 
 _PROTO_OUT = sys.stdout
 

@@ -1,0 +1,22 @@
+diff --git a/src/PrimeSenseSensor.cpp b/src/PrimeSenseSensor.cpp
+index fb34e30..914b42f 100644
+--- a/src/PrimeSenseSensor.cpp
++++ b/src/PrimeSenseSensor.cpp
+@@ -118,7 +118,7 @@ bool PrimeSenseSensor::readDepthAndColor ( const cv::Mat& rgbTest, const cv::Mat
+         {
+             const int x = i%width;
+             const int y = i / width;
+-            const int src = y*width + ( width - 1 - x );
++            const int src = y*width + x;
+             const uint16_t& p = pDepth[src];
+ 
+             float dF = ( float ) p*0.001f;
+@@ -161,7 +161,7 @@ bool PrimeSenseSensor::readDepthAndColor ( const cv::Mat& rgbTest, const cv::Mat
+ 
+             if ( y2 >= 0 && y2 < ( int ) height )
+             {
+-                unsigned int Index1D = y2*width + ( width - 1 - x );	//x-flip here
++                unsigned int Index1D = y2*width + x;
+ 
+                 //const openni::RGB888Pixel& pixel = pImage[Index1D];
+ 

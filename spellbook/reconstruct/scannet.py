@@ -6,6 +6,7 @@ output frame (gravity z-up, floor ~0). axisAlignment is computed and written, NO
 (verified: released ScanNet meshes are raw-frame z-up with arbitrary floor/wall azimuth;
 consumers apply axisAlignment).
 """
+import cv2  # noqa: F401  (load before pymeshlab, whose bundled glib otherwise breaks cv2)
 import os
 import subprocess
 

@@ -20,7 +20,9 @@ dependencies:
   - pip
   - pip:
       - open3d==0.19.0
+      - pymeshlab
+      - pypng  # ScanNet SensReader depth export (predict/frames.py)
       - imgui
       - PyOpenGL
       - glfw
-      - /home/rolf/opt/zed-sdk/pyzed-5.4-cp310-cp310-linux_x86_64.whl
+      - ${HOME}/opt/zed-sdk/pyzed-5.4-cp310-cp310-linux_x86_64.whl

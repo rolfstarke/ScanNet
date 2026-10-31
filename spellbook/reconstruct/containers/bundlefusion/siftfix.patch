@@ -1,0 +1,55 @@
+diff --git a/src/Bundler.cpp b/src/Bundler.cpp
+index 7a7281a..337adf2 100644
+--- a/src/Bundler.cpp
++++ b/src/Bundler.cpp
+@@ -77,7 +77,7 @@ void Bundler::initSift ( unsigned int widthSift, unsigned int heightSift, bool i
+     if ( isLocal )
+     {
+         m_sift = new SiftGPU;
+-        m_sift->SetParams ( widthSift, heightSift, false, 150, GlobalAppState::get().s_sensorDepthMin, GlobalAppState::get().s_sensorDepthMax );
++        m_sift->SetParams ( widthSift, heightSift, false, GlobalBundlingState::get().s_maxNumKeysPerImage, GlobalAppState::get().s_sensorDepthMin, GlobalAppState::get().s_sensorDepthMax );
+         m_sift->InitSiftGPU();
+     }
+     else
+diff --git a/src/SiftGPU/SIFTImageManager.cu b/src/SiftGPU/SIFTImageManager.cu
+index 1cfbdb7..732a748 100644
+--- a/src/SiftGPU/SIFTImageManager.cu
++++ b/src/SiftGPU/SIFTImageManager.cu
+@@ -105,7 +105,8 @@ void __global__ SortKeyPointMatchesCU_Kernel(
+ 	__shared__ bool swapped;
+ 	swapped = true;
+ 	unsigned int run = 0;
+-	while (swapped) {
++	//at least one odd phase is required
++	while (swapped || run < 2) {
+ 		swapped = false;
+ 
+ 		unsigned int idx0 = 2 * tidx + 0;
+diff --git a/src/SiftGPU/SiftPyramid.cpp b/src/SiftGPU/SiftPyramid.cpp
+index ec78237..403daae 100644
+--- a/src/SiftGPU/SiftPyramid.cpp
++++ b/src/SiftGPU/SiftPyramid.cpp
+@@ -251,6 +251,14 @@ void SiftPyramid::LimitFeatureCount(int have_keylist)
+ 			_featureNum -= _levelFeatureNum[i];
+ 			_levelFeatureNum[i++] = 0;
+ 		}
++		//clamp number of features in the last contributing level.
++		if (_featureNum > _FeatureCountThreshold)
++		{
++			int num_to_erase_last = _featureNum - _FeatureCountThreshold;
++			num_to_erase += num_to_erase_last;
++			_featureNum -= num_to_erase_last;
++			_levelFeatureNum[i] -= num_to_erase_last;
++		}
+ 	}
+ }
+ 
+@@ -745,7 +753,7 @@ void SiftPyramid::CreateGlobalKeyPointList(float4* d_keypoints, const float* d_d
+ 
+ 	//if needed, eliminate lower level keypoints first
+ 	std::vector<int> numKeysPerLevel(n, 0); int cur = 0;
+-	const bool bHasMax = maxNumKeyPoints == (unsigned int)-1;
++	const bool bHasMax = maxNumKeyPoints != (unsigned int)-1;
+ 	for (int i = n - 1; i >= 0; i--) {
+ 		if (!bHasMax) numKeysPerLevel[i] = _levelFeatureNum[i];
+ 		else {

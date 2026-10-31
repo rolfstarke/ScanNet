@@ -1,7 +1,7 @@
 """Detached Spellbook job queue: submit once, process independent of OpenCode.
 
 Each submission writes a durable record under
-/data/scannet/derived/jobs/<job-id>/ and launches one transient
+<scannet_root>/derived/jobs/<job-id>/ and launches one transient
 `systemd --user` unit running `jobs.py _run <job-id>`. The submitting
 process exits immediately; closing OpenCode, tmux, or the shell does not
 stop the job. There is no queue daemon: waiting jobs block in the existing
@@ -30,7 +30,11 @@ SCHEMA_VERSION = 1
 ACTIVE_STATES = ("queued", "starting", "running", "cancelling")
 TERMINAL_STATES = ("succeeded", "failed", "cancelled", "lost")
 
-ENV_ALLOWLIST = ("PATH", "PYTHONPATH", "LD_LIBRARY_PATH")
+# Engine preset selection must survive detached jobs: new names are SPELLBOOK_<ENGINE>_PRESET
+# (prefix allowlist); the historical selectors (ZED_VARIANT #39, OPEN3D_BOUNDED_BACKEND #51)
+# are still passed through so old command lines keep working.
+ENV_ALLOWLIST = ("PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "ZED_DIR",
+                 "ZED_VARIANT", "OPEN3D_BOUNDED_BACKEND")
 ENV_PREFIX_ALLOWLIST = ("SPELLBOOK_",)
 JOB_ID_ENV = "SPELLBOOK_JOB_ID"
 JOB_MAX_WORKERS_ENV = "SPELLBOOK_JOB_MAX_GPU_WORKERS"
@@ -394,6 +398,14 @@ def job_context(argv, cwd=None, kind="command", run_id=None, scannet_root=None):
         yield job_id
     except KeyboardInterrupt:
         _update_status(job_id, root, state="cancelled", ended=time.time())
+        raise
+    except SystemExit as exc:
+        # main.py ends foreground work with sys.exit(0 | 1); 0 is a success, not a failure.
+        if exc.code in (0, None):
+            _update_status(job_id, root, state="succeeded", ended=time.time(), exit_code=0)
+        else:
+            _update_status(job_id, root, state="failed", ended=time.time(),
+                           error=str(exc)[:500])
         raise
     except BaseException as exc:
         _update_status(job_id, root, state="failed", ended=time.time(),

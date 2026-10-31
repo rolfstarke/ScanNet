@@ -1,6 +1,6 @@
 """Cross-process flock locks for reconstruction frames, scan artifacts, and prediction indexes.
 
-Lock files persist under /data/scannet/derived/locks/; the kernel releases ownership on process
+Lock files persist under <scannet_root>/derived/locks/; the kernel releases ownership on process
 death. Global acquisition order:
 
 1. canonical reconstruction-frame lock

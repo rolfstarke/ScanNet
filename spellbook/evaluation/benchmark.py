@@ -7,7 +7,7 @@ Protocol details are fixed in code (never in settings.yaml) so invalid combinati
 
 settings.yaml (spellbook/settings.yaml):
     default: ScanNet20
-    scannet_root: /data/scannet
+    scannet_root: /data/scannetdata
 """
 import importlib.util
 import os
@@ -46,6 +46,7 @@ PREDICTION_METHODS = (
     "openyolo3d",
     "open3dis",
     "openmask3d",
+    "sam3dis",
 )
 
 
@@ -176,7 +177,7 @@ def validate_prediction_methods(methods):
 def _validate_prediction_protocol():
     official = official_val_scenes()
     assert PREDICTION_METHODS == (
-        "mosaic3d", "openins3d", "openyolo3d", "open3dis", "openmask3d")
+        "mosaic3d", "openins3d", "openyolo3d", "open3dis", "openmask3d", "sam3dis")
     assert len(PREDICTION_EVALUATION_SCENES) == 16
     assert len(set(PREDICTION_EVALUATION_SCENES)) == 16
     bases = [scene.rsplit("_", 1)[0] for scene in PREDICTION_EVALUATION_SCENES]
@@ -226,13 +227,15 @@ def load_settings():
     with open(_SETTINGS_FILE) as f:
         cfg = yaml.safe_load(f) or {}
     default = cfg.get("default", "ScanNet20")
-    root = cfg.get("scannet_root", "/data/scannet")
+    root = cfg.get("scannet_root", "/data/scannetdata")
     if default not in BENCHMARKS:
         raise ValueError(f"settings.yaml: unknown default benchmark {default!r} "
                          f"(expected one of {list(BENCHMARKS)})")
     if not os.path.isdir(root):
         raise ValueError(f"settings.yaml: scannet_root {root!r} is not a directory")
-    pool = validate_gpu_pool(cfg.get("gpu_pool", [1, 2, 3, 4]))
+    override = os.environ.get("SPELLBOOK_GPU_POOL", "").strip()  # set per run by a queue (free GPUs only)
+    pool = validate_gpu_pool([int(g) for g in override.split(",")] if override
+                             else cfg.get("gpu_pool", [1, 2, 3, 4]))
     return {"default": default, "scannet_root": root, "gpu_pool": pool}
 
 

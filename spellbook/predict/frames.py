@@ -6,7 +6,7 @@ original frame indices as contiguous 0..N-1 filenames -- both models require con
 and subsample via their own config, OpenYOLO3D `frequency`, Open3DIS `img_interval`).
 
 Canonical output (per scene):
-    /data/scannet/scans/<scene_id>/frames/
+    <scannet_root>/scans/<scene_id>/frames/
     ├── color/{0..N-1}.jpg       # RGB frames (original JPEG bytes)
     ├── depth/{0..N-1}.png       # 16-bit depth (mm; meters = px / 1000)
     ├── pose/{0..N-1}.txt        # 4x4 camera-to-world
@@ -23,7 +23,10 @@ sys.path.insert(0, os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "SensReader", "python")))
 from SensorData import SensorData
 
-SCANS_DIR = "/data/scannet/scans"
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from evaluation.benchmark import load_settings  # noqa: E402
+
+SCANS_DIR = os.path.join(load_settings()["scannet_root"], "scans")
 
 INTRINSIC_FILES = ("intrinsic_color.txt", "extrinsic_color.txt",
                    "intrinsic_depth.txt", "extrinsic_depth.txt")

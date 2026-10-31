@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from common import add_run_args, load_overrides  # noqa: E402
 
 
-OPENINS3D_REPO = "/home/rolf/GIT/OpenIns3D"
+OPENINS3D_REPO = "/data/openins3d/repo-56ccc22"  # worktree of the logged upstream commit 56ccc22
 IMAGE_SIZE = [800, 800]
 ADJUST_CAMERA = [2, 0.1, 1.0]
 LOOKUP_THRESHOLD = 0.3
@@ -59,7 +59,7 @@ def main():
     args = ap.parse_args()
     params = load_overrides(args.parameters_json, {
         "detector", "lookup_threshold", "mask_confidence_threshold",
-        "point_limit", "min_mask_points"})
+        "point_limit", "min_mask_points", "use_precomputed"})
     detector = str(params.get("detector", args.detector))
     lookup_threshold = float(params.get("lookup_threshold", LOOKUP_THRESHOLD))
 

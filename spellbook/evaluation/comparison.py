@@ -374,12 +374,12 @@ def _reconstruction_identity(scan_id, recon_dir):
 
 def is_custom_scan(scan_id, scannet_root=None, reference=None):
     try:
-        from reconstruct import parse_scan_id
+        from reconstruct import SCANNET_ROOT, parse_scan_id
         scene_num, _, _ = parse_scan_id(scan_id)
     except (ValueError, ImportError):
         return False
     custom_raw = os.path.join(
-        scannet_root or "/data/scannet", "custom", "raw", f"scene{scene_num:04d}.svo2")
+        scannet_root or SCANNET_ROOT, "custom", "raw", f"scene{scene_num:04d}.svo2")
     if os.path.isfile(custom_raw):
         return True
     try:
@@ -399,8 +399,9 @@ def _read_geometry_score(path):
 
 
 def collect_reconstruction_rows(scans_dir=None, scannet_root=None):
+    from evaluation.benchmark import load_settings
     from utils.compute_time import load_timing, reconstruction_timing_path
-    root = scannet_root or "/data/scannet"
+    root = scannet_root or load_settings()["scannet_root"]
     scans = scans_dir or os.path.join(root, "scans")
     try:
         reference = _load_geometry_reference()

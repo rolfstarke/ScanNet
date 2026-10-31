@@ -1,3 +1,3 @@
 default: ScanNet200
-scannet_root: /data/scannet
+scannet_root: /data/scannetdata
 gpu_pool: [1, 2, 3, 4]

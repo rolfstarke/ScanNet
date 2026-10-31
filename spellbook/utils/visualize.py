@@ -16,7 +16,8 @@ _SPELLBOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, _SPELLBOOK)
 import util  # noqa: E402
 import util_3d  # noqa: E402
-from evaluation.benchmark import BENCHMARKS, artifact_paths, resolve_benchmark, submission_dir  # noqa: E402
+from evaluation.benchmark import (  # noqa: E402
+    BENCHMARKS, artifact_paths, load_settings, resolve_benchmark, submission_dir)
 from evaluation.evaluate import load_score_sidecar, score_sidecar_path  # noqa: E402
 from evaluation.runs import _is_comparable, load_manifest, read_evaluator_csv  # noqa: E402
 from utils import hud, query_prompt  # noqa: E402
@@ -39,8 +40,8 @@ from utils.query import (  # noqa: E402
     openins_snap_root, query_modes_for)
 
 
-DEFAULT_SCANNET_DIR = "/data/scannet/scans"
-LABEL_MAP_FILE = "/data/scannet/v2/scannetv2-labels.combined.tsv"
+DEFAULT_SCANNET_DIR = os.path.join(load_settings()["scannet_root"], "scans")
+LABEL_MAP_FILE = os.path.join(load_settings()["scannet_root"], "v2", "scannetv2-labels.combined.tsv")
 _SCENE_ID_RE = re.compile(r"^(scene\d{4})_(\d{2})$")
 _GEOMETRY_REF = os.path.join(_SPELLBOOK, "reconstruct", "geometry_reference.yaml")
 

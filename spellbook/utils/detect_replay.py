@@ -13,7 +13,7 @@ import tempfile
 # Source of truth: predict.runner MODEL_PYTHON / OPENYOLO3D_CUDA_HOME.
 OPENYOLO3D_PYTHON = "/data/openyolo3D/conda/envs/openyolo3d/bin/python"
 OPENYOLO3D_CUDA_LIB = "/data/openyolo3D/cuda-11.3/lib64"
-OPENYOLO3D_CONFIG = "/home/rolf/GIT/OpenYOLO3D/pretrained/config_scannet200.yaml"
+OPENYOLO3D_CONFIG = "/data/OpenYOLO3D/pretrained/config_scannet200.yaml"
 _WORKER = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "predict", "models",
     "_openyolo3d_detect_worker.py"))

@@ -1,0 +1,1 @@
+{"sam3dis":{"proposal_engine":"pool","score_mode":"maxjoint_median","nms_iou":0.5,"nms_mode":"linear","top_n":400,"tau_support":0.40,"view_power":0.25,"label_sharpen":0.5,"match_iou":0.20,"min_views":2,"min_mask_points":100}}

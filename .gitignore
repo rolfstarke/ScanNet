@@ -65,3 +65,14 @@ logs/
 # Session exports
 session-ses_*.json
 session-ses_*.md
+
+# Secrets
+spellbook/.secrets.env
+
+# Local recovery runtime files
+spellbook/tmp/issues/
+spellbook/tmp/overview/logs/
+spellbook/tmp/overview/state.json
+spellbook/tmp/overview/setup.json
+spellbook/tmp/overview/runs.json
+spellbook/tmp/overview/reserved_gpus

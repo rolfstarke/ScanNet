@@ -72,9 +72,9 @@ class FrameIdTests(unittest.TestCase):
         self.assertEqual(yolo_frame_ids(_seq(7), 10), [7])
 
     def test_exp_path_layout(self):
-        path = open3dis_exp_pth("vis-replay-open3dis", "scene0618_00")
-        self.assertTrue(path.endswith(
-            "vis-replay-open3dis_scene0618_00_ov3discomp/maskGdino/scene0618_00.pth"))
+        path = open3dis_exp_pth("vis-replay-open3dis", "scene0618_00", "/data/scannetdata")
+        self.assertEqual(path, "/data/scannetdata/derived/open3dis/vis-replay-open3dis/"
+                               "scene0618_00/exp/vis-replay-open3dis/maskGdino/scene0618_00.pth")
 
 
 class ContractTests(unittest.TestCase):

@@ -1,48 +1,47 @@
-"""Runs Open3DIS's 3-stage pipeline (2D grounding -> hierarchical-agglomerative clustering ->
-CLIP feature refinement) inside the `open3dis` conda env, then does CLIP classification from the
-refined per-instance features and writes ScanNet benchmark instance-segmentation format.
+"""Runs the official Open3DIS ScanNet200 2D+3D pipeline (configs/scannet200.yaml, #60) for one
+scene inside the `open3dis` conda env and writes ScanNet benchmark instance-segmentation format.
 
-Uses Open3DIS's own generic `Ov3disSceneReader` (open3dis/dataset/ov3dis_loader.py, templated
-off configs/ov3dis_scene4.yaml) with proposals.p2d:True/p3d:False -- 2D-mask-guided clustering
-only, no superpoints/3D proposals needed. This script adapts the proven ov3dis-comparison
-wrapper (utils/_open3dis_run.py) to ScanNet's own data layout:
-    --frames points at /data/scannet/scans/<scene>/frames/ (see frames.py)
-    scene_id comes from the scene directory name (common.scene_id_from_pointcloud)
-
-The vendored Open3DIS checkout at /home/rolf/GIT/Open3DIS already carries the local patches
-this code path needs (verified: Ov3disSceneReader present, generate_3d_inst.py's get_final_
-instances() gated behind `if False`, tracker_*.txt skip-lists present).
+Stages (docs/RUN.md), every tool with cwd = <scratch>/cwd so each run/scene owns its
+tracker_{2d,lifted,refine,final}.txt (#15); stale tracker entries are dropped first (0ca2762):
+    0. _open3dis_prepare.py      per-scene data tree + ISBNet head_scannetv2_200_val.pth
+                                 class-agnostic proposals / dc_feat (lost fork 459aa14)
+    1. grounding                 Grounded-SAM (GroundingDINO SwinT_OGC 0.4/0.4 + SAM ViT-H),
+                                 CLIP ViT-L/14@336px 768-d point features
+    2. generate                  hierarchical agglomerative clustering -> hier_agglo
+    3. tools/refine_grounding_feat.py (upstream, top_k 5) -> refined_grounded_feat
+    4. generate (final config)   skip_clustering + emit_final, proposals p2d/p3d/refined,
+                                 agnostic False -> final_result_hier_agglo (official 2D+3D
+                                 fusion with mask-wise CLIP scoring, final_instance defaults)
+The submission is final_result_hier_agglo/<scene>.pth as-is ({ins, conf, final_class}); no own
+CLIP re-classification. Scratch: <scannet_root>/derived/open3dis/<run-id>/<scene>/ (#24).
 """
 import os
 import sys
 
 import argparse
-import pathlib
 import subprocess
 
-import clip
-import cv2
 import numpy as np
-import open3d as o3d
 import torch
-import yaml
-from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (  # noqa: E402
     _benchmark_spec, add_run_args, load_overrides, publish_clip_features,
     scene_id_from_pointcloud, write_scannet_submission_rows,
 )
+from _open3dis_config import (  # noqa: E402
+    BASE_CONFIG, OPEN3DIS_REPO, derive_config, ensure_tracker, load_yaml,
+    output_path, reconcile_tracker, scannet_root_from_pointcloud, scene_layout, scratch_dir,
+    write_yaml,
+)
 
-OPEN3DIS_REPO = "/home/rolf/GIT/Open3DIS"
 OPEN3DIS_PY = "/data/open3dis/conda/envs/open3dis/bin/python"
-SCRATCH_ROOT = "/data/open3dis/scratch"  # transient split/config files -- kept off the submission root
+HERE = os.path.dirname(os.path.abspath(__file__))
+PREPARE_SCRIPT = os.path.join(HERE, "_open3dis_prepare.py")
+STAGE_SCRIPT = os.path.join(HERE, "_open3dis_stage.py")
+REFINE_SCRIPT = os.path.join(OPEN3DIS_REPO, "tools", "refine_grounding_feat.py")
 
 MIN_MASK_POINTS = 20
-DECIMATE_LIMIT = 700_000
-FINAL_INSTANCE_TOP_K = 300
-
-GENERIC_TEMPLATE_CONFIG = os.path.join(OPEN3DIS_REPO, "configs", "ov3dis_scene4.yaml")
 
 
 def _rle_decode(rle):
@@ -59,197 +58,128 @@ def _rle_decode(rle):
     return mask
 
 
-def _link_frames(frames_dir, scene_2d_dir):
-    """(Re)symlinks this scene's color/depth/pose/intrinsic_depth.txt into Open3DIS's own data
-    tree -- Ov3disSceneReader reads them from there, under cfg.data.datapath/<scene_id>."""
-    os.makedirs(scene_2d_dir, exist_ok=True)
-    links = {
-        "color": os.path.join(frames_dir, "color"),
-        "depth": os.path.join(frames_dir, "depth"),
-        "pose": os.path.join(frames_dir, "pose"),
-        "intrinsic.txt": os.path.join(frames_dir, "intrinsic_depth.txt"),
-    }
-    for name, target in links.items():
-        link = os.path.join(scene_2d_dir, name)
-        if os.path.islink(link) or os.path.exists(link):
-            os.remove(link)
-        os.symlink(target, link)
-
-
 def _frame_img_dim(frames_dir):
     """[width, height] straight from this scene's own first frame. ScanNet's color (1296x968) and
     depth (640x480) resolutions differ, so each is read separately: img_dim is the DEPTH resolution
     (projection/depth alignment), rgb_img_dim the COLOR resolution (2D masks) -- matching Open3DIS's
-    own configs/scannet200.yaml."""
-    color_dir = os.path.join(frames_dir, "color")
-    first_color = sorted(os.listdir(color_dir), key=lambda f: int(os.path.splitext(f)[0]))[0]
-    h, w = cv2.imread(os.path.join(color_dir, first_color)).shape[:2]
-    rgb_img_dim = [w, h]
-    depth_dir = os.path.join(frames_dir, "depth")
-    first_depth = sorted(os.listdir(depth_dir), key=lambda f: int(os.path.splitext(f)[0]))[0]
-    dh, dw = cv2.imread(os.path.join(depth_dir, first_depth), -1).shape[:2]
-    img_dim = [dw, dh]
-    return img_dim, rgb_img_dim
+    own configs/scannet200.yaml (#3)."""
+    import cv2
+    color = cv2.imread(os.path.join(frames_dir, "color", "0.jpg"))
+    depth = cv2.imread(os.path.join(frames_dir, "depth", "0.png"), -1)
+    return [depth.shape[1], depth.shape[0]], [color.shape[1], color.shape[0]]
 
 
-def _ensure_working_ply(pointcloud_path, working_ply, limit):
-    """Symlinks --pointcloud into Open3DIS's data tree if small enough, else builds (and caches)
-    a voxel-decimated copy. Returns whether decimation was applied."""
-    os.makedirs(os.path.dirname(working_ply), exist_ok=True)
-    pcd = o3d.io.read_point_cloud(pointcloud_path)
-    meta_path = working_ply + ".limit"
-
-    if len(pcd.points) <= limit:
-        if os.path.islink(working_ply) or os.path.exists(working_ply):
-            os.remove(working_ply)
-        if os.path.isfile(meta_path):
-            os.remove(meta_path)
-        os.symlink(os.path.abspath(pointcloud_path), working_ply)
-        return False
-
-    if (os.path.exists(working_ply) and not os.path.islink(working_ply)
-            and os.path.getmtime(working_ply) >= os.path.getmtime(pointcloud_path)
-            and os.path.isfile(meta_path)):
-        try:
-            with open(meta_path) as f:
-                cached = int(f.read().strip())
-        except (OSError, ValueError):
-            cached = None
-        if cached == int(limit):
-            return True
-
-    voxel_size = 0.01
-    down = pcd
-    while len(down.points) > limit:
-        voxel_size *= 1.4
-        down = pcd.voxel_down_sample(voxel_size)
-    if os.path.islink(working_ply) or os.path.exists(working_ply):
-        os.remove(working_ply)
-    o3d.io.write_point_cloud(working_ply, down)
-    with open(meta_path, "w") as f:
-        f.write(str(int(limit)) + "\n")
-    return True
-
-
-def _make_run_config(base_config, data_overrides, exp_name, classes, out_dir):
-    with open(base_config) as f:
-        cfg = yaml.safe_load(f)
-    cfg["data"].update(data_overrides)
-    cfg["data"]["custom_classes"] = list(classes)
-    cfg["data"]["num_classes"] = len(classes)
-    cfg["exp"]["exp_name"] = exp_name
-    run_config = os.path.join(out_dir, "open3dis_run.yaml")
-    with open(run_config, "w") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
-    return run_config
-
-
-def _run_stage(script, config, env):
-    fd = os.environ.get("SPELLBOOK_GPU_LEASE_FD")
-    pass_fds = (int(fd),) if fd else ()
-    subprocess.run([OPEN3DIS_PY, script, "--config", config], cwd=OPEN3DIS_REPO,
-                   env=env, check=True, pass_fds=pass_fds)
-
-
-def _classify(inst_feat, classes, device):
-    """CLIP text-vs-instance-feature classification; inst_feat rows are already L2-normalized."""
-    model, _ = clip.load("ViT-L/14@336px", device=device)
-    with torch.no_grad():
-        text_ft = model.encode_text(clip.tokenize([f"a photo of a {c}." for c in classes]).to(device))
-        text_ft = (text_ft / text_ft.norm(dim=-1, keepdim=True)).cpu().numpy()
-
-    sims = inst_feat.numpy() @ text_ft.T
-    best = sims.argmax(1)
-    confidence = (sims[np.arange(len(best)), best] + 1) / 2
-    return best, confidence
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pointcloud", required=True, help="scene pointcloud (.ply, xyz+rgb)")
-    ap.add_argument("--frames", required=True, help="extracted frames dir (frames.py)")
-    ap.add_argument("--classes", nargs="+", required=True)
-    ap.add_argument("--out", required=True, help="predictions output dir")
-    ap.add_argument("--benchmark", default="ScanNet20",
-                    choices=["ScanNet20", "ScanNet200"])
-    add_run_args(ap)
-    args = ap.parse_args()
-    spec = _benchmark_spec(args.benchmark)
-    params = load_overrides(args.parameters_json, {
-        "min_mask_points", "decimate_limit", "final_instance_top_k"})
-    min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
-    decimate_limit = int(params.get("decimate_limit", DECIMATE_LIMIT))
-    final_instance_top_k = int(params.get("final_instance_top_k", FINAL_INSTANCE_TOP_K))
-
-    os.makedirs(args.out, exist_ok=True)
-    scene_id = scene_id_from_pointcloud(args.pointcloud)
-    print(f"[INFO] {scene_id} run_id={args.run_id} overrides={params}")
-
-    scene_2d_dir = os.path.join(OPEN3DIS_REPO, "data", "ov3dis_scene", "ov3dis_scene_2d", scene_id)
-    working_ply = os.path.join(OPEN3DIS_REPO, "data", "ov3dis_scene", "original_ply", f"{scene_id}.ply")
-    _link_frames(args.frames, scene_2d_dir)
-    decimated = _ensure_working_ply(args.pointcloud, working_ply, decimate_limit)
-
-    split_path = os.path.join(SCRATCH_ROOT, args.run_id, scene_id, "open3dis_split.txt")
-    os.makedirs(os.path.dirname(split_path), exist_ok=True)
-    with open(split_path, "w") as f:
-        f.write(scene_id + "\n")
-
-    img_dim, rgb_img_dim = _frame_img_dim(args.frames)
-    exp_name = f"{args.run_id}_{scene_id}_ov3discomp"
-    run_config = _make_run_config(
-        GENERIC_TEMPLATE_CONFIG,
-        dict(split_path=split_path, img_dim=img_dim, rgb_img_dim=rgb_img_dim),
-        exp_name, args.classes, os.path.join(SCRATCH_ROOT, args.run_id, scene_id),
-    )
-    exp_dir = os.path.join(OPEN3DIS_REPO, "exp", exp_name)
-
+def _child_env():
     env = os.environ.copy()
     env["PYTHONWARNINGS"] = "ignore"
     env["PYTHONPATH"] = OPEN3DIS_REPO + ":" + env.get("PYTHONPATH", "")
     env["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+    return env
 
-    # fresh run every invocation: each tools/*.py script's own tracker_*.txt skip-list would
-    # otherwise silently no-op a scene it's already seen.
-    for tracker in ("tracker_2d.txt", "tracker_lifted.txt", "tracker_refine.txt"):
-        open(os.path.join(OPEN3DIS_REPO, tracker), "w").close()
 
-    _run_stage("tools/grounding_2d.py", run_config, env)
-    _run_stage("tools/generate_3d_inst.py", run_config, env)
-    _run_stage("tools/refine_grounding_feat.py", run_config, env)
+def _run(args, cwd, env):
+    fd = os.environ.get("SPELLBOOK_GPU_LEASE_FD")
+    pass_fds = (int(fd),) if fd else ()
+    print(f"[INFO] open3dis: {' '.join(os.path.basename(a) for a in args[:2])}", flush=True)
+    subprocess.run([OPEN3DIS_PY, *args], cwd=cwd, env=env, check=True, pass_fds=pass_fds)
 
-    clustered = torch.load(os.path.join(exp_dir, "hier_agglo", f"{scene_id}.pth"))
-    refined = torch.load(os.path.join(exp_dir, "refined_grounded_feat", f"{scene_id}.pth"))
-    masks_rle = clustered["ins"]
-    inst_feat = refined["inst_feat"]
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    best_idx, confidence = _classify(inst_feat, args.classes, device)
+def _run_tool(args, cfg, tracker, layout, env):
+    """One upstream tool step in the private cwd, after dropping stale tracker entries."""
+    path = os.path.join(layout["cwd"], tracker)
+    ensure_tracker(path)
+    dropped = reconcile_tracker(path, cfg)
+    if dropped:
+        print(f"[INFO] open3dis: dropped stale {tracker} entries {dropped}")
+    _run(args, layout["cwd"], env)
 
-    nn_idx = None
-    if decimated:
-        full_pts = np.asarray(o3d.io.read_point_cloud(args.pointcloud).points)
-        working_pts = np.asarray(o3d.io.read_point_cloud(working_ply).points)
-        nn_idx = cKDTree(working_pts).query(full_pts, k=1, workers=-1)[1]
 
-    def _instances():
-        for i, rle in enumerate(masks_rle):
-            feat = inst_feat[i].numpy()
-            if np.linalg.norm(feat) < 1e-6:
-                continue
-            sel = _rle_decode(rle).astype(bool)
-            if nn_idx is not None:
-                sel = sel[nn_idx]
-            yield sel, args.classes[best_idx[i]], confidence[i], feat
+def _instance_features(pc_feat_path, masks):
+    """Per-instance CLIP feature for the query sidecar: mean of the L2-normalized point
+    features over the mask, renormalized."""  # [inferred] sidecar convention, not scoring
+    feat = torch.load(pc_feat_path, map_location="cpu")["feat"].float()
+    feat = torch.nn.functional.normalize(feat, dim=1)
+    rows = []
+    for mask in masks:
+        idx = torch.from_numpy(np.flatnonzero(mask))
+        v = feat[idx].mean(0) if len(idx) else torch.zeros(feat.shape[1])
+        rows.append(torch.nn.functional.normalize(v, dim=0).numpy())
+    return rows
 
-    ranked = sorted(_instances(), key=lambda t: -t[2])[:final_instance_top_k]
-    candidates = [(sel, cls, conf) for sel, cls, conf, _feat in ranked]
-    feature_rows = [feat for _sel, _cls, _conf, feat in ranked]
-    rows = write_scannet_submission_rows(args.out, scene_id, args.classes, candidates,
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pointcloud", required=True, help="scene pointcloud (<scene>_vh_clean_2.ply)")
+    ap.add_argument("--frames", required=True, help="extracted frames dir (frames.py)")
+    ap.add_argument("--classes", nargs="+", required=True)
+    ap.add_argument("--out", required=True, help="predictions output dir")
+    ap.add_argument("--benchmark", default="ScanNet200",
+                    choices=["ScanNet20", "ScanNet200"])
+    add_run_args(ap)
+    args = ap.parse_args()
+    spec = _benchmark_spec(args.benchmark)
+    params = load_overrides(args.parameters_json, {"min_mask_points"})
+    min_mask_points = int(params.get("min_mask_points", MIN_MASK_POINTS))
+
+    sys.path.insert(0, OPEN3DIS_REPO)
+    from open3dis.dataset.scannet200 import INSTANCE_CAT_SCANNET_200
+    class_names = list(INSTANCE_CAT_SCANNET_200)
+    if list(args.classes) != class_names:
+        raise ValueError("open3dis scannet200 path scores the official 198 ScanNet200 classes "
+                         "(INSTANCE_CAT_SCANNET_200); --benchmark ScanNet200 required")
+
+    os.makedirs(args.out, exist_ok=True)
+    scene_id = scene_id_from_pointcloud(args.pointcloud)
+    scannet_root = scannet_root_from_pointcloud(args.pointcloud)
+    scratch = scratch_dir(scannet_root, args.run_id, scene_id)
+    layout = scene_layout(scratch, scene_id)
+    os.makedirs(layout["cwd"], exist_ok=True)
+    os.makedirs(layout["isbnet_cwd"], exist_ok=True)
+    print(f"[INFO] {scene_id} run_id={args.run_id} scratch={scratch} overrides={params}")
+
+    # #24: parent dir exists before the split file is written
+    os.makedirs(os.path.dirname(layout["split"]), exist_ok=True)
+    with open(layout["split"], "w") as f:
+        f.write(scene_id + "\n")
+
+    img_dim, rgb_img_dim = _frame_img_dim(args.frames)
+    base = load_yaml(BASE_CONFIG)
+    cfg = derive_config(base, layout, scene_id, args.run_id, img_dim, rgb_img_dim,
+                        num_classes=len(class_names))
+    cfg_final = derive_config(base, layout, scene_id, args.run_id, img_dim, rgb_img_dim,
+                              num_classes=len(class_names), final=True)
+    write_yaml(cfg, layout["config"])
+    write_yaml(cfg_final, layout["config_final"])
+
+    env = _child_env()
+    _run([PREPARE_SCRIPT, "--scene-dir", os.path.dirname(os.path.abspath(args.pointcloud)),
+          "--frames", args.frames, "--scratch", scratch], layout["isbnet_cwd"], env)
+    _run_tool([STAGE_SCRIPT, "grounding", "--config", layout["config"]],
+              cfg, "tracker_2d.txt", layout, env)
+    _run_tool([STAGE_SCRIPT, "generate", "--config", layout["config"]],
+              cfg, "tracker_lifted.txt", layout, env)
+    _run_tool([REFINE_SCRIPT, "--config", layout["config"]],
+              cfg, "tracker_refine.txt", layout, env)
+    _run_tool([STAGE_SCRIPT, "generate", "--config", layout["config_final"]],
+              cfg_final, "tracker_final.txt", layout, env)
+
+    final = torch.load(output_path(cfg_final, "final_output", scene_id), map_location="cpu")
+    masks = [_rle_decode(rle).astype(bool) for rle in final["ins"]]
+    conf = np.asarray(final["conf"], dtype=np.float64).reshape(-1)
+    cls = np.asarray(final["final_class"]).reshape(-1).astype(int)
+    print(f"[INFO] {scene_id}: {len(masks)} fused instances from final_result_hier_agglo")
+
+    instances = [(m, class_names[c], float(s)) for m, c, s in zip(masks, cls, conf)]
+    rows = write_scannet_submission_rows(args.out, scene_id, class_names, instances,
                                         min_mask_points, spec)
-    publish_clip_features(
-        args.features_out, feature_rows, rows, spec, args.run_id, "open3dis", scene_id,
-        "openai_clip", "ViT-L/14@336px", 768)
+    if args.features_out:
+        pc_feat = output_path(cfg_final, "refined_grounded_feat_output", scene_id)
+        if not os.path.isfile(pc_feat):
+            pc_feat = output_path(cfg_final, "grounded_feat_output", scene_id)
+        feature_rows = _instance_features(pc_feat, masks)
+        publish_clip_features(
+            args.features_out, feature_rows, rows, spec, args.run_id, "open3dis", scene_id,
+            "openai_clip", "ViT-L/14@336px", 768)
     print(f"[INFO] Wrote {rows['n_written']} instances to {args.out}")
 
 

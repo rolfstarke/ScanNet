@@ -23,12 +23,25 @@ _COLOR_JPEG = 2
 _DEPTH_ZLIB = 1
 _DEPTH_SHIFT = 1000.0
 _DEPTH_MIN, _DEPTH_MAX = 0.1, 6.0
-FRAMES_ROOT = "/data/scannet/derived/reconstruction/frames"
+FRAMES_ROOT = os.path.join(load_settings()["scannet_root"], "derived", "reconstruction", "frames")
 _EXTRACT_CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_extract_run.py")
+# Legacy irreplaceable scene9004 frame set; promoted into the pool only while it still exists.
+LEGACY_9004_FRAMES = os.path.join(load_settings()["scannet_root"], "scans", "scene9004_04",
+                                  "recon", "frames")
 
 
 def write_sens(path, camera_to_world, color_bytes, depth_bytes, color_ts, depth_ts, K,
                width, height):
+    """ScanNet .sens v4 (SensorData.h). `color_bytes`/`depth_bytes` may be lists or
+    iterators. See write_sens_frames."""
+    write_sens_frames(path, camera_to_world, zip(color_ts, depth_ts, color_bytes, depth_bytes),
+                      K, width, height)
+
+
+def write_sens_frames(path, camera_to_world, frames, K, width, height):
+    """ScanNet .sens v4 from `frames` = iterable of (color_ts, depth_ts, color_bytes,
+    depth_bytes), streamed so a 5 GB scan never sits in memory. Atomic publish: written to a
+    same-directory temp file, fsync'ed, then os.replace'd over `path` (#22 2026-09-26)."""
     n = len(camera_to_world)
     name = b"ZED X"
 
@@ -39,22 +52,37 @@ def write_sens(path, camera_to_world, color_bytes, depth_bytes, color_ts, depth_
         out[:3, :3] = m
         return out
 
-    with open(path, "wb") as f:
-        f.write(struct.pack("<I", 4))
-        f.write(struct.pack("<Q", len(name)) + name)
-        for m in (_m4(K), np.eye(4), _m4(K), np.eye(4)):
-            f.write(struct.pack("<16f", *m.ravel()))
-        f.write(struct.pack("<ii", _COLOR_JPEG, _DEPTH_ZLIB))
-        f.write(struct.pack("<IIII", width, height, width, height))
-        f.write(struct.pack("<f", _DEPTH_SHIFT))
-        f.write(struct.pack("<Q", n))
-        for ctw, ct, dt, cb, db in zip(camera_to_world, color_ts, depth_ts, color_bytes, depth_bytes):
-            f.write(struct.pack("<16f", *ctw.ravel()))
-            f.write(struct.pack("<QQ", int(ct), int(dt)))
-            f.write(struct.pack("<QQ", len(cb), len(db)))
-            f.write(cb)
-            f.write(db)
-        f.write(struct.pack("<Q", 0))
+    tmp = f"{path}.tmp.{os.getpid()}"
+    written = 0
+    try:
+        with open(tmp, "wb") as f:
+            f.write(struct.pack("<I", 4))
+            f.write(struct.pack("<Q", len(name)) + name)
+            for m in (_m4(K), np.eye(4), _m4(K), np.eye(4)):
+                f.write(struct.pack("<16f", *m.ravel()))
+            f.write(struct.pack("<ii", _COLOR_JPEG, _DEPTH_ZLIB))
+            f.write(struct.pack("<IIII", width, height, width, height))
+            f.write(struct.pack("<f", _DEPTH_SHIFT))
+            f.write(struct.pack("<Q", n))
+            for ctw, (ct, dt, cb, db) in zip(camera_to_world, frames):
+                f.write(struct.pack("<16f", *np.asarray(ctw).ravel()))
+                f.write(struct.pack("<QQ", int(ct), int(dt)))
+                f.write(struct.pack("<QQ", len(cb), len(db)))
+                f.write(cb)
+                f.write(db)
+                written += 1
+            if written != n:
+                raise RuntimeError(f".sens frame count mismatch: header {n}, wrote {written}")
+            f.write(struct.pack("<Q", 0))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def frames_complete(frames_dir):
@@ -211,7 +239,7 @@ def pool_frames_dir(scene_num):
 
 def promote_scene9004_frames(src=None):
     """Move the irreplaceable scene9004 frame set into the shared pool."""
-    src = src or "/data/scannet/scans/scene9004_04/recon/frames"
+    src = src or LEGACY_9004_FRAMES
     dst_parent = os.path.join(FRAMES_ROOT, "scene9004")
     dst = os.path.join(dst_parent, "frames")
     with exclusive_lock(frames_lock_path(9004)):
@@ -249,16 +277,18 @@ def extract_scenes(scene_nums, replace=False):
     """Main-checkout multi-GPU frame extraction into the shared pool.
 
     One SVO per leased GPU. Existing complete pools are reused unless replace=True.
-    Scene9004 is never re-extracted: promote the existing set instead.
+    Scene9004 promotes the legacy scene9004_04 frame set when it still exists; otherwise it is
+    extracted from its SVO like every other scene.
     """
     settings = load_settings()
     results = {}
+    legacy_9004 = LEGACY_9004_FRAMES
     for scene in scene_nums:
         scene = int(scene)
-        if scene == 9004:
-            results[scene] = promote_scene9004_frames()
+        if scene == 9004 and os.path.isdir(legacy_9004):
+            results[scene] = promote_scene9004_frames(legacy_9004)
             continue
-        svo = f"/data/scannet/custom/raw/scene{scene:04d}.svo2"
+        svo = os.path.join(load_settings()["scannet_root"], "custom", "raw", f"scene{scene:04d}.svo2")
         if not os.path.exists(svo):
             raise FileNotFoundError(svo)
         work = os.path.join(FRAMES_ROOT, f"scene{scene:04d}")

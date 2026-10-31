@@ -38,33 +38,46 @@ _WRAPPERS = {
     "openyolo3d": os.path.join("predict", "models", "_openyolo3d_run.py"),
     "open3dis": os.path.join("predict", "models", "_open3dis_run.py"),
     "openmask3d": os.path.join("predict", "models", "_openmask3d_run.py"),
+    "sam3dis": os.path.join("predict", "models", "_sam3dis_run.py"),
 }
 _EXTERNAL_REPOS = {
-    "mosaic3d": "/home/rolf/GIT/Mosaic3D",
-    "openins3d": "/home/rolf/GIT/OpenIns3D",
-    "openyolo3d": "/home/rolf/GIT/OpenYOLO3D",
-    "open3dis": "/home/rolf/GIT/Open3DIS",
-    "openmask3d": "/home/rolf/GIT/openmask3d",
+    "mosaic3d": "/data/Mosaic3D",
+    "openins3d": "/data/openins3d/repo-56ccc22",
+    "openyolo3d": "/data/OpenYOLO3D",
+    "open3dis": "/data/Open3DIS",
+    "openmask3d": "/data/openmask3d",
+    "sam3dis": "/data/sam3dis",
 }
 _REQUIRED_EXTERNAL = {
     "mosaic3d": (
-        "/home/rolf/GIT/Mosaic3D/scripts/run_custom_scene.py",
-        "/data/mosaic3d/ckpts/spunet34c.ckpt",
+        os.path.join(_SPELLBOOK, "predict", "models", "_mosaic3d_scene.py"),
+        "/data/mosaic3d/ckpts/sc.ckpt",
+        "/data/openins3d/checkpoints/scannet200_val.ckpt",
     ),
-    "openins3d": ("/home/rolf/GIT/OpenIns3D/third_party/scannet200_val.ckpt",),
+    "openins3d": ("/data/openins3d/repo-56ccc22/third_party/scannet200_val.ckpt",),
     "openyolo3d": (
-        "/home/rolf/GIT/OpenYOLO3D/pretrained/config_scannet200.yaml",
-        "/home/rolf/GIT/OpenYOLO3D/pretrained/checkpoints/scannet200_val.ckpt",
-        "/home/rolf/GIT/OpenYOLO3D/pretrained/checkpoints/"
+        "/data/OpenYOLO3D/pretrained/config_scannet200.yaml",
+        "/data/OpenYOLO3D/pretrained/checkpoints/scannet200_val.ckpt",
+        "/data/OpenYOLO3D/pretrained/checkpoints/"
         "yolo_world_v2_x_obj365v1_goldg_cc3mlite_pretrain_1280ft-14996a36.pth",
     ),
     "open3dis": (
-        "/home/rolf/GIT/Open3DIS/configs/ov3dis_scene4.yaml",
-        "/home/rolf/GIT/Open3DIS/open3dis/dataset/ov3dis_loader.py",
+        "/data/Open3DIS/configs/scannet200.yaml",
+        "/data/Open3DIS/open3dis/dataset/scannet_loader.py",
+        "/data/Open3DIS/segmenter3d/ISBNet/configs/scannet200/isbnet_scannet200.yaml",
+        "/data/pretrains/scannet200/head_scannetv2_200_val.pth",
+        os.path.join(_SPELLBOOK, "predict", "models", "_open3dis_stage.py"),
+        os.path.join(_SPELLBOOK, "predict", "models", "_open3dis_prepare.py"),
+        os.path.join(_SPELLBOOK, "predict", "models", "_open3dis_config.py"),
     ),
     "openmask3d": (
         "/data/openmask3d/resources/scannet200_model.ckpt",
         "/data/openmask3d/resources/sam_vit_h_4b8939.pth",
+    ),
+    "sam3dis": (
+        "/data/sam3dis/sam3dis/pipeline.py",
+        "/data/sam3dis/hf_cache/hub/models--facebook--sam3/snapshots/"
+        "3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt",
     ),
 }
 
@@ -348,7 +361,10 @@ def discover_manifests(spec, scannet_root=None):
         path = os.path.join(run_dir, MANIFEST_NAME)
         if not os.path.isdir(run_dir) or not os.path.isfile(path):
             continue
-        found.append(load_manifest(path, spec=spec, run_id=name))
+        try:
+            found.append(load_manifest(path, spec=spec, run_id=name))
+        except (OSError, ValueError) as exc:  # #34: one bad manifest must not block ranking
+            print(f"[WARN] skipping unparseable manifest {path}: {exc}", file=sys.stderr)
     return found
 
 

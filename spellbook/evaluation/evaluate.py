@@ -33,8 +33,8 @@ import util_3d  # noqa: E402
 # (which contains its own utils.py) to sys.path.
 from evaluation.runs import manifest_path as _run_manifest_path  # noqa: E402
 
-PYTHON = "/home/rolf/anaconda3/envs/3disspellbook/bin/python"
-_LABEL_MAP_FALLBACK = "/data/scannet/v2/scannetv2-labels.combined.tsv"
+PYTHON = os.path.expanduser("~/.conda/envs/3disspellbook/bin/python")
+_LABEL_MAP_FALLBACK = os.path.join(load_settings()["scannet_root"], "v2", "scannetv2-labels.combined.tsv")
 
 SIDECAR_SCHEMA = 4
 SIDECAR_METRIC = "scannet_instance_ap50"

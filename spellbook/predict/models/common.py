@@ -25,17 +25,24 @@ _INT_BOUNDS = {
     "min_mask_points": (1, None),
     "decimate_limit": (1, None),
     "final_instance_top_k": (1, None),
+    "frequency": (1, None),  # [inferred] openyolo3d/openmask3d frame stride
 }
 _FLOAT_BOUNDS = {
     "dedup_iou": (0.0, 1.0),
     "grid_size": (0.0, None),
     "mask_confidence_threshold": (0.0, 1.0),
     "lookup_threshold": (0.0, 1.0),
+    "network2d_th": (0.0, 1.0),  # [inferred] openyolo3d YOLO-World score threshold
+    "network3d_nms": (0.0, 1.0),  # [inferred] openyolo3d Mask3D proposal NMS IoU
+    "proposal_score_power": (0.0, None),  # [inferred] openyolo3d score calibration
 }
 _POSITIVE_FLOATS = frozenset({"grid_size"})
+_BOOLS = frozenset({"use_precomputed"})
 _ENUMS = {
     "condition": ("ScanNet", "ARKitScenes", "ScanNetPP"),
     "detector": ("odise", "yoloworld"),
+    "proposal_source": ("live", "official_precomputed"),
+    "vote_weighting": ("count", "detector_confidence"),
 }
 
 
@@ -55,7 +62,7 @@ def _benchmark_spec(benchmark_name):
 
 def scene_id_from_pointcloud(pointcloud_path):
     """ScanNet scene id straight from the scene directory name:
-    /data/scannet/scans/scene0000_00/scene0000_00_vh_clean_2.ply -> scene0000_00."""
+    <scannet_root>/scans/scene0000_00/scene0000_00_vh_clean_2.ply -> scene0000_00."""
     return pathlib.Path(pointcloud_path).parent.name
 
 
@@ -146,6 +153,9 @@ def load_overrides(path, allowed):
             value = _check_bounds(key, _as_number(value, int, key), *_INT_BOUNDS[key])
         elif key in _FLOAT_BOUNDS:
             value = _check_bounds(key, _as_number(value, float, key), *_FLOAT_BOUNDS[key])
+        elif key in _BOOLS:
+            if type(value) is not bool:
+                raise ValueError(f"{key} must be a boolean, got {value!r}")
         elif key in _ENUMS:
             if value not in _ENUMS[key]:
                 raise ValueError(f"{key} must be one of {list(_ENUMS[key])}, got {value!r}")

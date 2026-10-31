@@ -53,7 +53,8 @@ def _prepare_frames(scenes, replace):
         if not os.path.exists(svo):
             raise SystemExit(f"svo not found: {svo}")
         pool = frames_pool_dir(scene)
-        if scene == 9004 and not extract_mod.frames_complete(pool):
+        if scene == 9004 and not extract_mod.frames_complete(pool) \
+                and os.path.isdir(extract_mod.LEGACY_9004_FRAMES):
             extract_mod.promote_scene9004_frames()
         if extract_mod.frames_complete(pool) and not replace:
             by_scene[scene] = pool
@@ -70,10 +71,15 @@ def _prepare_frames(scenes, replace):
     return by_scene
 
 
-def _run_task(scene, engine, frames_dir, log_path, bar, slot, proc_registry):
+def _run_task(scene, engine, frames_dir, log_path, bar, slot, proc_registry, issue=None,
+              offline_score=False):
     label = f"scene{scene:04d}_{engine}"
     cmd = [sys.executable, "-m", "spellbook.reconstruct.run",
            "--scene", str(scene), "--engine", engine, "--frames", frames_dir]
+    if issue is not None:
+        cmd += ["--issue", str(int(issue))]
+    if offline_score:
+        cmd.append("--offline-score")
     env = os.environ.copy()
     env.pop("CUDA_VISIBLE_DEVICES", None)
     env["PYTHONUNBUFFERED"] = "1"
@@ -119,7 +125,7 @@ def _run_task(scene, engine, frames_dir, log_path, bar, slot, proc_registry):
     return sid, ok, tail, log_path
 
 
-def run_batch(scenes, engines, replace=False):
+def run_batch(scenes, engines, replace=False, issue=None, offline_score=False):
     engines = list(engines)
     scenes = [int(s) for s in scenes]
     unknown = [e for e in engines if e not in ENGINE_INDEX]
@@ -161,7 +167,8 @@ def run_batch(scenes, engines, replace=False):
         try:
             log_path = os.path.join(log_dir, f"scene{scene:04d}_{engine}.log")
             return _run_task(scene, engine, frames_by_scene[scene],
-                             log_path, bars[slot], slot, registry)
+                             log_path, bars[slot], slot, registry, issue=issue,
+                             offline_score=offline_score)
         finally:
             free_slots.put(slot)
             if s is not None:
@@ -199,6 +206,9 @@ if __name__ == "__main__":
     ap.add_argument("--scene", nargs="+", type=int, required=True)
     ap.add_argument("--engine", nargs="+", required=True)
     ap.add_argument("--replace", action="store_true")
+    ap.add_argument("--issue", type=int, default=None)
+    ap.add_argument("--offline-score", action="store_true")
     a = ap.parse_args()
-    ok, failed = run_batch(a.scene, a.engine, a.replace)
+    ok, failed = run_batch(a.scene, a.engine, a.replace, issue=a.issue,
+                           offline_score=a.offline_score)
     sys.exit(1 if failed else 0)

@@ -1,96 +1,119 @@
-"""RTAB-Map RGB-D SLAM on ZED X SVO2, official workflow only, one podman run.
+"""RTAB-Map engine: assisted-hybrid baseline `_20` (#70 2026-10-01, params #41 2026-09-15).
 
-STAGE 1 (capture, in-container): the official launch file
-`rtabmap_examples/zed.launch.py` declares ONLY `camera_model` and
-`use_zed_odometry` -- it cannot forward `svo_path`/`enable_ipc` and does not
-expose `tf_tolerance`, so its documented equivalent node graph is used verbatim:
-the exact launch file zed.launch.py includes (`zed_wrapper/zed_camera.launch.py`)
-plus rgbd_sync + rtabmap with `odom` remapped to `/zed/zed_node/odom`
-(= `use_zed_odometry:=true`; no rgbd_odometry node, no rtabmap_viz headless).
-Documented working zed_wrapper params: svo_realtime=true, use_svo_timestamps=false
-(wall-clock stamps -- SVO stamps caused a 937502 s TF gap), enable_ipc=false,
-camera_model=zedx, depth NEURAL pre-warm waited out in the readiness loop.
-RTAB-Map fixes vs the old wrapper: wait_for_transform=3.0, tf_tolerance=3.0
-(odom TF arrives ~2.3 s late). Rtabmap/DetectionRate stays at default (1 Hz);
-Mem/IncrementalMemory=true; approx_sync_max_interval=0.5 (an RTAB-Map sync param,
-NOT a zed_wrapper param -- this wrapper version has none). SVO runs to the end,
-then SIGINT with >= 30 s grace (up to 90 s) before SIGKILL so the db saves.
+"Explicitly not pure SLAM" (#70): the shared frame pool is replayed into rtabmap with per-frame
+ack (containers/rtabmap/rtabmap_replay.py), Stage-A ZED poses as odometry, only every 90th frame
+in the map (9004: 41/41 frames, span 99.7%). Export is poses only, optimized by GTSAM; no
+reprocess, no loop-closure pass. The mesh is a TSDF fusion of the node frames with the shared CPU
+tsdf.py values (2 cm, trunc 0.06, depth 6 m, no weight threshold) [inferred: #41 "no mesh flags",
+losers named sdf.04/depth3; engines/__init__.py: shared integration lives in tsdf.py]. Open3D B1's
+weight_threshold 3 needs three views per voxel: 41 sparse frames shred it (47.19 cm, comp 75.40).
 
-STAGE 2 (offline refinement, maintainer recipe rtabmap issue 1605):
-    rtabmap-reprocess -default --Rtabmap/DetectionRate 0 -odom rtabmap.db refined.db
-then detect_more_loop_closures via the official CLI rtabmap-detectMoreLoopClosures
-(refined.db in place; same code as the rtabmap_slam service -- the GUI-only
-databaseViewer post-processing and the ROS service need a running node). If the
-binary is absent at runtime: warn and continue with refined.db.
+Target: `_20` 20.515862 cm (21.5595/19.472223) with the old mask, recon 91.401 s.
 
-STAGE 3 (export): rtabmap-export --cloud --mesh --texture --images_id
---poses_camera --output scene --output_dir work/rtabmap/export --max_range 6.0
---voxel 0 --decimation 1 --poses_format 11 refined.db (NO --opt 0: export the
-optimized graph poses; --opt 0 exported raw graph poses and caused 4.37 m drift).
+The live zed_wrapper path is gone (master before 2026-08-30), so ZED wrapper parameters such as
+#41 grab_resolution=SVGA do not apply: the baseline never opens the SVO.
 
-Parsing (reuses the verified normalize_export.py logic): scene_camera_poses.txt
-format 11 lines "stamp x y z qx qy qz qw id" -> 4x4 camera-to-world; images are
-keyed by node id (scene_rgb/<id>.jpg, scene_depth/<id>.png); keep = node ids with
-both rgb and depth, sorted, 0-based (rtabmap node ids are contiguous from 1, so
-keep == 0..M-1). The mesh is the textured OBJ -> engine_native.ply (binary PLY;
-vertex colors baked from the texture via UV sampling, else written without
-colors). Exported depth images (uint16 mm) are not needed -- Stage A provides
-depth. Poses are in the ROS map frame, Z-up -> convention "rtabmap_map".
-
-All container I/O goes to work/logs/rtabmap.log (no DEVNULL); subprocess timeout
-7200 s; no caching (db/refined/export removed before every run); no swallowed
-exceptions. Podman image localhost/zed-rtabmap:jazzy; heavy storage under
-/data/zed-rtabmap (ZED_RTABMAP_DATA overridable); GPU args via the documented
-podman_gpu.sh (rootless, host-lib mount).
+Docker runs through reconstruct/containers (snap docker: hostfs mounts, explicit GPU args).
+Container I/O goes to recon/logs/rtabmap.log and recon/rtabmap/logs/. Overruns are enforced by
+run.py (SIGALRM, 3x scene length); the container is killed on the way out.
 """
+import argparse
 import glob
+import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 
 import numpy as np
 
-PODMAN_IMAGE = "localhost/zed-rtabmap:jazzy"
-GPU_SCRIPT = "/home/rolf/GIT/zed-rtabmap/scripts/podman_gpu.sh"
+from .. import preset_env, runtime_cap_s
+from ..containers import gpu_args, mount, user_args
+from ..tsdf import PARAMS as FUSION
+
+IMAGE = "localhost/zed-rtabmap:jazzy"
 TIMEOUT = 7200
-CONTAINER_NAME = f"spellbook-rtabmap-{os.getpid()}"  # unique per process: parallel tasks
+CONTAINER_NAME = f"spellbook-rtabmap-{os.getpid()}"  # unique per process: parallel tasks (#23)
 
 GPU_POLICY = "managed"
 SERIAL = False
 
+ISSUE = 70
+PROFILE = "assisted-hybrid"
+DEFAULT_STRIDE = 90
+SOURCE_FPS = 15  # #51 run.json "fps 15" (SVO header)
+STAMP_ORIGIN = 1_700_000_000  # [inferred] synthetic stamps: node stamp -> pool index
+CONVENTION = "rtabmap_map"  # [inferred] exported camera poses in the ROS z-up map frame
+FUSE_THREADS = 6  # OpenMP on all cores spin-waits under load: fusion 231 s vs 8 s at 6 threads
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+
+_REPLAY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "containers", "rtabmap", "rtabmap_replay.py")
+
+
+def selected_profile():
+    return preset_env("rtabmap", "SPELLBOOK_RTABMAP_PROFILE") or PROFILE
+
+
+def selected_stride():
+    return int(os.environ.get("SPELLBOOK_RTABMAP_STRIDE", "").strip() or DEFAULT_STRIDE)
+
+
+def provenance():
+    return {"variant": f"{selected_profile()}-s{selected_stride()}",
+            "config": dict(profile=selected_profile(), stride=selected_stride(), image=IMAGE,
+                           map_only=True, external_odom=True, fast=True,
+                           fusion=dict(FUSION)),
+            "fps": SOURCE_FPS}
+
+
+def provenance_after(work):
+    path = os.path.join(work, "effective_config.json")
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as f:
+        eff = json.load(f)
+    return {k: eff[k] for k in ("keep", "span", "profile", "stride") if k in eff}
+
 
 def preflight():
-    if subprocess.run(["podman", "image", "exists", PODMAN_IMAGE],
-                      capture_output=True).returncode != 0:
-        return f"podman image {PODMAN_IMAGE} missing"
+    if selected_profile() != PROFILE:
+        return f"unknown rtabmap profile {selected_profile()!r} (only {PROFILE})"
+    if selected_stride() < 1:
+        return f"bad SPELLBOOK_RTABMAP_STRIDE {selected_stride()}"
+    r = subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True, text=True)
+    if r.returncode:
+        return f"docker image {IMAGE} unavailable: {r.stderr.strip()[-200:]}"
+    try:
+        import open3d  # noqa: F401
+    except Exception as ex:
+        return f"open3d not importable with {sys.executable} (use the conda env): {ex}"
     return None
 
 
 def gpu_check(gpu=None, lease_fd=None, hold_seconds=5):
-    """Native RTAB-Map distribution check under the lease: the exact podman_gpu.sh
-    mapping used by the real run, image start, in-container NVIDIA runtime probe."""
+    """Image start under the lease with the real GPU args, in-container NVIDIA probe."""
     if gpu is None or lease_fd is None:
         return dict(status="fail", reason="managed check requires gpu + lease_fd")
-    import time
-
     start = time.time()
     try:
-        gpu_args = _podman_gpu_args(gpu)
+        args = gpu_args(gpu)
     except Exception as ex:
-        return dict(status="fail", reason=f"podman_gpu_args: {ex}")
+        return dict(status="fail", reason=f"gpu_args: {ex}")
     container = f"spellbook-gpu-check-rtabmap-{os.getpid()}"
-    cmd = ["podman", "run", "--rm", "--name", container] + gpu_args + [
-        "-e", f"ROS_DOMAIN_ID={40 + gpu}",
-        PODMAN_IMAGE,
-        "bash", "-lc",
-        f"echo CUDA_VISIBLE_DEVICES=${{CUDA_VISIBLE_DEVICES:-unset}}; "
+    cmd = ["docker", "run", "--rm", "--name", container] + user_args() + args + [
+        IMAGE, "bash", "-c",
+        "echo CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}; "
         "nvidia-smi -L || echo no-nvidia-smi; sleep %d" % hold_seconds,
     ]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=hold_seconds + 120, pass_fds=(lease_fd,))
     except subprocess.TimeoutExpired:
-        subprocess.run(["podman", "kill", container], capture_output=True)
+        subprocess.run(["docker", "kill", container], capture_output=True)
         return dict(status="fail", reason="rtabmap gpu_check timed out")
     if r.returncode != 0:
         return dict(status="fail", reason=f"rtabmap gpu_check rc={r.returncode}: "
@@ -99,239 +122,91 @@ def gpu_check(gpu=None, lease_fd=None, hold_seconds=5):
         return dict(status="fail",
                     reason=f"assigned env missing in container output: {r.stdout[-300:]}")
     return dict(status="pass", policy="managed", physical_gpu=gpu, visible_gpu=gpu,
-                lease_fd=lease_fd, runtime="podman localhost/zed-rtabmap:jazzy",
+                lease_fd=lease_fd, runtime=f"docker {IMAGE}",
                 seconds=round(time.time() - start, 1), reason=None)
 
-_INSIDE_SH = r"""#!/usr/bin/env bash
-# SVO2 -> rtabmap.db -> refined.db -> export, one container run.
-set -eo pipefail
-source /opt/ros/${ROS_DISTRO}/setup.bash
-[ -f /root/ros2_ws/install/local_setup.bash ] && source /root/ros2_ws/install/local_setup.bash
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export OMP_WAIT_POLICY=passive
-export RCUTILS_LOGGING_USE_STDOUT=1
-export RCUTILS_LOGGING_BUFFERED_STREAM=1
 
-SVO_PATH="$1"
-DB_PATH="$2"
-REFINED_PATH="$3"
-EXPORT_DIR="$4"
-CAMERA_MODEL="$5"
-
-rm -f "$DB_PATH" "$REFINED_PATH"
-rm -rf "$EXPORT_DIR"
-mkdir -p "$(dirname "$DB_PATH")" "$EXPORT_DIR" /tmp/rtabmap_logs "$(dirname "$DB_PATH")/logs"
-
-cat > /tmp/zed_override.yaml <<'EOF'
----
+_RGBD_SYNC_YAML = """\
 /**:
   ros__parameters:
-    general:
-      grab_resolution: 'NATIVE'
-    depth:
-      depth_mode: 'NEURAL'
-      depth_stabilization: 0
-    svo:
-      use_svo_timestamps: false
-      svo_realtime: true
-      replay_rate: 1.0
-EOF
-
-cat > /tmp/rgbd_sync.yaml <<'EOF'
-/**:
-  ros__parameters:
-    subscribe_rgbd: true
-    approx_sync: true
-    approx_sync_max_interval: 0.5
+    approx_sync: false
+    approx_sync_max_interval: 2.0
     topic_queue_size: 30
     sync_queue_size: 30
-    qos: 1
-    qos_camera_info: 1
-EOF
-
-cat > /tmp/rtabmap.yaml <<EOF
-/**:
-  ros__parameters:
-    frame_id: "zed_camera_link"
-    map_frame_id: "map"
-    odom_frame_id: "odom"
-    subscribe_rgbd: true
-    approx_sync: true
-    approx_sync_max_interval: 0.5
-    wait_imu_to_init: true
-    wait_for_transform: 3.0
-    tf_tolerance: 3.0
-    database_path: "${DB_PATH}"
-    topic_queue_size: 30
-    sync_queue_size: 30
-    qos_image: 1
-    qos_camera_info: 1
-    qos_odom: 1
-    qos_imu: 1
-    "Mem/IncrementalMemory": "true",
-    # process EVERY frame (default 1 Hz drops ~97% of frames and leaves a sparse graph;
-    # 0 = all frames, same value the maintainer's offline reprocess recipe uses)
-    "Rtabmap/DetectionRate": "0"
-EOF
-
-echo "[inside] starting rgbd_sync + rtabmap (subscribers first)"
-stdbuf -oL ros2 run rtabmap_sync rgbd_sync --ros-args \
-  --params-file /tmp/rgbd_sync.yaml \
-  -r rgb/image:=/zed/zed_node/rgb/color/rect/image \
-  -r depth/image:=/zed/zed_node/depth/depth_registered \
-  -r rgb/camera_info:=/zed/zed_node/rgb/color/rect/camera_info \
-  > /tmp/rtabmap_logs/rgbd_sync.log 2>&1 &
-SYNC_PID=$!
-
-stdbuf -oL ros2 run rtabmap_slam rtabmap --ros-args \
-  --params-file /tmp/rtabmap.yaml \
-  -r odom:=/zed/zed_node/odom \
-  -r imu:=/zed/zed_node/imu/data \
-  -- -d \
-  > /tmp/rtabmap_logs/rtabmap.log 2>&1 &
-RTAB_PID=$!
-
-sleep 3
-
-echo "[inside] starting ZED wrapper (model=$CAMERA_MODEL svo=$SVO_PATH)"
-stdbuf -oL ros2 launch zed_wrapper zed_camera.launch.py \
-  camera_model:="$CAMERA_MODEL" \
-  camera_name:=zed \
-  svo_path:="$SVO_PATH" \
-  publish_tf:=true \
-  publish_map_tf:=false \
-  publish_imu_tf:=true \
-  enable_ipc:=false \
-  ros_params_override_path:=/tmp/zed_override.yaml \
-  > /tmp/rtabmap_logs/zed_wrapper.log 2>&1 &
-ZED_PID=$!
-
-echo "[inside] waiting for ZED + first RGBD frames (NEURAL pre-warm allowed)..."
-READY=0
-for i in $(seq 1 900); do
-  if ! kill -0 "$ZED_PID" 2>/dev/null; then
-    echo "[inside] ZED wrapper died early" >&2
-    tail -120 /tmp/rtabmap_logs/zed_wrapper.log >&2 || true
-    exit 1
-  fi
-  if grep -q "Optimizing model" /tmp/rtabmap_logs/zed_wrapper.log 2>/dev/null; then
-    if ! grep -qE "Optimizing model: .*100|zed started" /tmp/rtabmap_logs/zed_wrapper.log 2>/dev/null; then
-      sleep 1
-      continue
-    fi
-  fi
-  if grep -q "zed started" /tmp/rtabmap_logs/zed_wrapper.log 2>/dev/null; then
-    if grep -qE "Update rate|Publishing map|Processed|link" /tmp/rtabmap_logs/rtabmap.log 2>/dev/null; then
-      echo "[inside] data flowing after ${i}s"
-      READY=1
-      break
-    fi
-    if (( i > 30 )) && ros2 topic list 2>/dev/null | grep -q "/zed/zed_node/rgb/color/rect/image"; then
-      sleep 5
-      if grep -qE "Update rate|Publishing map|Processed|link" /tmp/rtabmap_logs/rtabmap.log 2>/dev/null; then
-        echo "[inside] data flowing after ${i}s"
-        READY=1
-        break
-      fi
-    fi
-  fi
-  sleep 1
-done
-if [[ "$READY" != "1" ]]; then
-  echo "[inside] timed out waiting for pipeline data" >&2
-  tail -40 /tmp/rtabmap_logs/zed_wrapper.log >&2 || true
-  tail -40 /tmp/rtabmap_logs/rtabmap.log >&2 || true
-  tail -20 /tmp/rtabmap_logs/rgbd_sync.log >&2 || true
-  exit 1
-fi
-
-SVO_DONE=0
-while kill -0 "$ZED_PID" 2>/dev/null; do
-  if ! kill -0 "$RTAB_PID" 2>/dev/null; then
-    echo "[inside] rtabmap died" >&2
-    tail -80 /tmp/rtabmap_logs/rtabmap.log >&2 || true
-    exit 1
-  fi
-  if grep -q "SVO reached the end" /tmp/rtabmap_logs/zed_wrapper.log 2>/dev/null; then
-    echo "[inside] SVO finished"
-    sleep 5
-    SVO_DONE=1
-    break
-  fi
-  sleep 2
-done
-if [[ "$SVO_DONE" != "1" ]]; then
-  echo "[inside] ZED wrapper stopped before SVO end" >&2
-  tail -60 /tmp/rtabmap_logs/zed_wrapper.log >&2 || true
-  tail -40 /tmp/rtabmap_logs/rtabmap.log >&2 || true
-  exit 1
-fi
-
-shutdown() {
-  echo "[inside] SIGINT rtabmap (db save), grace 90s"
-  kill -INT "$RTAB_PID" 2>/dev/null || true
-  for s in $(seq 1 18); do
-    kill -0 "$RTAB_PID" 2>/dev/null || break
-    sleep 5
-  done
-  if kill -0 "$RTAB_PID" 2>/dev/null; then
-    echo "[inside] rtabmap still alive after 90s, SIGKILL"
-    kill -KILL "$RTAB_PID" 2>/dev/null || true
-  fi
-  wait "$RTAB_PID" 2>/dev/null || true
-  kill -INT "$SYNC_PID" "$ZED_PID" 2>/dev/null || true
-  sleep 5
-  kill "$SYNC_PID" "$ZED_PID" 2>/dev/null || true
-  wait "$SYNC_PID" 2>/dev/null || true
-  wait "$ZED_PID" 2>/dev/null || true
-}
-trap shutdown EXIT
-shutdown
-trap - EXIT
-
-cp -f /tmp/rtabmap_logs/* "$(dirname "$DB_PATH")/logs/" 2>/dev/null || true
-
-if [[ ! -s "$DB_PATH" ]]; then
-  echo "[inside] no database written at $DB_PATH" >&2
-  exit 1
-fi
-echo "[inside] database size: $(stat -c%s "$DB_PATH") bytes"
-
-echo "[inside] stage 2: rtabmap-reprocess (maintainer recipe)"
-rtabmap-reprocess -default --Rtabmap/DetectionRate 0 -odom "$DB_PATH" "$REFINED_PATH"
-if [[ ! -s "$REFINED_PATH" ]]; then
-  echo "[inside] reprocess produced no refined.db" >&2
-  exit 1
-fi
-
-echo "[inside] stage 2b: detect_more_loop_closures"
-if command -v rtabmap-detectMoreLoopClosures >/dev/null 2>&1; then
-  rtabmap-detectMoreLoopClosures "$REFINED_PATH"
-else
-  echo "[inside] WARNING: rtabmap-detectMoreLoopClosures not available, continuing with refined.db"
-fi
-
-echo "[inside] stage 3: rtabmap-export"
-rtabmap-export --cloud --mesh --texture --images_id --poses_camera \
-  --output scene --output_dir "$EXPORT_DIR" \
-  --max_range 6.0 --voxel 0 --decimation 1 --poses_format 11 \
-  "$REFINED_PATH"
-
-ls -la "$EXPORT_DIR"
-echo "[inside] done"
 """
 
+_RTABMAP_YAML = """\
+/**:
+  ros__parameters:
+    frame_id: "camera_link"
+    map_frame_id: "map"
+    subscribe_rgbd: true
+    approx_sync: true
+    approx_sync_max_interval: 2.0
+    wait_for_transform: 0.5
+    tf_tolerance: 0.5
+    database_path: "/output/rtabmap.db"
+    topic_queue_size: 30
+    sync_queue_size: 30
+    "Mem/IncrementalMemory": "true"
+    "Rtabmap/DetectionRate": "0"
+    "RGBD/LinearUpdate": "0"
+    "RGBD/AngularUpdate": "0"
+    "Kp/MaxFeatures": "400"
+    "Optimizer/Strategy": "2"
+    "Rtabmap/ImagesAlreadyRectified": "true"
+    "Rtabmap/ImageBufferSize": "0"
+"""
 
-def _podman_gpu_args(gpu):
-    if gpu is None:
-        raise RuntimeError("_podman_gpu_args requires the leased physical GPU index")
-    if not os.path.exists(GPU_SCRIPT):
-        raise RuntimeError(f"podman_gpu.sh not found at {GPU_SCRIPT}")
-    r = subprocess.run(["bash", GPU_SCRIPT, str(gpu)],
-                       capture_output=True, text=True, timeout=60)
-    if r.returncode != 0:
-        raise RuntimeError(f"podman_gpu.sh failed: {r.stderr.strip() or r.stdout.strip()}")
-    return [line for line in r.stdout.splitlines() if line]
+_INSIDE_SH = r"""#!/usr/bin/env bash
+# Pool replay -> rtabmap.db -> GTSAM camera poses, one container run.
+set -eo pipefail
+source /opt/ros/${ROS_DISTRO}/setup.bash
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export RCUTILS_LOGGING_USE_STDOUT=1
+STRIDE="$1"; FPS="$2"; STAMP_ORIGIN="$3"
+LOGS=/output/logs
+mkdir -p "$LOGS" /tmp/ros "$HOME/.ros"
+
+# Real binaries, not `ros2 run`: a backgrounded python launcher would ignore SIGINT.
+/opt/ros/jazzy/lib/rtabmap_sync/rgbd_sync --ros-args -r __node:=rgbd_sync_map \
+  --params-file /output/rgbd_sync.yaml \
+  -r rgb/image:=/map_rgbd/rgb/image -r depth/image:=/map_rgbd/depth/image \
+  -r rgb/camera_info:=/map_rgbd/rgb/camera_info -r rgbd_image:=/map_rgbd/rgbd_image \
+  > "$LOGS/rgbd_sync.log" 2>&1 &
+SYNC_PID=$!
+/opt/ros/jazzy/lib/rtabmap_slam/rtabmap --ros-args --params-file /output/rtabmap.yaml \
+  -r rgbd_image:=/map_rgbd/rgbd_image -r odom:=/odom -- -d \
+  > "$LOGS/rtabmap.log" 2>&1 &
+RTAB_PID=$!
+
+stop_nodes() {
+  kill -INT "$RTAB_PID" 2>/dev/null || true
+  for _ in $(seq 1 180); do
+    kill -0 "$RTAB_PID" 2>/dev/null || break
+    sleep 0.5
+  done
+  kill -KILL "$RTAB_PID" 2>/dev/null || true
+  wait "$RTAB_PID" 2>/dev/null || true
+  kill -INT "$SYNC_PID" 2>/dev/null || true
+  wait "$SYNC_PID" 2>/dev/null || true
+}
+
+if ! python3 /rtabmap_replay.py --frames /frames --stride "$STRIDE" --fps "$FPS" \
+      --stamp-origin "$STAMP_ORIGIN" --result /output/replay.json \
+      --watch-pids "$SYNC_PID" "$RTAB_PID"; then
+  stop_nodes
+  tail -40 "$LOGS/rtabmap.log" "$LOGS/rgbd_sync.log" >&2 || true
+  exit 1
+fi
+stop_nodes
+[ -s /output/rtabmap.db ] || { echo "[inside] no database written" >&2; exit 1; }
+
+echo "[inside] export"
+rtabmap-export --poses_camera --poses_format 11 --opt 2 --voxel 0.01 \
+  --output scene --output_dir /output/export /output/rtabmap.db
+echo "[inside] done"
+"""
 
 
 def _quat_to_R(qx, qy, qz, qw):
@@ -345,186 +220,142 @@ def _quat_to_R(qx, qy, qz, qw):
 
 
 def _parse_poses(path):
-    """poses_format 11: 'stamp x y z qx qy qz qw id' -> [(node_id, 4x4 c2w)].
-    Same parsing as zed-rtabmap/scripts/normalize_export.py (verified correct)."""
+    """poses_format 11: 'stamp x y z qx qy qz qw id' -> [(stamp, 4x4 c2w)] in node order."""
     out = []
-    for line in open(path).read().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
+    with open(path) as f:
+        lines = f.read().splitlines()
+    for line in lines:
         parts = line.split()
-        if len(parts) < 9:
+        if len(parts) < 9 or line.startswith("#"):
             continue
-        x, y, z = map(float, parts[1:4])
-        qx, qy, qz, qw = map(float, parts[4:8])
-        node_id = int(float(parts[8]))
+        stamp, x, y, z, qx, qy, qz, qw = map(float, parts[:8])
         T = np.eye(4, dtype=np.float64)
         T[:3, :3] = _quat_to_R(qx, qy, qz, qw)
         T[:3, 3] = (x, y, z)
-        out.append((node_id, T))
+        out.append((int(float(parts[8])), stamp, T))
     out.sort(key=lambda t: t[0])
-    return out
+    return [(stamp, T) for _, stamp, T in out]
 
 
-def _parse_export(export_dir):
-    poses_files = glob.glob(os.path.join(export_dir, "*_camera_poses.txt"))
-    if not poses_files:
+def _pool_index(stamp, origin=STAMP_ORIGIN, fps=SOURCE_FPS):
+    return int(round((stamp - origin) * fps))
+
+
+def _parse_export(export_dir, expected):
+    """Exported poses -> (poses, keep); every replayed frame must be a graph node (41/41)."""
+    files = glob.glob(os.path.join(export_dir, "*_camera_poses.txt"))
+    if not files:
         raise RuntimeError(f"no *_camera_poses.txt in export dir {export_dir}")
-    rgb_dir = glob.glob(os.path.join(export_dir, "*_rgb"))
-    depth_dir = glob.glob(os.path.join(export_dir, "*_depth"))
-    if not rgb_dir or not depth_dir:
-        raise RuntimeError(f"export has no *_rgb / *_depth image dirs in {export_dir}")
-    rgb_dir, depth_dir = rgb_dir[0], depth_dir[0]
-
-    kept = []
-    for node_id, T in _parse_poses(poses_files[0]):
-        rgb = os.path.join(rgb_dir, f"{node_id}.jpg")
-        if not os.path.exists(rgb):
-            rgb = os.path.join(rgb_dir, f"{node_id}.png")
-        if os.path.exists(rgb) and os.path.exists(os.path.join(depth_dir, f"{node_id}.png")):
-            kept.append((node_id, T))
-    if not kept:
-        raise RuntimeError(f"no node with both rgb+depth in export {export_dir}")
-
-    ids = [nid for nid, _ in kept]
-    if ids != list(range(ids[0], ids[0] + len(ids))):
-        raise RuntimeError(
-            f"rtabmap export node ids not contiguous ({ids[0]}..{ids[-1]}, {len(ids)} nodes); "
-            "cannot map node ids to original frame indices without a timestamp "
-            "correspondence (stamps are wall-clock, use_svo_timestamps=false)")
-    keep = [i - ids[0] for i in ids]
-    poses = np.stack([T for _, T in kept]).astype(np.float64)
-    return poses, keep
+    parsed = _parse_poses(files[0])
+    keep = [_pool_index(stamp) for stamp, _ in parsed]
+    if keep != list(expected):
+        raise RuntimeError(f"export nodes do not match the replay: {len(keep)} poses vs "
+                           f"{len(expected)} frames, first {keep[:5]} vs {list(expected)[:5]}")
+    return np.stack([T for _, T in parsed]).astype(np.float64), keep
 
 
-def _bake_vertex_colors(mesh):
-    texs = [np.asarray(t) for t in mesh.textures]
-    tris = np.asarray(mesh.triangles)
-    if tris.size == 0 or len(texs) == 0:
-        return
-    uvs = np.asarray(mesh.triangle_uvs).reshape(-1, 3, 2)
-    mids = np.asarray(mesh.triangle_material_ids)
-    n = len(mesh.vertices)
-    acc = np.zeros((n, 3), dtype=np.float64)
-    cnt = np.zeros(n, dtype=np.int64)
-    for mat in np.unique(mids):
-        sel = np.where(mids == mat)[0]
-        tex = texs[int(mat)]
-        h, w = tex.shape[:2]
-        u = uvs[sel]
-        px = np.clip(np.rint(u[:, :, 0] * (w - 1)).astype(np.int64), 0, w - 1)
-        py = np.clip(np.rint((1.0 - u[:, :, 1]) * (h - 1)).astype(np.int64), 0, h - 1)
-        cols = tex[py, px]
-        if cols.shape[-1] == 1:
-            cols = np.repeat(cols, 3, axis=-1)
-        else:
-            cols = cols[..., :3]
-        cols = cols.astype(np.float64)
-        if cols.max() > 1.5:
-            cols /= 255.0
-        idx = tris[sel].ravel()
-        np.add.at(acc, idx, cols.reshape(-1, 3))
-        np.add.at(cnt, idx, 1)
-    if cnt.sum() == 0:
-        return
-    import open3d as o3d
-    mesh.vertex_colors = o3d.utility.Vector3dVector(acc / np.maximum(cnt[:, None], 1))
-
-
-def _to_native_ply(export_dir, out_path):
-    import open3d as o3d
-    objs = sorted(glob.glob(os.path.join(export_dir, "*_mesh.obj")))
-    if not objs:
-        raise RuntimeError(f"rtabmap export produced no *_mesh.obj in {export_dir}")
-    mesh = o3d.io.read_triangle_mesh(objs[0])
-    if len(mesh.vertices) == 0:
-        raise RuntimeError(f"empty mesh from {objs[0]}")
-    if not mesh.has_vertex_colors() and mesh.has_triangle_uvs() and len(mesh.textures):
+def _run_container(cmd, name, log_path, lease_fd):
+    with open(log_path, "w") as lf:
+        lf.write("cmd: " + " ".join(cmd) + "\n")
+        lf.flush()
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, pass_fds=(lease_fd,))
         try:
-            _bake_vertex_colors(mesh)
-        except Exception as e:
-            print(f"[rtabmap] texture color bake failed ({e}); writing mesh without colors")
-    o3d.io.write_triangle_mesh(out_path, mesh, write_ascii=False,
-                               write_vertex_normals=False,
-                               write_vertex_colors=mesh.has_vertex_colors(),
-                               write_triangle_uvs=False)
-    return out_path
+            proc.wait(timeout=TIMEOUT)
+        except BaseException as ex:  # includes the run.py cap (a BaseException)
+            lf.write(f"{type(ex).__name__}: killing container {name}\n")
+            lf.flush()
+            subprocess.run(["docker", "kill", name], stdout=lf, stderr=subprocess.STDOUT)
+            proc.kill()
+            proc.wait()
+            raise
+    if proc.returncode != 0:
+        raise RuntimeError(f"rtabmap container failed rc={proc.returncode} (log: {log_path})")
 
 
 def reconstruct(work, root, gpu=None, lease_fd=None):
     if gpu is None or lease_fd is None:
         raise RuntimeError("rtabmap is GPU_POLICY managed: gpu + lease_fd required "
                            "(run.py acquires the settings-pool lease)")
-    marker = os.path.join(work, "svo_path.txt")
-    if not os.path.exists(marker):
-        raise RuntimeError("run.py must write recon/svo_path.txt before engines run")
-    svo = open(marker).read().strip()
+    import cv2  # noqa: F401  cv2 fails to load after pymeshlab (glib clash), finalize needs it
+
+    t0 = time.monotonic()
+    stride = selected_stride()
+    frames = os.path.realpath(os.path.join(work, "frames"))
+    states = open(os.path.join(frames, "pose_state.txt")).read().split()
+    expected = list(range(0, len(states), stride))
+    bad = [i for i in expected if states[i] != "OK"]
+    if bad:  # [inferred] external odometry needs a valid Stage-A pose on every replayed frame
+        raise RuntimeError(f"replayed pool frames without OK pose: {bad[:10]}")
 
     rtab_dir = os.path.join(work, "rtabmap")
     log_dir = os.path.join(work, "logs")
-    os.makedirs(rtab_dir, exist_ok=True)
+    shutil.rmtree(rtab_dir, ignore_errors=True)
+    os.makedirs(rtab_dir)
     os.makedirs(log_dir, exist_ok=True)
+    for name, text in (("inside.sh", _INSIDE_SH), ("rgbd_sync.yaml", _RGBD_SYNC_YAML),
+                       ("rtabmap.yaml", _RTABMAP_YAML)):
+        with open(os.path.join(rtab_dir, name), "w") as f:
+            f.write(text)
 
-    db_path = os.path.join(rtab_dir, "rtabmap.db")
-    refined_path = os.path.join(rtab_dir, "refined.db")
-    export_dir = os.path.join(rtab_dir, "export")
-    for stale in (db_path, refined_path):
-        if os.path.exists(stale):
-            os.unlink(stale)
-    if os.path.isdir(export_dir):
-        shutil.rmtree(export_dir)
-
-    inside_sh = os.path.join(rtab_dir, "inside.sh")
-    with open(inside_sh, "w") as f:
-        f.write(_INSIDE_SH)
-    os.chmod(inside_sh, 0o755)
-
-    gpu_args = _podman_gpu_args(gpu)
-    data_root = os.environ.get("ZED_RTABMAP_DATA", "/data/zed-rtabmap")
-    resources = os.path.join(data_root, "zed-resources")
-    settings = os.path.join(data_root, "zed-settings")
-    for d in (resources, settings):
-        os.makedirs(d, exist_ok=True)
-
-    svo_real = os.path.realpath(svo)
-    svo_dir, svo_base = os.path.split(svo_real)
-    cmd = ["podman", "run", "--rm", "--name", CONTAINER_NAME] + gpu_args + [
+    cmd = ["docker", "run", "--rm", "--name", CONTAINER_NAME] + user_args() + gpu_args(gpu) + [
         "--network=host", "--ipc=host",
         "-e", f"ROS_DOMAIN_ID={40 + gpu}",
-        "-e", "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp",
-        "-v", f"{svo_dir}:/input:ro",
-        "-v", f"{rtab_dir}:/output:rw",
-        "-v", f"{resources}:/usr/local/zed/resources:rw",
-        "-v", f"{settings}:/usr/local/zed/settings:rw",
-        "-v", f"{inside_sh}:/inside.sh:ro",
-        PODMAN_IMAGE,
-        "bash", "/inside.sh",
-        f"/input/{svo_base}", "/output/rtabmap.db", "/output/refined.db",
-        "/output/export", "zedx",
+        "-e", "HOME=/tmp", "-e", "ROS_LOG_DIR=/tmp/ros",
+    ] + mount(frames, "/frames", read_only=True) + mount(rtab_dir, "/output") \
+      + mount(_REPLAY, "/rtabmap_replay.py", read_only=True) + [
+        IMAGE, "bash", "/output/inside.sh", str(stride), str(SOURCE_FPS), str(STAMP_ORIGIN),
     ]
+    t_slam = time.monotonic()
+    _run_container(cmd, CONTAINER_NAME, os.path.join(log_dir, "rtabmap.log"), lease_fd)
+    slam_s = time.monotonic() - t_slam
 
-    log_path = os.path.join(log_dir, "rtabmap.log")
-    pass_fds = (lease_fd,)
-    with open(log_path, "w") as lf:
-        lf.write("cmd: " + " ".join(cmd) + "\n")
-        lf.flush()
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
-                                pass_fds=pass_fds)
-        try:
-            proc.wait(timeout=TIMEOUT)
-        except subprocess.TimeoutExpired:
-            lf.write(f"timeout after {TIMEOUT}s, killing container {CONTAINER_NAME}\n")
-            lf.flush()
-            subprocess.run(["podman", "kill", CONTAINER_NAME], stdout=lf, stderr=subprocess.STDOUT)
-            try:
-                proc.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            raise RuntimeError(f"rtabmap container timed out after {TIMEOUT}s (log: {log_path})")
-    if proc.returncode != 0:
-        raise RuntimeError(f"rtabmap container failed rc={proc.returncode} (log: {log_path})")
+    with open(os.path.join(rtab_dir, "replay.json")) as f:
+        replay = json.load(f)
+    poses, keep = _parse_export(os.path.join(rtab_dir, "export"), expected)
+    span = replay["span"]
+    print(f"[rtabmap] {len(keep)}/{len(expected)} frames, span {span:.1%}", flush=True)
 
-    poses, keep = _parse_export(export_dir)
-    native = _to_native_ply(export_dir, os.path.join(work, "engine_native.ply"))
-    return native, poses, keep, "rtabmap_map"
+    eff = dict(sid=os.path.basename(os.path.normpath(root)), issue=ISSUE,
+               profile=selected_profile(), stride=stride, keep=f"{len(keep)}/{len(expected)}",
+               span=span, convention=CONVENTION, fps=SOURCE_FPS, fusion=dict(FUSION))
+    with open(os.path.join(work, "effective_config.json"), "w") as f:
+        json.dump(eff, f, indent=2, sort_keys=True)
+        f.write("\n")
+    np.save(os.path.join(work, "frame_indices.npy"), np.asarray(keep))
+    np.save(os.path.join(rtab_dir, "fusion_poses.npy"), poses)
+
+    t_fuse = time.monotonic()
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = str(FUSE_THREADS)  # read when open3d loads, hence the child
+    pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = _REPO_ROOT + (os.pathsep + pp if pp else "")
+    r = subprocess.run([sys.executable, "-m", "spellbook.reconstruct.engines.rtabmap",
+                        "--child", "--work", work], env=env, cwd=_REPO_ROOT)
+    if r.returncode != 0:
+        raise RuntimeError(f"rtabmap TSDF child failed rc={r.returncode}")
+    native = os.path.join(work, "engine_native.ply")
+    fuse_s = time.monotonic() - t_fuse
+
+    timings = dict(slam_export=round(slam_s, 3), fuse=round(fuse_s, 3),
+                   reconstruct=round(time.monotonic() - t0, 3))
+    with open(os.path.join(work, "stage_timings.json"), "w") as f:
+        json.dump(timings, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"[rtabmap] timings {json.dumps(timings, sort_keys=True)}", flush=True)
+    return native, poses, keep, CONVENTION
+
+
+def _child_main(argv):
+    """CPU TSDF fusion of the node frames at the exported poses, thread count set by the parent."""
+    from ..tsdf import integrate_tsdf
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--child", action="store_true")
+    ap.add_argument("--work", required=True)
+    args = ap.parse_args(argv)
+    keep = [int(i) for i in np.load(os.path.join(args.work, "frame_indices.npy"))]
+    poses = np.load(os.path.join(args.work, "rtabmap", "fusion_poses.npy"))
+    integrate_tsdf(args.work, keep, poses, min_frames=1, conjugate=False)
+
+
+if __name__ == "__main__":
+    _child_main(sys.argv[1:])

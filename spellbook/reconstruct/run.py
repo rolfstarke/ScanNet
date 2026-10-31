@@ -1,11 +1,25 @@
 """CLI: python -m spellbook.reconstruct.run --scene 9004 --engine open3d
 
 Pipeline: shared frames -> allocate slot -> reconstruct -> align/meshes/sens -> score (scene9004).
+
+Timed region = engine.reconstruct + _pipeline (align, meshes, .sens/.txt, segmentator); it is
+written to recon/timing.json and capped at 3x the scene length (runtime rule 2026-09-15,
+SCENE_DURATION_S in reconstruct/__init__.py). Lease wait and CAD scoring are outside it;
+`--offline-score` skips the inline score so it can run later
+(`python -m spellbook.reconstruct.geometry_score --scan-id <sid>`). Adapters with
+RUNTIME_CAP_EXEMPT = True (Metashape) are unbounded. Overrun -> rc 124, slot left incomplete
+(the allocator reuses it).
+
+Provenance: recon/run.json (schema 1) with engine, scan, issue, variant/preset + effective
+config (adapter provenance() hook), commit/dirty, adapter sha256, duration/limit/elapsed.
 """
 import argparse
+import hashlib
 import importlib
+import json
 import os
 import shutil
+import signal
 import sys
 import time
 
@@ -20,14 +34,106 @@ import yaml
 from evaluation.benchmark import load_settings
 from utils.gpu import gpu_lease
 from utils.scan_lock import exclusive_lock, frames_lock_path, scan_lock_path, scene_engine_lock_path
-from . import (SCANS_DIR, engine_run_range, frames_pool_dir, parse_scan_id, scan_dir, scan_id,
-               svo_path)
+from . import (SCANS_DIR, SCENE_DURATION_S, engine_run_range, frames_pool_dir, parse_scan_id,
+               runtime_cap_s, scan_dir, scan_id, svo_path)
 from . import cleanup, extract as extract_mod
 from . import finalize, scannet
 from .geometry_score import DEFAULT_CONFIG, load_config, score_scan
 
 VALID_POLICIES = ("managed", "cpu", "blocked")
 BENCHMARK_SCENE = 9004
+RUN_SCHEMA = 1
+CAP_EXIT_CODE = 124
+# Run-0 replacement on the ten-slot benchmark scene (#53 2026-09-08, verbatim name): purge +
+# remove slot 0 under locks and reuse it instead of the normal slot policy.
+TARGET_RUN0_ENV = "SPELLBOOK_TARGET_RUN0"
+
+
+class RuntimeCapExceeded(BaseException):
+    """Raised in the main thread by SIGALRM when the timed region overruns the cap.
+    BaseException so adapter `except Exception` blocks cannot swallow it; subprocess.run
+    kills its child on the way out."""
+
+
+class runtime_cap:
+    """Context manager arming a one-shot SIGALRM after `cap_s` seconds (None = no cap)."""
+
+    def __init__(self, cap_s):
+        self.cap_s = cap_s
+        self._old = None
+
+    def _fire(self, signum, frame):
+        raise RuntimeCapExceeded(f"runtime cap {self.cap_s:.6f}s exceeded")
+
+    def __enter__(self):
+        if self.cap_s:
+            self._old = signal.signal(signal.SIGALRM, self._fire)
+            signal.setitimer(signal.ITIMER_REAL, float(self.cap_s))
+        return self
+
+    def __exit__(self, *exc):
+        if self.cap_s:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self._old or signal.SIG_DFL)
+        return False
+
+
+def cap_for(engine, scene):
+    """Cap seconds for (adapter module, scene), or None when exempt/unknown."""
+    if getattr(engine, "RUNTIME_CAP_EXEMPT", False):
+        return None
+    return runtime_cap_s(scene)
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_json(path, doc):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(doc, f, indent=2, sort_keys=True, default=str)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _run_record(args, engine, sid, svo, shared, cap):
+    """Initial recon/run.json document (updated in place when the run ends)."""
+    from jobs import _git_info
+
+    prov = {}
+    if hasattr(engine, "provenance"):
+        prov = dict(engine.provenance() or {})
+    adapter = os.path.abspath(engine.__file__)
+    git = _git_info(_REPO_ROOT)
+    duration = SCENE_DURATION_S.get(args.scene)
+    return {
+        "schema": RUN_SCHEMA,
+        "engine": args.engine,
+        "scene": f"scene{args.scene:04d}",
+        "scan_id": sid,
+        "issue": args.issue,
+        "variant": prov.pop("variant", None),
+        "config": prov.pop("config", None),
+        **prov,
+        "commit": git.get("commit"),
+        "branch": git.get("branch"),
+        "git_dirty": git.get("dirty"),
+        "adapter": os.path.relpath(adapter, _REPO_ROOT),
+        "adapter_sha256": _sha256(adapter),
+        "svo": svo,
+        "frames": shared,
+        "job_id": os.environ.get("SPELLBOOK_JOB_ID"),
+        "duration_s": duration,
+        "limit_s": cap,
+        "cap_exempt": bool(getattr(engine, "RUNTIME_CAP_EXEMPT", False)),
+        "started": time.time(),
+        "status": "running",
+    }
 
 
 def _complete_scan(root, sid, require_score=False):
@@ -78,7 +184,10 @@ def _read_score(path):
         return float(yaml.safe_load(f)["mean_bidirectional_distance_cm"])
 
 
-def _pipeline(work, root, sid, info, engine_name, mesh_native, poses, keep, convention):
+def _pipeline(work, root, sid, info, engine_name, mesh_native, poses, keep, convention,
+              frames_dir=None):
+    """`frames_dir` overrides the shared pool as .sens source (engines that package their own
+    per-frame depth, e.g. Metashape native depth maps); same K and frame indices."""
     print(f"[engine:{engine_name}] mesh={mesh_native} frames={len(keep)} conv={convention}")
     if not keep or len(poses) != len(keep):
         sys.exit("engine returned inconsistent poses/keep")
@@ -89,7 +198,8 @@ def _pipeline(work, root, sid, info, engine_name, mesh_native, poses, keep, conv
     axis = scannet.axis_alignment_matrix(clean2)
     print(f"[scannet] _vh_clean={os.path.basename(clean)} _vh_clean_2={os.path.basename(clean2)}")
 
-    sens_path, width, height = finalize.finalize(root, sid, os.path.join(work, "frames"),
+    sens_path, width, height = finalize.finalize(root, sid,
+                                                 frames_dir or os.path.join(work, "frames"),
                                                  info["K"], aligned_poses, keep)
     finalize.write_txt(os.path.join(root, f"{sid}.txt"), info["K"], len(keep), axis,
                        os.environ.get("SCENE_TYPE", "Custom"), width, height)
@@ -102,7 +212,8 @@ def _pipeline(work, root, sid, info, engine_name, mesh_native, poses, keep, conv
 def _prepare_shared_frames(scene, replace):
     pool = frames_pool_dir(scene)
     with exclusive_lock(frames_lock_path(scene)):
-        if scene == BENCHMARK_SCENE and not extract_mod.frames_complete(pool):
+        if scene == BENCHMARK_SCENE and not extract_mod.frames_complete(pool) \
+                and os.path.isdir(extract_mod.LEGACY_9004_FRAMES):
             extract_mod.promote_scene9004_frames()
         if not extract_mod.frames_complete(pool):
             if replace or scene != BENCHMARK_SCENE:
@@ -122,7 +233,7 @@ def _allocate(scene, engine):
     sc = cfg.get("scenes", {}).get(f"scene{scene:04d}", {})
     retained = int(sc.get("retained_runs", retained))
 
-    if retained == 1 or scene != BENCHMARK_SCENE:
+    if retained == 1 or scene != BENCHMARK_SCENE or os.environ.get(TARGET_RUN0_ENV) == "1":
         run_num = 0
         sid = scan_id(scene, engine, run_num)
         root = scan_dir(scene, engine, run_num)
@@ -189,6 +300,20 @@ def _allocate(scene, engine):
     return run_num, sid, root
 
 
+def _reconstruct_and_pipeline(engine, args, work, root, sid, info, gpu=None, lease_fd=None):
+    """The timed region. Returns elapsed seconds."""
+    started = time.monotonic()
+    if gpu is None:
+        result = engine.reconstruct(work, root)
+    else:
+        result = engine.reconstruct(work, root, gpu=gpu, lease_fd=lease_fd)
+    mesh_native, poses, keep, convention = result[:4]
+    frames_dir = result[4] if len(result) > 4 else None
+    _pipeline(work, root, sid, info, args.engine, mesh_native, poses, keep, convention,
+              frames_dir)
+    return time.monotonic() - started
+
+
 def main():
     ap = argparse.ArgumentParser(description="SVO2 -> ScanNet-native scan")
     ap.add_argument("--scene", type=int, required=True)
@@ -199,6 +324,10 @@ def main():
     ap.add_argument("--frames", default=None, help="shared frames dir (batch)")
     ap.add_argument("--replace", action="store_true",
                     help="re-extract shared frames (main extract path only)")
+    ap.add_argument("--issue", type=int, default=None,
+                    help="GitHub issue number recorded in recon/run.json")
+    ap.add_argument("--offline-score", action="store_true",
+                    help="skip the inline CAD score (score later with geometry_score)")
     args = ap.parse_args()
 
     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -225,6 +354,7 @@ def main():
     else:
         shared = _prepare_shared_frames(args.scene, args.replace)
 
+    cap = cap_for(engine, args.scene)
     with exclusive_lock(scene_engine_lock_path(args.scene, args.engine)):
         run_num, sid, root = _allocate(args.scene, args.engine)
         print(f"[run] {sid} <- {svo}")
@@ -244,32 +374,61 @@ def main():
             os.symlink(shared, local)
             info = extract_mod.load_info(shared)
 
+            record = _run_record(args, engine, sid, svo, shared, cap)
+            run_json = os.path.join(work, "run.json")
+            _write_json(run_json, record)
+            shutil.copy2(engine.__file__, os.path.join(work, f"adapter_{args.engine}.py"))
+            print(f"[cap] {sid} limit="
+                  + (f"{cap:.6f}s" if cap else "none (exempt/unknown scene length)")
+                  + f" variant={record.get('variant')}")
+
             from utils.compute_time import write_reconstruction_timing
 
-            if policy == "managed":
-                settings = load_settings()
-                with gpu_lease(settings["gpu_pool"], settings["scannet_root"]) as lease:
-                    started = time.monotonic()
-                    mesh_native, poses, keep, convention = engine.reconstruct(
-                        work, root, gpu=lease.index, lease_fd=lease.fileno())
-                    _pipeline(work, root, sid, info, args.engine, mesh_native, poses,
-                              keep, convention)
-                    write_reconstruction_timing(
-                        root, sid, args.engine, time.monotonic() - started)
-            else:
-                started = time.monotonic()
-                mesh_native, poses, keep, convention = engine.reconstruct(work, root)
-                _pipeline(work, root, sid, info, args.engine, mesh_native, poses,
-                          keep, convention)
-                write_reconstruction_timing(
-                    root, sid, args.engine, time.monotonic() - started)
+            # The cap arms only once the lease is held: lease wait is not charged.
+            try:
+                if policy == "managed":
+                    settings = load_settings()
+                    # GPU_POOL: an adapter may pin its lease (bundlefusion's ordered pair).
+                    pool = getattr(engine, "GPU_POOL", settings["gpu_pool"])
+                    with gpu_lease(pool, settings["scannet_root"]) as lease:
+                        record["gpu"] = lease.index
+                        with runtime_cap(cap):
+                            elapsed = _reconstruct_and_pipeline(
+                                engine, args, work, root, sid, info,
+                                gpu=lease.index, lease_fd=lease.fileno())
+                else:
+                    with runtime_cap(cap):
+                        elapsed = _reconstruct_and_pipeline(engine, args, work, root, sid,
+                                                            info)
+            except (RuntimeCapExceeded, *getattr(engine, "CAP_ERRORS", ())) as ex:
+                record.update(status="timeout", ended=time.time(), cap_pass=False)
+                _write_json(run_json, record)
+                print(f"[cap] FAIL {sid}: {ex}; slot left incomplete")
+                sys.exit(CAP_EXIT_CODE)
+
+            write_reconstruction_timing(root, sid, args.engine, elapsed)
+            cap_pass = cap is None or elapsed <= cap
+            record.update(status="complete" if cap_pass else "timeout", ended=time.time(),
+                          elapsed_s=elapsed, cap_pass=cap_pass)
+            if hasattr(engine, "provenance_after"):
+                record.update(engine.provenance_after(work) or {})
+            _write_json(run_json, record)
+            print(f"[cap] {sid} elapsed={elapsed:.2f}s "
+                  + (f"<= {cap:.6f}s PASS" if cap and cap_pass else
+                     f"> {cap:.6f}s FAIL" if cap else "(no cap)"))
+            if not cap_pass:
+                sys.exit(CAP_EXIT_CODE)
 
             if args.scene == BENCHMARK_SCENE:
-                try:
-                    score_scan(sid)
-                except Exception as ex:
-                    print(f"[geometry] FAILED {sid}: {ex}")
-                    sys.exit(1)
+                if args.offline_score:
+                    print(f"[geometry] offline: python -m spellbook.reconstruct.geometry_score "
+                          f"--scan-id {sid}")
+                else:
+                    try:
+                        score_scan(sid)
+                    except Exception as ex:
+                        print(f"[geometry] FAILED {sid}: {ex}")
+                        sys.exit(1)
 
             print(f"[done] {sid}")
 

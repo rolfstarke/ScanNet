@@ -157,6 +157,20 @@ class RankingTests(unittest.TestCase):
             self.assertEqual(by_id["run-a"]["rank_ap"], 1)
             self.assertEqual(by_id["run-b"]["rank_ap"], 2)
 
+    def test_unparseable_manifest_skipped_with_warning(self):  # [inferred] #34
+        with tempfile.TemporaryDirectory() as root:
+            spec = self._layout(root, "run-a", "mosaic3d", ["scene0568_01"],
+                                _csv_rows("0.5", "0.8", "0.2"))
+            bad = os.path.join(root, "derived", "evaluations", "ScanNet20", "run-bad")
+            os.makedirs(bad)
+            with open(os.path.join(bad, "run.json"), "w") as f:
+                f.write('{"schema": 2, "methods": {"spaceformer"')
+            with mock.patch("sys.stderr") as stderr:
+                rows, _ = rank_runs(spec, scannet_root=root)
+            self.assertEqual([row["run_id"] for row in rows], ["run-a"])
+            self.assertIn("skipping unparseable manifest",
+                          "".join(c.args[0] for c in stderr.write.call_args_list))
+
     def test_groups_do_not_cross_method_or_scenes(self):
         with tempfile.TemporaryDirectory() as root:
             spec = self._layout(root, "run-a", "mosaic3d", ["scene0568_01"],

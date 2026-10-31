@@ -1,0 +1,7 @@
+# bundlefusion:latest + niessner/BundleFusion PR #28 and PR #31 (SIFT feature-count, match-sort).
+# Only for the historical #50 presets; the baseline does not use it.
+# Build: docker build -f Dockerfile.siftfix -t bundlefusion:spellbook-siftfix .
+FROM bundlefusion:latest
+COPY siftfix.patch /tmp/siftfix.patch
+RUN git apply --whitespace=nowarn /tmp/siftfix.patch && \
+    cd build && make -j"$(nproc)" bundle_fusion_headless

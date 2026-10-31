@@ -1,0 +1,398 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f37a1eb..443224b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -11,7 +11,7 @@ find_package(CUDA REQUIRED)
+ set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
+ set(CUDA_SEPARABLE_COMPILATION ON)
+ set(CUDA_PROPAGATE_HOST_FLAGS OFF)
+-set(CUDA_NVCC_FLAGS -arch=sm_35;-std=c++14;-lm)
++set(CUDA_NVCC_FLAGS -arch=sm_86;-std=c++14;-lm)
+ ADD_DEFINITIONS(-fpermissive)
+ 
+ find_package (Threads)
+@@ -93,6 +93,10 @@ add_executable(bundle_fusion_example example/bundle_fusion_example.cpp)
+ target_link_libraries(bundle_fusion_example 
+    BundleFusion
+ )
++add_executable(bundle_fusion_headless example/bundle_fusion_headless.cpp)
++target_link_libraries(bundle_fusion_headless
++   BundleFusion
++)
+ # 
+ # include_directories(
+ # ${PROJECT_SOURCE_DIR}/example/include/)
+diff --git a/example/bundle_fusion_headless.cpp b/example/bundle_fusion_headless.cpp
+new file mode 100644
+index 0000000..1daacca
+--- /dev/null
++++ b/example/bundle_fusion_headless.cpp
+@@ -0,0 +1,74 @@
++// Headless BundleFusion: <app.txt> <bundling.txt> <in_dir> <out_dir> <rounds>
++// in_dir/color/<i>.jpg + in_dir/depth/<i>.png (640x480, 16-bit depth in mm).
++// Writes out_dir/pose/<i>.txt and out_dir/mesh.ply.
++#include <BundleFusion.h>
++#include <dirent.h>
++#include <sys/stat.h>
++#include <algorithm>
++#include <iostream>
++#include <string>
++#include <vector>
++#include <opencv2/opencv.hpp>
++
++static std::vector<int> listFrames(const std::string& dir)
++{
++    std::vector<int> ids;
++    DIR* d = opendir(dir.c_str());
++    if (!d) return ids;
++    while (dirent* e = readdir(d))
++    {
++        const std::string n(e->d_name);
++        if (n.size() > 4 && n.compare(n.size() - 4, 4, ".jpg") == 0)
++            ids.push_back(std::stoi(n));
++    }
++    closedir(d);
++    std::sort(ids.begin(), ids.end());
++    return ids;
++}
++
++int main(int argc, char** argv)
++{
++    if (argc != 6)
++    {
++        std::cerr << "usage: bundle_fusion_headless <app.txt> <bundling.txt> <in_dir> <out_dir> <rounds>" << std::endl;
++        return 2;
++    }
++    const std::string in = argv[3], out = argv[4];
++    const int rounds = std::stoi(argv[5]);
++    const std::vector<int> ids = listFrames(in + "/color");
++    if (ids.empty())
++    {
++        std::cerr << "no frames in " << in << "/color" << std::endl;
++        return 2;
++    }
++    if (!initBundleFusion(argv[1], argv[2]))
++    {
++        std::cerr << "BundleFusion init failed" << std::endl;
++        return 1;
++    }
++    size_t processed = 0;
++    for (const int i : ids)
++    {
++        const std::string name = std::to_string(i);
++        cv::Mat rgb = cv::imread(in + "/color/" + name + ".jpg");
++        cv::Mat depth = cv::imread(in + "/depth/" + name + ".png", cv::IMREAD_UNCHANGED);
++        if (rgb.empty() || depth.empty() || rgb.cols != 640 || rgb.rows != 480
++            || depth.cols != 640 || depth.rows != 480 || depth.type() != CV_16UC1)
++        {
++            std::cout << "[warn] skipping frame " << i << std::endl;
++            continue;
++        }
++        if (!processInputRGBDFrame(rgb, depth))
++        {
++            std::cout << "[warn] skipping frame " << i << std::endl;
++            continue;
++        }
++        processed++;
++    }
++    std::cout << "[info] processed " << processed << "/" << ids.size() << " frames" << std::endl;
++    mkdir((out + "/pose").c_str(), 0775);
++    const bool ok = finishBundleFusion(out + "/pose", out + "/mesh.ply", rounds);
++    deinitBundleFusion();
++    std::cout << "[info] done" << std::endl;
++    return ok ? 0 : 1;
++}
+diff --git a/include/BundleFusion.h b/include/BundleFusion.h
+index da75852..2b9d180 100644
+--- a/include/BundleFusion.h
++++ b/include/BundleFusion.h
+@@ -27,6 +27,13 @@ bool initBundleFusion(std::string app_config, std::string bundle_config);
+ bool processInputRGBDFrame(cv::Mat& rgb, cv::Mat& depth);
+ 
+ 
++/**
++ * end of sequence: stop the sensor, run `rounds` past-end global solves, stop the bundling
++ * thread, write <poseDir>/<i>.txt (row-major camera-to-world, finite only, optimized pose
++ * if finite else integrated pose) BEFORE the reintegration drain, drain, write the mesh.
++ * */
++bool finishBundleFusion(const std::string& poseDir, const std::string& meshPath, int rounds);
++
+ /**
+  * release all resources include GPU, memory or other shader sources
+  * */
+diff --git a/include/RGBDSensor.h b/include/RGBDSensor.h
+index 35e201b..5b07681 100644
+--- a/include/RGBDSensor.h
++++ b/include/RGBDSensor.h
+@@ -84,8 +84,8 @@ public:
+ 		return mat4f::identity();
+ 	}
+ 
+-	virtual void startReceivingFrames() {}
+-	virtual void stopReceivingFrames() {}
++	virtual void startReceivingFrames() { m_bIsReceivingFrames = true; }
++	virtual void stopReceivingFrames() { m_bIsReceivingFrames = false; }
+ 
+ 	virtual bool isReceivingFrames() const {
+ 		return m_bIsReceivingFrames;
+diff --git a/include/SiftGPU/cudaUtil.h b/include/SiftGPU/cudaUtil.h
+index 1f41dcc..6d9c73a 100644
+--- a/include/SiftGPU/cudaUtil.h
++++ b/include/SiftGPU/cudaUtil.h
+@@ -24,20 +24,20 @@
+ __inline__ __device__
+ float warpReduceSum(float val) {
+ 	for (int offset = warpSize / 2; offset > 0; offset /= 2)
+-		val += __shfl_down(val, offset);
++		val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+ 	return val;
+ }
+ __inline__ __device__
+ float warpReduceMax(float val) {
+ 	for (int offset = 32 / 2; offset > 0; offset /= 2) {
+-		val = max(val, __shfl_down(val, offset, 32));
++		val = max(val, __shfl_down_sync(0xFFFFFFFF, val, offset, 32));
+ 	}
+ 	return val;
+ }
+ __inline__ __device__
+ float warpReduceMin(float val) {
+ 	for (int offset = 32 / 2; offset > 0; offset /= 2) {
+-		val = min(val, __shfl_down(val, offset, 32));
++		val = min(val, __shfl_down_sync(0xFFFFFFFF, val, offset, 32));
+ 	}
+ 	return val;
+ }
+@@ -45,21 +45,21 @@ float warpReduceMin(float val) {
+ __inline__ __device__
+ float warpReduceSumAll(float val) {
+ 	for (int offset = 32 / 2; offset > 0; offset /= 2) {
+-		val += __shfl_xor(val, offset, 32);
++		val += __shfl_xor_sync(0xFFFFFFFF, val, offset, 32);
+ 	}
+ 	return val;
+ }
+ __inline__ __device__
+ float warpReduceMaxAll(float val) {
+ 	for (int offset = 32 / 2; offset > 0; offset /= 2) {
+-		val = max(val, __shfl_xor(val, offset, 32));
++		val = max(val, __shfl_xor_sync(0xFFFFFFFF, val, offset, 32));
+ 	}
+ 	return val;
+ }
+ __inline__ __device__
+ float warpReduceMinAll(float val) {
+ 	for (int offset = 32 / 2; offset > 0; offset /= 2) {
+-		val = min(val, __shfl_xor(val, offset, 32));
++		val = min(val, __shfl_xor_sync(0xFFFFFFFF, val, offset, 32));
+ 	}
+ 	return val;
+ }
+diff --git a/include/Solver/SolverBundlingUtil.h b/include/Solver/SolverBundlingUtil.h
+index 4194628..cf1cc66 100644
+--- a/include/Solver/SolverBundlingUtil.h
++++ b/include/Solver/SolverBundlingUtil.h
+@@ -14,7 +14,7 @@
+ __inline__ __device__ float warpReduce(float val) {
+ 	int offset = 32 >> 1;
+ 	while (offset > 0) {
+-		val = val + __shfl_down(val, offset, 32);
++		val = val + __shfl_down_sync(0xFFFFFFFF, val, offset, 32);
+ 		offset = offset >> 1;
+ 	}
+ 	return val;
+diff --git a/src/BundleFusion.cpp b/src/BundleFusion.cpp
+index e214944..841cb7d 100644
+--- a/src/BundleFusion.cpp
++++ b/src/BundleFusion.cpp
+@@ -31,6 +31,7 @@
+ #include <iomanip>
+ #include <fstream>
+ #include <unistd.h>
++#include <cmath>
+ 
+ #ifdef WITH_VISUALIZATION
+ #include <Output3DWrapper.h>
+@@ -65,7 +66,7 @@ bool publish_rgb = true;
+ bool publish_depth = false;
+ bool publish_mesh = true;
+ 
+-std::thread* bundlingThread;
++std::thread* bundlingThread = nullptr;
+ 
+ 
+ // Functions
+@@ -432,8 +433,102 @@ bool saveMeshIntoFile ( const std::string& filename, bool overwriteExistingFile
+     //g_chunkGrid->debugCheckForDuplicates();
+ }
+ 
++static void stopBundlingThread()
++{
++#ifdef RUN_MULTITHREADED
++    if ( !bundlingThread || !bundlingThread->joinable() ) return;
++    g_bundler->exitBundlingThread();
++
++    ConditionManager::lockImageManagerFrameReady ( ConditionManager::Recon );
++    while ( g_imageManager->hasBundlingFrameRdy() ) //bundling must have consumed the last frame
++    {
++        ConditionManager::waitImageManagerFrameReady ( ConditionManager::Recon );
++    }
++    g_imageManager->setBundlingFrameRdy();			//release all bundling locks
++    ConditionManager::unlockAndNotifyImageManagerFrameReady ( ConditionManager::Recon );
++    ConditionManager::lockBundlerProcessedInput ( ConditionManager::Recon );
++    g_bundler->confirmProcessedInputFrame();		//release all bundling locks
++    ConditionManager::unlockAndNotifyBundlerProcessedInput ( ConditionManager::Recon );
++
++    bundlingThread->join();	//wait for the bundling thread to return;
++    ConditionManager::release ( ConditionManager::Recon );
++#endif
++}
++
++static bool finiteTransform ( const mat4f& m )
++{
++    for ( unsigned int k = 0; k < 16; k++ )
++    {
++        if ( !std::isfinite ( m[k] ) ) return false;
++    }
++    return true;
++}
++
++// Never identity-backfill: frames with no finite transform get no file.
++static void saveOptimizedPoses ( const std::string& poseDir )
++{
++    TrajectoryManager* tm = g_bundler->getTrajectoryManager();
++    const std::vector<TrajectoryManager::TrajectoryFrame>& frames = tm->getFrames();
++    const unsigned int numAdded = tm->getNumAddedFrames();
++    const unsigned int numOpt = std::min ( tm->getNumOptimizedFrames(), numAdded );
++    unsigned int nOpt = 0, nInt = 0, nDrop = 0;
++    for ( unsigned int i = 0; i < numAdded; i++ )
++    {
++        const auto& f = frames[i];
++        const mat4f* t = nullptr;
++        if ( i < numOpt && finiteTransform ( f.optimizedTransform ) )
++        {
++            t = &f.optimizedTransform;
++            nOpt++;
++        }
++        else if ( finiteTransform ( f.integratedTransform ) )
++        {
++            t = &f.integratedTransform;
++            nInt++;
++        }
++        else
++        {
++            nDrop++;
++            continue;
++        }
++        std::ofstream s ( poseDir + "/" + std::to_string ( i ) + ".txt" );
++        s << std::setprecision ( 9 );
++        for ( unsigned int r = 0; r < 4; r++ )
++        {
++            s << ( *t ) [4*r] << " " << ( *t ) [4*r+1] << " " << ( *t ) [4*r+2] << " " << ( *t ) [4*r+3] << "\n";
++        }
++    }
++    std::cout << "[info] saved poses: " << nOpt << " optimized + " << nInt << " integrated, "
++              << nDrop << " dropped of " << numAdded << std::endl;
++}
++
++bool finishBundleFusion ( const std::string& poseDir, const std::string& meshPath, int rounds )
++{
++    cv::Mat none;
++    if ( rounds > 0 ) // rounds 0: no past-end solve is started at all
++    {
++        g_RGBDSensor->stopReceivingFrames();
++    }
++    for ( int r = 0; r < rounds; r++ )
++    {
++        processInputRGBDFrame ( none, none );
++    }
++    stopBundlingThread();
++    saveOptimizedPoses ( poseDir ); // BEFORE the drain: it overwrites integratedTransform
++
++    TrajectoryManager* tm = g_bundler->getTrajectoryManager();
++    const unsigned int maxPasses = 2 * tm->getNumAddedFrames() + 100; // bounded: never hang here
++    for ( unsigned int pass = 0; pass < maxPasses; pass++ )
++    {
++        reintegrate();
++        if ( tm->getNumActiveOperations() == 0 ) break;
++    }
++    return saveMeshIntoFile ( meshPath, true );
++}
++
+ bool deinitBundleFusion()
+ {
++    stopBundlingThread();
+ 
+     SAFE_DELETE ( g_sceneRep );
+     SAFE_DELETE ( g_rayCast );
+@@ -441,16 +536,6 @@ bool deinitBundleFusion()
+     SAFE_DELETE ( g_historgram );
+     SAFE_DELETE ( g_chunkGrid );
+ 
+-#ifdef RUN_MULTITHREADED
+-    g_bundler->exitBundlingThread();
+-
+-    g_imageManager->setBundlingFrameRdy();			//release all bundling locks
+-    g_bundler->confirmProcessedInputFrame();		//release all bundling locks
+-    ConditionManager::release ( ConditionManager::Recon ); // release bundling locks
+-
+-    if ( bundlingThread->joinable() )
+-        bundlingThread->join();	//wait for the bundling thread to return;
+-#endif
+     SAFE_DELETE ( g_bundler );
+     SAFE_DELETE ( g_imageManager );
+ 
+@@ -516,7 +601,10 @@ void bundlingThreadFunc()
+     while ( 1 )
+     {
+         // opt
+-        if ( g_RGBDSensor->isReceivingFrames() )
++        if ( g_bundler->getExitBundlingThread() ) // no new solve once exit was requested
++        {
++        }
++        else if ( g_RGBDSensor->isReceivingFrames() )
+         {
+             if ( g_bundler->getCurrProcessedFrame() % submapSize == 0 ) // stop solve
+             {
+@@ -571,6 +659,10 @@ void bundlingThreadFunc()
+ 
+         if ( g_bundler->getExitBundlingThread() )
+         {
++            if ( tOpt.joinable() )
++            {
++                tOpt.join();
++            }
+             ConditionManager::release ( ConditionManager::Bundling );
+             break;
+         }
+diff --git a/src/SiftGPU/ProgramCU.cu b/src/SiftGPU/ProgramCU.cu
+index 006489d..e9f4d39 100644
+--- a/src/SiftGPU/ProgramCU.cu
++++ b/src/SiftGPU/ProgramCU.cu
+@@ -47,7 +47,7 @@
+ //////////////////////////////////////////////////////////
+ #define IMUL(X,Y) __mul24(X,Y)
+ //#define FDIV(X,Y) ((X)/(Y))
+-#define FDIV(X,Y) __fdividef(X,Y)
++#define FDIV(X,Y) ((X)/(Y))
+ 
+ /////////////////////////////////////////////////////////
+ //filter kernel width range (don't change this)
+@@ -897,7 +897,7 @@ void ProgramCU::GenerateList(CuTexImage* list, CuTexImage* hist)
+ //__inline__ __device__
+ //float warpReduceMax(float val) {
+ //	for (int offset = 32 / 2; offset > 0; offset /= 2) {
+-//		val = max(val, __shfl_down(val, offset, 32));
++//		val = max(val, __shfl_down_sync(0xFFFFFFFF, val, offset, 32));
+ //	}
+ //	return val;
+ //}
+@@ -1332,7 +1332,7 @@ void __global__ ComputeDescriptorRECT_Kernel(float4* d_des, int num, int width,
+ __inline__ __device__
+ float warpAllReduceSum(float val) {
+ 	for (int offset = 32 / 2; offset > 0; offset /= 2) {
+-		val += __shfl_xor(val, offset, 32);
++		val += __shfl_xor_sync(0xFFFFFFFF, val, offset, 32);
+ 	}
+ 	return val;
+ }

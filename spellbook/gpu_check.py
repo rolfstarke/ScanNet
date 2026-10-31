@@ -25,7 +25,7 @@ from evaluation.benchmark import load_settings
 from utils.gpu import gpu_lease
 
 ENGINE_ORDER = ["zed", "open3d", "metashape", "rtabmap", "isaac", "bundlefusion"]
-BLOCKED_ENGINES = {"zed", "isaac"}
+BLOCKED_ENGINES = {"isaac"}  # zed managed since the #29 remap validation
 
 _GPU0_UUID = None
 

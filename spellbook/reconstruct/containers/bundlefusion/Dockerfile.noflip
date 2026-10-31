@@ -1,0 +1,7 @@
+# bundlefusion:latest without the fork's horizontal flip in PrimeSenseSensor::readDepthAndColor.
+# The flip mirrors mesh and poses relative to the input frames (fork issue #32).
+# Build: docker build -f Dockerfile.noflip -t bundlefusion:noflip .
+FROM bundlefusion:latest
+COPY noflip.patch /tmp/noflip.patch
+RUN git apply --whitespace=nowarn /tmp/noflip.patch && \
+    cd build && make -j"$(nproc)" bundle_fusion_headless

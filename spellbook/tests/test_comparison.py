@@ -48,7 +48,7 @@ def _geometry_doc(scan_id, mean="15.0", acc="20.0", comp="10.0"):
         "completeness_mean_cm": float(comp),
         "scene": scan_id,
         "reference_sha256": "766131128d262b8a7c0cf75243f88c3b269f4c88058c62d9750b380c8b4eb24d",
-        "visible_voxels_sha256": "9e47eb8667b43d0f2604f119909489d05db7989f469159368c5ab4414d724d9c",
+        "visible_voxels_sha256": "d4d7fbf0f58d3226c1f74210b189cdd307d0a31bcc3ac94106d47239cba066d3",
         "voxel_mm": 10,
     }
 
